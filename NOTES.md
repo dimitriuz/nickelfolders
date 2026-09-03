@@ -1250,12 +1250,35 @@ real, ordinary `bl 0x<address>` straight to a function's own code, with no
 PLT indirection at all, produces no relocation for `plt.sh` to match against,
 so it reports `<no PLT stub found>` — the identical message it gives for a
 address that is not a call at all. The tool cannot tell "this is a direct
-call I don't handle" from "this was never a call." Nothing in this project
-so far has depended on resolving one of these (every cross-function call
-found here, weak symbols included, has gone through the PLT — checked, not
-assumed, when it mattered for `QuickAccessLibraryController`'s own known
-caller), but the blind spot is structural, not empirical, and the next
-firmware or the next function may not be as accommodating.
+call I don't handle" from "this was never a call," and the blind spot is
+structural, not empirical: this project hit it for real, not just in theory.
+
+**The concrete instance, and what it cost.** Inside
+`MainWindowController::push` (`0xeaacac`, disassembled in full above), every
+neighbouring call is a `blx` through the PLT — `690760`, `68e6c8`, `681f4c`,
+`6ab7e8`, all resolved by name earlier in this file — except one:
+
+```
+eaaf94: blx 690760      ; QObject::connectImpl                  (PLT)
+eaaf9a: blx 68e6c8      ; QMetaObject::Connection::~Connection  (PLT)
+eaafa0: bl  ea9100      ; <-- DIRECT bl, no PLT stub, no relocation
+eaafa8: blx 681f4c      ; MainWindowController::pushView(QWidget*)  (PLT)
+eaafb0: blx 6ab7e8      ; MainWindowController::prepareView(...)   (PLT)
+```
+
+`sh tools/plt.sh libnickel.so.1.0.0 0xea9100` reports `<no PLT stub found
+within 32 bytes>` — indistinguishable, from the tool's own output, from a
+literal-pool false positive. It is not one: `0xea9100` is a real function,
+the view fetch that reads the controller's own `QWeakPointer<QWidget>` back
+out, and its return value is exactly what `pushView` (the very next
+instruction) receives as the widget to display. **An earlier attempt at
+rung 2 failed precisely here**: the `d`/`+4` state this call depends on
+was unset, so it returned NULL, `pushView(NULL)` logged a `qWarning()` and
+returned having done nothing, and the failure was **silent** — no crash, no
+error visible without reading the log, PID unchanged, just no screen. A
+disassembly-only read of `push` that trusted `plt.sh`'s "no PLT stub found"
+as "not worth chasing" would have missed the one call in the whole function
+that actually decides whether anything appears.
 
 **Conversely, three separate `bl` instructions objdump printed inside this
 firmware's own function bodies were not calls at all** — they were
