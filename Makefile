@@ -1,7 +1,7 @@
 include NickelHook/NickelHook.mk
 
 override LIBRARY  := libnfolders.so
-override SOURCES  += nfolders.cc
+override SOURCES  += nfolders.cc nfnickel.cc
 override CFLAGS   += -Wall -Wextra -Werror -Wno-missing-field-initializers -fvisibility=hidden
 override CXXFLAGS += -Wall -Wextra -Werror -Wno-missing-field-initializers -fvisibility=hidden -fvisibility-inlines-hidden
 # `test` isn't an ARM build target, so it must be excluded before the second
@@ -28,9 +28,15 @@ HOST_TESTBIN  := $(patsubst tests/%.cc,build/%,$(HOST_TESTSRC))
 # guard in a header runs against a stale binary and appears not to fail --
 # which would silently invalidate the one discipline this rung leans on.
 HOST_HDR      := $(wildcard *.h) $(wildcard tests/*.h)
-HOST_CXXFLAGS := -std=gnu++11 -O1 -g -Wall -Wextra -Werror -I. -Itests \
+# `=` (recursive), not `:=`, on these two: a `:=` is expanded once, when this
+# line is read, which is on EVERY make invocation -- including a cross build
+# run inside the NickelTC container, where there is no host Qt5Core and
+# `pkg-config` prints "Package Qt5Core was not found" four times for no
+# reason. `=` defers the pkg-config calls until a host test binary is
+# actually being built, which is the only place these variables are used.
+HOST_CXXFLAGS = -std=gnu++11 -O1 -g -Wall -Wextra -Werror -I. -Itests \
                  $(shell pkg-config --cflags Qt5Core)
-HOST_LDLIBS   := $(shell pkg-config --libs Qt5Core)
+HOST_LDLIBS   = $(shell pkg-config --libs Qt5Core)
 
 build:
 	@mkdir -p build
