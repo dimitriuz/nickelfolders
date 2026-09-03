@@ -28,12 +28,16 @@ The book also landed in Nickel's **Recents**, which is the evidence for using
 `ReadBookActionProxy` rather than pushing a `ReadingController`: Nickel's own
 bookkeeping ran. Do not "simplify" that call site.
 
-**Where back goes is still open** (`NOTES.md` #1) and it shapes the design.
-It was briefly recorded as answered; that was wrong, and the mistake is
-documented there because it is the instructive kind: the test set the baseline
-view to Home, which is also what one of the two hypotheses predicts, so the
-observation discriminated nothing. **Never set a baseline to the value you
-expect to measure.**
+**Back POPS to the view beneath**, measured from a non-Home baseline:
+`DragonLibraryView` → `ReadingView` → back → `DragonLibraryView`. So the
+browser can be a real screen on Nickel's window stack that you return to, which
+is what the native-screen architecture needs to be worth building.
+
+That measurement was botched once and the reason is worth carrying: the first
+attempt set the baseline view to Home, which is also what the rival hypothesis
+predicts, so it discriminated nothing — and it was written down as confirmed
+anyway. **Never set a baseline to the value you expect to measure.** `NOTES.md`
+has the full account under Results.
 
 ## Build
 

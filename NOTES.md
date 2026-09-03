@@ -231,7 +231,7 @@ change at any point, i.e. **Nickel survived every stage**.
 | Does the proxy constructor accept an arbitrary `QObject` parent? | **Yes.** Constructed against the mod's own trigger object. |
 | Does `onSelected()` actually navigate? | **Yes.** `ndbCurrentView` went `HomePageView` → `ReadingView`, and a framebuffer grab shows the right book open in the stock reader with Nickel's own header and chapter footer. Took ~4 s. |
 | Does Nickel's own bookkeeping run? | **Yes**, and this is the payoff for choosing `ReadBookActionProxy` over `ReadingController`: the book appeared in Nickel's **Recents** afterwards. A direct `ReadingController` push would have rendered the book with no reading session and no Recents entry. |
-| Where does **back** go? | **STILL OPEN — see open question #1.** The owner pressed back and landed on the home screen, but that observation is worthless: the test had run `mwcHome` first, so Home *was* the view beneath the reader. "Pops to the view beneath" and "always goes Home" predict the same result. |
+| Where does **back** go? | **It POPS to the view beneath.** Measured 2026-09-03 with a deliberately non-Home baseline: `DragonLibraryView` → (open) → `ReadingView` → (owner presses back) → `DragonLibraryView`, nickel PID unchanged throughout. Both the owner's report and `ndbCurrentView` agree. So a browser view of ours on the window stack **will** be returned to — the browser can be a screen, not a one-shot launcher. |
 
 The test used `file:///mnt/onboard/books/Pratchett_ Terry - The Color of Magic_ A Discworld Novel.epub`
 — a plain sideloaded `.epub` one directory down, chosen because it is exactly
@@ -241,29 +241,26 @@ the case the stock library will not let you navigate to.
 as an oracle: a log line only proves a call returned, and the question here was
 always whether Nickel *navigated*.
 
+### The back-gesture measurement was wrong once, and the reason generalises
+
+It was first "answered" by a run that did `qndb -m mwcHome` before triggering,
+on the reasoning that back needed a *known* destination. That made Home the
+view beneath the reader — and "pops to the view beneath" and "always goes Home"
+then predict the same observation, so landing on Home discriminated nothing. It
+was recorded as confirmed anyway, and the owner's own doubt is what caught it.
+
+**Setting a baseline to the value you expect to measure destroys the
+measurement.** Re-run from `DragonLibraryView` it took one attempt.
+
+Note also that NickelDBus cannot navigate to the library on its own — its only
+view-changing methods are `mwcHome` and `bwmOpenBrowser` — so a non-Home
+baseline needs either a tap from the owner or the web browser view standing in.
+
 ### Open questions — what a device run still has to answer
 
 These are cheap now: the mod is installed and `tools/kobo.py open` drives it
-without a rebuild. Numbered so they can be referred to.
-
-1. **Where the back gesture goes — pop, or always Home?** This decides whether
-   the browser can be a screen you return to or is only a one-shot launcher, so
-   it shapes the whole design.
-
-   **It was recorded as answered on 2026-09-03 and that was a mistake worth
-   keeping here as a warning.** `tools/nftest.sh` deliberately ran
-   `qndb -m mwcHome` before triggering, "so the back-destination is known" —
-   which made Home the view beneath the reader. Both hypotheses then predict
-   landing on Home, so the observation discriminated nothing. **Setting a
-   baseline to the value you expect to measure destroys the measurement.**
-
-   To actually answer it, the view beneath the reader must NOT be Home:
-   put Nickel on the Library view, confirm with `ndbCurrentView`, trigger the
-   open, press back, and read `ndbCurrentView` again. Library means it pops;
-   `HomePageView` means it always goes Home. NickelDBus cannot navigate to the
-   library itself (its only view-changing methods are `mwcHome` and
-   `bwmOpenBrowser`), so this needs either a tap or the browser view as the
-   non-Home baseline.
+without a rebuild. Numbered so they can be referred to; #1 was answered on
+2026-09-03 and is in Results.
 
 2. **Other formats.** Only a plain sideloaded `.epub` has been opened. The
    library also holds `.kepub.epub`, `.cbz` and `.pdf`, and KEPUBs matter most
