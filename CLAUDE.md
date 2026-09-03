@@ -39,6 +39,12 @@ predicts, so it discriminated nothing — and it was written down as confirmed
 anyway. **Never set a baseline to the value you expect to measure.** `NOTES.md`
 has the full account under Results.
 
+**Repeated opens are safe and readers do not stack.** 20 consecutive opens with
+no back press in between: no crash, no slowdown, RSS byte-identical after the
+first, the last-opened book is the one shown, and **one** back press returns to
+where you started. So `browse → tap → read → back → same folder` needs no
+reader lifetime management and no special handling, however long the session.
+
 ## Build
 
 ```sh

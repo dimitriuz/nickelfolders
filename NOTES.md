@@ -297,26 +297,45 @@ answer — after the back-gesture baseline — and both times the tell was that 
 failures were *patterned* rather than random. A patterned failure is almost
 always the instrument.
 
-### Open questions — what a device run still has to answer
+### Repeated and consecutive opens (#3)
 
-These are cheap now: the mod is installed and `tools/kobo.py open` drives it
-without a rebuild. Numbered so they can be referred to; #1 was answered on
-2026-09-03 and is in Results.
+Measured 2026-09-03: **20 consecutive opens** alternating a `.epub` and a
+`.cbr`, with no back press anywhere in between, then one back press.
 
-3. **Repeated and consecutive opens.** Opening a second book without an
-   intervening back, and opening the same book twice, are both untested. The
-   proxy is currently leaked per open, so this is also where that shows up.
+| | |
+|---|---|
+| Completed | 20 of 20, nickel PID unchanged, no `hindenburg`/segfault/OOM chatter |
+| `onSelected()` duration | under a second every time, no degradation across the run |
+| RSS | 126,288 kB before → 133,628 kB after the *first* open → then **byte-identical 133,628 kB for all nine remaining iterations** |
+| Which book is on screen | the **last** one opened, confirmed by framebuffer grab (Sandman, not the Pratchett) — so a second open genuinely switches books |
+| Stack depth | **1.** One back press after 20 opens landed on `HomePageView`, confirmed by the owner and by `ndbCurrentView`. Readers are **replaced, not stacked**. |
+| RSS after that back | 123,324 kB — *below* the pre-test baseline, so nothing accumulated and the reader's memory is released. (Not reading much into the small decrease itself; ordinary reclaim would do that.) |
 
-Answered 2026-09-03: **#1** (back pops, in Results), **#2** and **#5** (below),
-**#4** as a side effect of #5's census, and **#6** by static analysis (below) —
-the reference device has no SD slot, so that one can never be closed on
-hardware here.
+The flat RSS predicted the stack-depth answer before the back press did: had
+each open pushed a controller, memory would have climbed.
+
+**For the browser this is about as good as it gets.** Open a book, read, one
+back press, you are where you were — every time, no matter how many books were
+opened in the session, with no reader lifetime to manage and no accumulating
+state. The `browse → tap → read → back → same folder` loop needs no special
+handling.
+
+It also prices the probe's deliberate leak: 52 bytes × 20 opens is ~1 kB and
+did not register. Still worth fixing before this is a product — a mod lives for
+weeks between reboots — but it is not a correctness problem.
+
+### Open questions
+
+**None.** #1–#6 are all answered above, as of 2026-09-03.
 
 Not device questions, but owed before this is a product:
 
-- The 52-byte-per-open proxy leak is a deliberate probe shortcut.
+- The 52-byte-per-open proxy leak is a deliberate probe shortcut (see #3 for
+  its measured scale).
 - The 500 ms poll thread is a probe mechanism; a real mod is driven by a menu
   item or a view, not by a file in `/tmp`.
+- `dbName` must come from `Device::getDbName()` rather than being hardcoded
+  empty — see below.
 
 ## dbName, and SD cards (#6)
 
