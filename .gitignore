@@ -20,3 +20,10 @@ compile_commands.json
 /libnickel.so.1.0.0
 __pycache__/
 *.pyc
+
+# SDD scratch: ledger, briefs, reports and review packages for in-flight
+# plans. Working notes, not history -- git log is the record.
+.superpowers/
+
+# Host test binaries.
+build/
