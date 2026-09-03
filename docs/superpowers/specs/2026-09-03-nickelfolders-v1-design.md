@@ -283,23 +283,98 @@ names one call and a crash after six names nothing.
 
 ## 6. Keeping the future open
 
-Covers, search, file operations and network are wanted later. What v1 does so
-they do not need a rewrite:
+Wanted later: covers, search, sort options with a direction, filtering, group
+operations, file operations, and possibly network. None are built. What follows
+is what v1 does structurally so none of them needs a rewrite — and one of them
+changes a v1 decision.
 
-- **Search** wants a flat result list, not a folder listing. So the display
-  rules of §3 are written against *the set of rows being shown*, never against
-  "the current folder". A search result set has no common run, so §3.2 does
-  nothing to it and §3.4 does the work instead — which is the correct behaviour
-  without a special case.
+### 6.1 One pipeline, in this order
+
+Every future feature above is an insertion into the same sequence, which is why
+v1 builds it as a sequence rather than as one function that lists and sorts:
+
+```
+list the directory
+  -> hide junk            (§3.5: extension allowlist, dotdirs, *.sdr)
+  -> user filter          (FUTURE: by type, or anything else)
+  -> fetch metadata       (getById + getDbValues, for EVERY row -- see §6.2)
+  -> group by kind        (§3.3: folders before files)
+  -> order within group   (§3.3's comparator; FUTURE: key + direction)
+  -> cap                  (none in v1; §3.3 says this stays after ordering)
+  -> derive labels        (§3.2: strip the common run, on the rows shown)
+  -> disambiguate         (§3.4: folder on the row, only where labels collide)
+```
+
+The order of the last three is load-bearing rather than tidy. **Labels are
+derived after filtering**, because filtering changes the row set and a common
+prefix computed before it may no longer be common after it — strip it anyway and
+rows lose text that was actually distinguishing. §3.2 is order-independent, so
+re-sorting never needs the labels recomputed, but re-filtering always does.
+
+### 6.2 Sort options change a v1 decision: metadata is fetched eagerly
+
+A direction toggle alone is cheap: **grouping and ordering are separate stages
+above, so descending reverses the order within each kind and never floats files
+above folders.** Recording that now because "reverse the list" is the obvious
+implementation and it is the wrong one.
+
+Alternate sort *keys* are the part that reaches back into v1. Sorting by date
+added, size or percent read needs that field for **every row before the sort
+runs**, so metadata cannot be fetched lazily for the rows on screen. v1
+therefore fetches it for the whole listing up front, even though v1's only sort
+key is the name and would not need it.
+
+**That raises §7's open timing question rather than answering it:** the cost is
+`getById` on all 27 rows of the largest folder before first paint, not on the
+handful that are visible. It is the same measurement, with a bigger N, and it is
+still the number this data design rests on.
+
+### 6.3 Filtering needs a third empty state
+
+A user filter is a **separate layer from §3.5's allowlist**, not an extension of
+it. The allowlist answers "is this a book"; a filter answers "which books do I
+want to see right now". Merged, filtering to PDFs would start arguing with the
+junk-hiding rule.
+
+The new failure it introduces is worth building §3.6 to accommodate: a folder
+where **everything was filtered out** must not look like an empty folder. Filter
+to PDF, open the manga folder, see nothing, and the honest reading is "my books
+are gone". So §3.6's two states become three — empty, unreadable, and filtered
+to nothing — which is koboy's `-1`-versus-`0` lesson generalising exactly as it
+did the first time.
+
+Whether a filter also hides *folders* containing none of the wanted type needs
+the recursive count already deferred in §3.5. Same fix, same deferral.
+
+### 6.4 Group operations multiply an existing hazard
+
+**File operations** carry a hazard worth recording now: `unlink`-ing a book
+leaves an orphan `content` row *and* a stale `Repository` cache entry, so
+`getById` would go on returning a valid `Volume` for a file that is gone. Any
+future delete must go through Nickel's own removal path rather than the
+filesystem. This is why v1 is strictly read-only.
+
+**Group operations are that hazard with a blast radius of N**, and they add two
+of their own:
+
+- Tap means "open" in v1. Selection needs a mode, so tap becomes ambiguous and
+  the mode has to be visible on the panel. Not foreclosed, but it is a real UI
+  decision and not a checkbox.
+- A group operation must act on the **selected rows**, never on "everything
+  currently shown". With §6.1's filter and sort stages in between, those two
+  sets diverge, and that divergence is the classic way a bulk delete takes the
+  wrong files.
+
+### 6.5 The cheap ones
+
+- **Search** wants a flat result list, not a folder listing. So §3's display
+  rules are written against *the set of rows being shown*, never against "the
+  current folder". A search result set has no common run, so §3.2 does nothing
+  to it and §3.4 does the work instead — correct behaviour with no special case.
 - **Covers** need `ImageId`, which `getDbValues()` already returns. No new
-  archaeology; the row model gains a field and the row gains a fixed height.
-  The real cost is decode plus e-ink refresh time, which is why it is not v1.
-- **File operations** carry a hazard worth recording now: `unlink`-ing a book
-  leaves an orphan `content` row *and* a stale `Repository` cache entry, so
-  `getById` would go on returning a valid `Volume` for a file that is gone.
-  Any future delete must go through Nickel's own removal path. This is why v1
-  is strictly read-only.
-- **Network** is unspecified and nothing here blocks it.
+  archaeology; the row model gains a field and the row gains a fixed height. The
+  real cost is decode plus e-ink refresh time, which is why it is not v1.
+- **Network** is unspecified, and nothing here blocks it.
 
 ## 7. Open, and owed
 
