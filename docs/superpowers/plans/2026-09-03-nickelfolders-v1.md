@@ -285,7 +285,14 @@ Expected: `3 checks, 0 failures`, exit 0.
 
 - [ ] **Step 5: Prove the test is not vacuous**
 
-Temporarily replace the digit branch's `if (li != lj) return li < lj ? -1 : 1;` with `if (false) {}` — that is the mutation that turns the comparator back into a plain lexical sort.
+Temporarily weaken the digit branch's `if (li != lj) return li < lj ? -1 : 1;`
+to `if (false && li != lj) return li < lj ? -1 : 1;` — that is the mutation that
+turns the comparator back into a plain lexical sort.
+
+Use that form and **not** a bare `if (false) {}`: deleting the comparison
+leaves `lj` unused, and `-Werror` then fails the *build*. A build failure is not
+a test failure, and a mutation step that cannot distinguish the two proves
+nothing. (Found by running it.)
 
 Run: `make test`
 Expected: FAIL on the `v9` vs `v10` check specifically.
@@ -656,13 +663,33 @@ static void test_sort_uses_natural_order_within_kind(void) {
     CHECK_EQ_STR(e.at(3).name, "v10 - The Wake");
 }
 
-// Stability, which is what makes the listing reproducible across runs.
-static void test_sort_is_stable_on_ties(void) {
-    QVector<nf_entry> e;
-    e << ent("same", false) << ent("same", false);
-    e[0].isDir = false;
-    nf_sort_entries(&e);
-    CHECK(e.size() == 2);
+// Determinism, which is what makes a listing reproducible across runs.
+//
+// This deliberately does NOT try to test stability directly: nf_entry carries
+// no payload beyond name and isDir, so two tied entries are indistinguishable
+// and any "stability" assertion over them can only restate the input. What IS
+// observable is that the sort is idempotent and independent of input order,
+// which is the property the listing actually depends on.
+static void test_sort_is_deterministic(void) {
+    QVector<nf_entry> sorted;
+    sorted << ent("alpha", true) << ent("omega", true)
+           << ent("v1.cbz", false) << ent("v2.cbz", false);
+
+    QVector<nf_entry> again = sorted;
+    nf_sort_entries(&again);          // sorting sorted input changes nothing
+    for (int i = 0; i < sorted.size(); i++) {
+        CHECK_EQ_STR(again.at(i).name, sorted.at(i).name.toUtf8().constData());
+        CHECK(again.at(i).isDir == sorted.at(i).isDir);
+    }
+
+    QVector<nf_entry> reversed;
+    for (int i = sorted.size() - 1; i >= 0; i--)
+        reversed << sorted.at(i);
+    nf_sort_entries(&reversed);       // and reversed input reaches the same order
+    for (int i = 0; i < sorted.size(); i++) {
+        CHECK_EQ_STR(reversed.at(i).name, sorted.at(i).name.toUtf8().constData());
+        CHECK(reversed.at(i).isDir == sorted.at(i).isDir);
+    }
 }
 ```
 
@@ -1018,16 +1045,20 @@ static void test_labels_match_their_rows_after_sorting(void) {
 // common case on the reference card, not an edge one.
 static void test_folders_and_files_are_labelled_separately(void) {
     QVector<nf_entry> e;
-    e << ent("Series - Volume 1.cbz", false)
-      << ent("Series - Volume 2.cbz", false)
+    // Zero-padded on purpose. With "Volume 1" / "Volume 2" the remainder is a
+    // SINGLE character, and Task 2's refuse-under-two-characters guard then
+    // correctly declines to strip -- so the unpadded form tests the guard, not
+    // the separation. Traced by hand before this plan was written.
+    e << ent("Series - Volume 01.cbz", false)
+      << ent("Series - Volume 02.cbz", false)
       << ent("Extras", true);
     QVector<nf_row> out;
     nf_build_listing(e, fake_meta, NULL, &out);
     CHECK(out.size() == 3);
     CHECK(out.at(0).isDir);
     CHECK_EQ_STR(out.at(0).label, "Extras");
-    CHECK_EQ_STR(out.at(1).label, "Volume 1");
-    CHECK_EQ_STR(out.at(2).label, "Volume 2");
+    CHECK_EQ_STR(out.at(1).label, "01");
+    CHECK_EQ_STR(out.at(2).label, "02");
 }
 
 int main(void) {
