@@ -22,17 +22,32 @@
 
 #include <NickelHook.h>
 
-// Nickel's _ZTV18AbstractController, read live and copied wholesale rather
-// than hand-transcribed: an 11-word array (offset-to-top, RTTI pointer,
-// then the 9 slots CLAUDE.md's measured table lists). This copy is built
-// ONCE, lazily, on first use, and is never freed -- a permanent,
-// process-lifetime table, same pattern as nf_proxy_owner/nf_watch_notifier
-// in nfnickel.cc -- so it outlives every controller whose vptr points into
-// it, including ones pushed long after this function last ran. POD, not a
-// QVector or similar: no file-scope object here may have a dynamic
-// initialiser (CLAUDE.md), and this one does not need one -- .bss zeroes it,
-// and nf_browser_vtable_ready() below fills it in at runtime.
+// Nickel's _ZTV18AbstractController, read live for the RTTI pointer and
+// slots 2-8 (each carries a normal relocation naming its symbol -- readelf
+// -r confirms it), but NOT for slots 0/1: those two carry no relocation at
+// all on 4.38.23684 (readelf -r finds nothing at 0163ff78/0163ff7c, file
+// bytes read zero), so a copy from the live table would put a null pointer
+// in both destructor slots -- nfnickel.h's comment on AbstractController__vtable
+// has the full account. nf_browser_vtable_ready() below stores
+// AbstractController__dtor1/__dtor0 into those two slots explicitly instead.
+// This table is built ONCE, lazily, on first use, and is never freed -- a
+// permanent, process-lifetime table, same pattern as
+// nf_proxy_owner/nf_watch_notifier in nfnickel.cc -- so it outlives every
+// controller whose vptr points into it, including ones pushed long after
+// this function last ran. POD, not a QVector or similar: no file-scope
+// object here may have a dynamic initialiser (CLAUDE.md), and this one does
+// not need one -- .bss zeroes it, and nf_browser_vtable_ready() below fills
+// it in at runtime.
 static void *NFControllerVTable[11];
+
+// Separate from NFControllerVTable's own contents on purpose: slot 0 (D1) is
+// one of the two words that come out zero from a copy (see above), so
+// testing NFControllerVTable[2] for "already built" would test exactly the
+// word most likely to be wrong -- it would report "not built" forever if the
+// explicit stores below were ever accidentally skipped, silently leaving a
+// null destructor in place rather than refusing. An explicit flag makes
+// "built" a fact this file asserts, not an inference from array contents.
+static bool NFControllerVTableReady = false;
 
 // The Itanium address point (the value a real vptr holds) is the table
 // base plus 8 bytes -- two header words -- confirmed independently by
@@ -47,20 +62,31 @@ enum { NF_VTABLE_HEADER_WORDS = 2, NF_VTABLE_SLOT8_INDEX = NF_VTABLE_HEADER_WORD
 static void nf_browser_load_view(void *self);
 
 // Populates NFControllerVTable from the live, already-relocated table on
-// first call; every later call is a no-op (slot 2, `size()`, is never NULL
-// once real once set, since it is copied straight from a resolved,
-// non-NULL Nickel pointer). Returns false only if AbstractController__vtable
-// itself never resolved -- nf_browser_resolve() already covers that for
-// nf_browser_show()'s own gate, so this mirrors it rather than trusting the
-// caller to have checked, since a future caller of this function might not.
+// first call; every later call is a no-op, per NFControllerVTableReady
+// above. Returns false if AbstractController__vtable, or either destructor
+// pointer, never resolved -- nf_browser_resolve() already covers all three
+// for nf_browser_show()'s own gate, so this mirrors it rather than trusting
+// the caller to have checked, since a future caller of this function might
+// not.
 static bool nf_browser_vtable_ready() {
-    if (NFControllerVTable[2])
+    if (NFControllerVTableReady)
         return true;
-    if (!AbstractController__vtable)
+    if (!AbstractController__vtable || !AbstractController__dtor1 || !AbstractController__dtor0)
         return false;
 
     for (int i = 0; i < NF_VTABLE_SLOT8_INDEX; i++)
         NFControllerVTable[i] = AbstractController__vtable[i];
+
+    // Slots 0/1 (D1, D0) are NOT trustworthy in the copy just above -- see
+    // NFControllerVTable's own comment, and nfnickel.h's comment on
+    // AbstractController__vtable, for the readelf evidence that these two
+    // words carry no relocation at all in Nickel's own table on 4.38.23684,
+    // so the copy loop just put two NULLs there. Overwritten here with the
+    // separately-resolved, by-name destructors instead -- never rely on the
+    // copy for these two words specifically.
+    NFControllerVTable[NF_VTABLE_HEADER_WORDS + 0] = reinterpret_cast<void*>(AbstractController__dtor1);
+    NFControllerVTable[NF_VTABLE_HEADER_WORDS + 1] = reinterpret_cast<void*>(AbstractController__dtor0);
+
     // The ONE slot Nickel's own table leaves as __cxa_pure_virtual --
     // CLAUDE.md's measured table calls it out as "the one we must supply".
     // Every other slot above keeps Nickel's own implementation verbatim:
@@ -68,6 +94,7 @@ static bool nf_browser_vtable_ready() {
     // allowedOrientations() and navSection() are real code we want, not
     // reimplemented here.
     NFControllerVTable[NF_VTABLE_SLOT8_INDEX] = reinterpret_cast<void*>(&nf_browser_load_view);
+    NFControllerVTableReady = true;
     return true;
 }
 
@@ -80,10 +107,15 @@ static bool nf_browser_vtable_ready() {
 // ensureViewLoaded calls slot 8...", has the disassembly this rests on.
 //
 // Its entire observable contract, read off that same caller, is: leave a
-// valid QWidget* at this+8. AbstractController::viewLoaded() (0xad13ac)
-// answers from exactly that offset (`ldr r3, [r0, #8]`), and this rung
-// draws nothing on purpose, so an otherwise-default QWidget is exactly what
-// "loaded" should mean here.
+// valid QWidget* at this+8. AbstractController::viewLoaded() (0xad13ac) is a
+// BOOL-returning function, not a pointer-returning one: its first read is
+// `ldr r3, [r0, #4]` (the "d" pointer AbstractController::AbstractController
+// zeroes), and only when that AND d[+4] are both non-null does it go on to
+// read `this[+8]` (`ldr r3, [r0, #8]`, at 0xad13b8) and return whether THAT
+// is non-null. This rung draws nothing on purpose, so an otherwise-default
+// QWidget is exactly what "loaded" should mean here once viewLoaded()'s
+// other precondition (the "d" pointer at +4) is satisfied by whatever sets
+// it up -- not established to be this rung's job; see NOTES.md.
 //
 // The "mainNavView" property is not cosmetic.
 // MainWindowController::currentViewName() (0xea8010) -- what NickelDBus's

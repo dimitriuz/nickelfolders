@@ -59,7 +59,7 @@ static void    (*ReadBookActionProxy__onSelected)(ReadBookActionProxy *_this);
 static Device        *(*Device__getCurrentDevice)(void);
 static QString const *(*Device__getDbName)(Device const *_this);
 
-// These four are NOT static, unlike everything above -- nfbrowser.cc needs
+// These six are NOT static, unlike everything above -- nfbrowser.cc needs
 // them directly to build its own vtable and controller object, which is a
 // lower-level operation than anything the book-opening path needed (that
 // path only ever called through a resolved pointer; this rung also reads
@@ -67,6 +67,13 @@ static QString const *(*Device__getDbName)(Device const *_this);
 // for each; NOTES.md's "Task 7, rung 2" section has the disassembly.
 void (*AbstractController__ctor)(AbstractController *_this);
 void **AbstractController__vtable;
+// Resolved separately from AbstractController__vtable and NEVER taken from
+// a copy of it -- that table's own slots 0/1 carry no relocation on
+// 4.38.23684 (readelf -r finds nothing at 0163ff78/0163ff7c, file bytes
+// read zero) and reading them live gives NULL, not Nickel's real
+// destructors. See nfnickel.h's comment on AbstractController__vtable.
+void (*AbstractController__dtor1)(AbstractController *_this);
+void (*AbstractController__dtor0)(AbstractController *_this);
 void  *(*MainWindowController__sharedInstance)(void);
 void   (*MainWindowController__push)(MainWindowController *_this, AbstractController *controller, bool animate);
 
@@ -95,6 +102,8 @@ struct nh_dlsym NFNickelDlsym[] = {
     {.name = "_ZNK6Device9getDbNameEv",                       .out = nh_symoutptr(Device__getDbName),               .desc = "Device::getDbName",                      .optional = true},
     {.name = "_ZN18AbstractControllerC1Ev",                   .out = nh_symoutptr(AbstractController__ctor),        .desc = "AbstractController::AbstractController", .optional = true},
     {.name = "_ZTV18AbstractController",                      .out = nh_symoutptr(AbstractController__vtable),      .desc = "AbstractController::vtable",             .optional = true},
+    {.name = "_ZN18AbstractControllerD1Ev",                   .out = nh_symoutptr(AbstractController__dtor1),       .desc = "AbstractController::~AbstractController (D1)", .optional = true},
+    {.name = "_ZN18AbstractControllerD0Ev",                   .out = nh_symoutptr(AbstractController__dtor0),       .desc = "AbstractController::~AbstractController (D0, deleting)", .optional = true},
     {.name = "_ZN20MainWindowController14sharedInstanceEv",   .out = nh_symoutptr(MainWindowController__sharedInstance), .desc = "MainWindowController::sharedInstance", .optional = true},
     {.name = "_ZN20MainWindowController4pushEP18AbstractControllerb", .out = nh_symoutptr(MainWindowController__push), .desc = "MainWindowController::push",           .optional = true},
     {0},
@@ -117,6 +126,7 @@ bool nf_nickel_resolve(void) {
 // table above.
 bool nf_browser_resolve(void) {
     return AbstractController__ctor && AbstractController__vtable &&
+           AbstractController__dtor1 && AbstractController__dtor0 &&
            MainWindowController__sharedInstance && MainWindowController__push;
 }
 
@@ -337,19 +347,35 @@ static void nf_watch_ready(int fd) {
 
     for (char *p = buf; p < buf + n; ) {
         struct inotify_event *ev = reinterpret_cast<struct inotify_event*>(p);
+        // The advance to the NEXT event is computed HERE, unconditionally,
+        // before the filter test below, and the filter/dispatch is wrapped
+        // in an `if` rather than an early `continue` -- an earlier version
+        // of this loop used `continue` for the filtered-out case with the
+        // advance written as the body's LAST statement, which a `for` with
+        // no increment clause turns into an infinite loop: `continue` skips
+        // straight past the advance and re-tests `p < buf + n` against the
+        // SAME `p`. This is not a corner case: IN_Q_OVERFLOW, IN_IGNORED and
+        // IN_UNMOUNT are all delivered regardless of the requested mask, and
+        // all carry len == 0, so the very first such event would hang this
+        // loop. It runs on Nickel's GUI thread, so the failure mode is not a
+        // crash -- it is Nickel's UI thread locking up solid, PID unchanged,
+        // invisible to tools/nftest.sh's PID-change abort, recoverable only
+        // by a power cycle. Do not reintroduce a `continue` here without
+        // also moving the advance ahead of it again.
+        char *next = p + sizeof(struct inotify_event) + ev->len;
         // ev->name is NUL-terminated by the kernel (padded with NULs to
         // ev->len), so a plain strcmp is safe -- no QByteArray construction
         // per event, and no file-scope Qt object to compare against (see
         // nf_watch_targets' own comment for why there cannot be one).
-        if (!ev->len || !(ev->mask & (IN_CLOSE_WRITE | IN_MOVED_TO)))
-            continue;
-        for (int i = 0; i < nf_watch_target_count; i++) {
-            if (strcmp(nf_watch_targets[i].name, ev->name) == 0 && nf_watch_targets[i].cb) {
-                nf_watch_targets[i].cb();
-                break; // basenames are unique by construction (one nf_watch_init call each)
+        if (ev->len && (ev->mask & (IN_CLOSE_WRITE | IN_MOVED_TO))) {
+            for (int i = 0; i < nf_watch_target_count; i++) {
+                if (strcmp(nf_watch_targets[i].name, ev->name) == 0 && nf_watch_targets[i].cb) {
+                    nf_watch_targets[i].cb();
+                    break; // basenames are unique by construction (one nf_watch_init call each)
+                }
             }
         }
-        p += sizeof(struct inotify_event) + ev->len;
+        p = next;
     }
 }
 

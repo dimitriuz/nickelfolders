@@ -763,13 +763,31 @@ ad1444: cbz r0, ad1456      ; cast failed -> qWarning() (QMessageLogger::warning
 
 So slot 8's contract, read off its only caller: **it is called with `this` in
 r0, its return value is never used, and it is expected to leave the view
-pointer at `this+8`** — `AbstractController::viewLoaded()` (`0xad13ac`) reads
-exactly that offset (`ldr r3, [r0, #8]`) to answer. The `dynamic_cast`
-afterward targets a type our copied, plain-`AbstractController` RTTI
-(see next section) cannot satisfy, and failing it is already a handled,
-logged, non-fatal outcome in Nickel's own code — not a path this mod needed
-to avoid, just one it will exercise once, harmlessly, the first time the
-screen loads.
+pointer at `this+8`.** `AbstractController::viewLoaded()` (`0xad13ac`) is a
+BOOL-returning function, not a pointer-returning one, and its first read is
+`this+4` (the "d" pointer AbstractController's own constructor zeroes), not
+`this+8`:
+
+```
+ad13ac: ldr r3, [r0, #4]   ; r3 = this->d
+ad13b2: cbz r3, ad13c8      ; d == 0 -> return false
+ad13b4: ldr r3, [r3, #4]    ; r3 = d[+4]
+ad13b6: cbz r3, ad13c8      ; d[+4] == 0 -> return false
+ad13b8: ldr r3, [r0, #8]    ; r3 = this->view -- ONLY reached once d and d[+4] are both non-null
+ad13be: movne r0, #1        ; return bool(r3 != 0)
+```
+
+So `this+8` is where the view pointer lives — confirmed independently by
+this being the only other offset the function reads at all, and by nothing
+in the vtable slots this mod copies writing anywhere else — but
+`viewLoaded()` answering `true` also depends on a "d" pointer at `this+4`
+that AbstractController's own constructor leaves zero and that this rung
+never sets up (not established whose job that is; see "What this rung does
+NOT establish", below). The `dynamic_cast` after slot 8 returns targets a
+type our copied, plain-`AbstractController` RTTI (see next section) cannot
+satisfy, and failing it is already a handled, logged, non-fatal outcome in
+Nickel's own code — not a path this mod needed to avoid, just one it will
+exercise once, harmlessly, the first time the screen loads.
 
 ### The vtable header matters, not just the 9 slots
 
@@ -808,6 +826,63 @@ Nickel's own dynamic linker has resolved every slot by whatever mechanism it
 uses — the mod does not need to know which mechanism that is, only that by
 the time `nf_init` runs, the table in memory is correct, which is the same
 trust every other resolved-by-name symbol in this project already rests on.
+
+### The paragraph above was wrong, and the mistake is left in on purpose
+
+Code review (not a device run this time — a second pair of eyes on the
+archaeology itself) caught it before it shipped: "it does not matter to
+correctness here" and "the mod does not need to know which mechanism [fills
+these in]" both assume there **is** a mechanism — that the two words read
+zero in the static file only because this project's tools can't decode
+whatever populates them at load time. That assumption was never checked
+against the alternative: that they are zero in the file because they are
+**meant to stay zero**, forever, at both compile time and runtime, because
+nothing in Nickel's own compiled code ever dispatches through
+`_ZTV18AbstractController`'s own D1/D0 slots specifically. Every real
+Nickel controller multiply-inherits `QObject` (see "The two vtable writes"
+below) and its own constructor immediately overwrites the vptr
+`AbstractController::AbstractController` set with the DERIVED class's own
+combined vtable — so nothing in normal operation ever destroys an object
+through the base class's isolated table. The linker plausibly never needed
+to populate those two slots because no reachable code path calls through
+them, which is a completely different, and much worse for this mod, than
+"populated by a mechanism these tools can't see."
+
+**The consequence: reading `_ZTV18AbstractController` live at runtime gives
+NULL in both destructor slots, not Nickel's real destructors.** A copy of
+this table into a controller of ours, followed by any virtual destruction of
+that controller (a `D0`/`D1` call through the vtable — which our own
+controller's construction pattern makes newly reachable, unlike every real
+Nickel controller, precisely because we deliberately keep pointing at a copy
+of the BASE table rather than building a full derived one), jumps to address
+0 inside Nickel. This is the exact "ungated call through a resolved pointer"
+class of bug `CLAUDE.md` exists to prevent, self-inflicted by trusting a
+live memory read instead of resolving the two symbols that answer it
+directly.
+
+**The fix**: `_ZN18AbstractControllerD1Ev` (`0xad1358`) and
+`_ZN18AbstractControllerD0Ev` (`0xad1398`) are BOTH separately exported —
+confirmed with `nm -D --defined-only`, same as every other symbol this mod
+resolves — so there was never a reason to lean on the live-copy assumption
+for these two specifically. They are now resolved by name
+(`AbstractController__dtor1`/`__dtor0`, `nfnickel.h`/`nfnickel.cc`) and
+stored into `NFControllerVTable`'s slots 0/1 explicitly
+(`nf_browser_vtable_ready`, `nfbrowser.cc`), NULL-gated the same as every
+other resolved pointer in this project. The live copy is still correct, and
+still used, for the RTTI pointer and slots 2–8 — every one of those DOES
+carry a normal relocation naming its symbol, confirmed by `readelf -r`, so
+reading them live is this project's ordinary "resolve by name, don't
+hardcode" discipline, not a second guess in the same place.
+
+**The generalisable lesson, which is now the same shape twice in this
+project** (the other being the back-gesture baseline in "The back-gesture
+measurement was wrong once, and the reason generalises", above): an absence
+in the data (a missing relocation, a baseline that happens to match one
+hypothesis) was explained by reaching for "the tooling must not be showing
+me something" rather than treating the absence itself as the fact and asking
+what it would mean if that fact were simply true. It compiled, linked, and
+would have passed every check in this rung's own build — the same way
+`getById`'s missing `this` did. It did not reach a device.
 
 ### How `ndbCurrentView` almost certainly identifies a view: `MainWindowController::currentViewName()`
 
@@ -867,12 +942,22 @@ at.
   `MainWindowController::push` needed every stub resolved).
 - Whether `ndbCurrentView` genuinely calls `currentViewName()` — plausible,
   not confirmed, see above.
+- Whose job it is to set up the "d" pointer at `this+4` that
+  `AbstractController::viewLoaded()` also requires before it will answer
+  `true` (see "`AbstractController::ensureViewLoaded` calls slot 8", above).
+  AbstractController's own constructor leaves it zero and nothing this rung
+  adds sets it, so `viewLoaded()` answering `false` even after slot 8 has
+  run a valid `QWidget*` into `this+8` is a real, unverified possibility —
+  not established to matter to anything this rung's own flow depends on
+  (nothing here calls `viewLoaded()`), but worth knowing before anything
+  later in this project does depend on it.
 - **Back.** NOTES.md's rung-1 back-gesture result (`ReadingView` pops to the
   view beneath) was measured for a *reader* pushed via
   `ReadBookActionProxy::onSelected()`, a completely different code path from
   `MainWindowController::push`. Nothing here establishes that back pops a
-  controller pushed this way, or what happens if the controller's `D0`
-  (deleting destructor, copied verbatim from Nickel's own vtable) runs on an
-  object this mod allocated with its own `::operator new` rather than
-  Nickel's. This is exactly what Step 6 (device-only, not this rung's job)
-  exists to check.
+  controller pushed this way, or what happens when the controller's `D0`
+  (deleting destructor, resolved by name — `AbstractController__dtor0`, see
+  "The paragraph above was wrong", above — and stored explicitly, NOT
+  copied from the live vtable) runs on an object this mod allocated with its
+  own `::operator new` rather than Nickel's. This is exactly what Step 6
+  (device-only, not this rung's job) exists to check.

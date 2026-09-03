@@ -59,9 +59,9 @@ bool nf_open_book_staged(QString const& contentId, QString const& dbName, int st
 // AbstractController is Nickel's base UI-controller class. Opaque per the
 // house rule ("Nickel's classes stay opaque") even though nfbrowser.cc, not
 // this file, is what actually builds an object shaped like one -- the
-// typedef stays here because it is the type the four symbols below are
-// resolved AS or against, and every libnickel symbol's resolved type lives
-// in one place per this header's own opening comment. NOT a QObject: its typeinfo
+// typedef stays here because it is the type the symbols below are resolved
+// AS or against, and every libnickel symbol's resolved type lives in one
+// place per this header's own opening comment. NOT a QObject: its typeinfo
 // (0x163ff68 on 4.38.23684) is a plain __class_type_info with no base --
 // given, device-verified fact, not re-derived here.
 typedef void AbstractController;
@@ -82,16 +82,38 @@ extern void (*AbstractController__ctor)(AbstractController *_this);
 
 // The resolved ADDRESS of Nickel's own _ZTV18AbstractController -- an
 // 11-word array (offset-to-top, RTTI pointer, then the 9 slots CLAUDE.md's
-// measured table lists) that nfbrowser.cc copies wholesale at runtime rather
-// than hand-transcribing byte-for-byte, because two of those 9 slots (the
-// destructors) carry no relocation this project's tools could decode
-// statically (NOTES.md). Reading it live sidesteps needing to know how
-// Nickel's own loader populates them -- only that by the time nf_init runs,
-// the table in memory is correct, the same trust every other dlsym'd
-// pointer in this project already rests on. A plain `void**` , not a
-// pointer-to-array-of-11, because nfbrowser.cc indexes it with a runtime
-// loop, not a compile-time struct.
+// measured table lists) that nfbrowser.cc copies at runtime rather than
+// hand-transcribing byte-for-byte, for the RTTI pointer and slots 2-8's
+// sake (every one of THOSE carries a normal R_ARM_ABS32 relocation naming
+// the symbol -- readelf -r confirms it -- so reading them live rather than
+// hardcoding an address is just this project's usual "resolve by name"
+// discipline, nothing more). Slots 0 and 1 (the two destructors) are the
+// exception, and copying them from this table is WRONG, not merely
+// unverified: on 4.38.23684 there is no relocation at all for either word
+// -- readelf -r finds nothing at 0163ff78/0163ff7c, and a raw byte dump
+// across that whole range reads zero -- so a copy from this live table
+// puts a null pointer in both destructor slots. AbstractController__dtor1
+// and AbstractController__dtor0 below are resolved BY NAME instead and
+// must be stored into those two slots explicitly; nfbrowser.cc does this.
+// NOTES.md has the full account, including the wrong assumption ("some
+// mechanism this project's tools can't decode will fill them in by
+// runtime") this replaces. A plain `void**`, not a pointer-to-array-of-11,
+// because nfbrowser.cc indexes it with a runtime loop, not a compile-time
+// struct.
 extern void **AbstractController__vtable;
+
+// The two destructor vtable slots _ZTV18AbstractController itself does NOT
+// populate (see AbstractController__vtable's comment, above) -- resolved
+// separately, by name, because that table cannot be trusted for these two
+// words. D1 ("complete object destructor") tears down the object's own
+// state without freeing `this`; D0 ("deleting destructor") does the same
+// and then frees `this` via operator delete -- both exported
+// (_ZN18AbstractControllerD1Ev at 0xad1358, _ZN18AbstractControllerD0Ev at
+// 0xad1398 on 4.38.23684), both take just `this` in r0. Store these into
+// NFControllerVTable's slots 0/1 explicitly; NEVER take them from a copy
+// of AbstractController__vtable.
+extern void (*AbstractController__dtor1)(AbstractController *_this);
+extern void (*AbstractController__dtor0)(AbstractController *_this);
 
 // MainWindowController::sharedInstance() -- a lazily-constructed singleton
 // accessor, not further disassembled (out of this rung's stated scope; see
