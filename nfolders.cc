@@ -109,8 +109,12 @@ static void nf_on_trigger() {
 }
 
 static int nf_init() {
+    // Every NFNickelDlsym entry is optional (nfnickel.cc), so a miss here is
+    // a real, reachable outcome now -- not hypothetical -- and this is the
+    // only place it gets logged loudly. nf_open_book_staged still refuses to
+    // run rather than call through a null pointer either way.
     if (!nf_nickel_resolve())
-        nh_log("init: a required libnickel symbol did not resolve; nf_open_book_staged will refuse to run rather than crash");
+        nh_log("init: a libnickel symbol did not resolve; book-opening is inert until this is fixed");
 
     if (nf_watch_init(NF_TRIGGER, &nf_on_trigger) != 0) {
         // Non-fatal on purpose. Failing init here would trip NickelHook's

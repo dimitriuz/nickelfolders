@@ -16,15 +16,14 @@
 // else for it to live once every entry has moved out of nfolders.cc.
 extern struct nh_dlsym NFNickelDlsym[];
 
-// True once every symbol above has resolved. Currently this can only ever be
-// called (from nf_init, after NickelHook's own dlsym pass) once every
-// REQUIRED entry in NFNickelDlsym already succeeded -- a missing one is fatal
-// at that pass, before nf_init runs at all, so this cannot yet observe false.
-// It stays as the one named check nf_open_book leans on rather than assuming,
-// so a future change that ever marks one of these symbols optional (a
-// firmware that drops Device::getDbName, say, without the rest of this mod
-// being broken) fails as "book-opening is inert" instead of as a null-pointer
-// dereference.
+// True once every symbol above has resolved. Every NFNickelDlsym entry is
+// .optional = true (see nfnickel.cc for why -- the shared NickelHook
+// failsafe), so a missing one no longer stops nf_init from running at all;
+// it resolves to NULL instead, and THIS is what catches that: nf_open_book
+// and nf_open_book_staged both refuse to run rather than call through a null
+// pointer. A firmware that renames or drops one of these symbols makes
+// book-opening inert -- logged, not a crash, and not a failsafe trip that
+// could take the owner's other NickelHook mods down with it.
 bool nf_nickel_resolve(void);
 
 // The dbName VolumeManager::getById wants for THIS device -- see nfnickel.cc

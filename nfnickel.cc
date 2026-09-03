@@ -9,7 +9,9 @@
 
 #include "nfnickel.h"
 
+#include <QAbstractEventDispatcher>
 #include <QByteArray>
+#include <QCoreApplication>
 #include <QObject>
 #include <QSocketNotifier>
 #include <QString>
@@ -51,14 +53,29 @@ static void    (*ReadBookActionProxy__onSelected)(ReadBookActionProxy *_this);
 static Device        *(*Device__getCurrentDevice)(void);
 static QString const *(*Device__getDbName)(Device const *_this);
 
+// Every entry below is .optional = true, and that is not carelessness on
+// getById of all things -- it is the shared-failsafe rule in CLAUDE.md taken
+// seriously. NickelHook.c resolves this array BEFORE nf_init ever runs
+// (nh.c:158-167), and a non-optional miss there is fatal at that pass --
+// nf_nickel_resolve()'s gate below and nf_open_book_staged's refusal to run
+// are both unreachable in exactly the scenario they exist for, because
+// NickelHook already gave up before either could run. A fatal init trips
+// NickelHook's failsafe, which is SHARED: this device also runs NickelMenu,
+// NickelDBus, kfmon and KOReader, so a symbol renamed on a firmware bump
+// could take their installs down along with this one. Marking every entry
+// optional means a miss instead resolves to NULL, gets logged as "is
+// optional so ignoring", and leaves nf_nickel_resolve() to catch it and make
+// book-opening (and only book-opening) inert -- matching what NOTES.md
+// already claims happens ("if a symbol stops resolving, NickelHook logs it
+// and disarms rather than crashing").
 struct nh_dlsym NFNickelDlsym[] = {
-    {.name = "_ZN13VolumeManager7getByIdERK7QStringS2_",      .out = nh_symoutptr(VolumeManager__getById),          .desc = "VolumeManager::getById"},
-    {.name = "_ZNK6Volume7isValidEv",                         .out = nh_symoutptr(Volume__isValid),                 .desc = "Volume::isValid"},
-    {.name = "_ZN6VolumeD1Ev",                                .out = nh_symoutptr(Volume__dtor),                    .desc = "Volume::~Volume"},
-    {.name = "_ZN19ReadBookActionProxyC1EP7QObjectRK6Volume", .out = nh_symoutptr(ReadBookActionProxy__ctor),       .desc = "ReadBookActionProxy::ReadBookActionProxy"},
-    {.name = "_ZN19ReadBookActionProxy10onSelectedEv",        .out = nh_symoutptr(ReadBookActionProxy__onSelected), .desc = "ReadBookActionProxy::onSelected"},
-    {.name = "_ZN6Device16getCurrentDeviceEv",                .out = nh_symoutptr(Device__getCurrentDevice),        .desc = "Device::getCurrentDevice"},
-    {.name = "_ZNK6Device9getDbNameEv",                       .out = nh_symoutptr(Device__getDbName),               .desc = "Device::getDbName"},
+    {.name = "_ZN13VolumeManager7getByIdERK7QStringS2_",      .out = nh_symoutptr(VolumeManager__getById),          .desc = "VolumeManager::getById",                 .optional = true},
+    {.name = "_ZNK6Volume7isValidEv",                         .out = nh_symoutptr(Volume__isValid),                 .desc = "Volume::isValid",                        .optional = true},
+    {.name = "_ZN6VolumeD1Ev",                                .out = nh_symoutptr(Volume__dtor),                    .desc = "Volume::~Volume",                        .optional = true},
+    {.name = "_ZN19ReadBookActionProxyC1EP7QObjectRK6Volume", .out = nh_symoutptr(ReadBookActionProxy__ctor),       .desc = "ReadBookActionProxy::ReadBookActionProxy", .optional = true},
+    {.name = "_ZN19ReadBookActionProxy10onSelectedEv",        .out = nh_symoutptr(ReadBookActionProxy__onSelected), .desc = "ReadBookActionProxy::onSelected",        .optional = true},
+    {.name = "_ZN6Device16getCurrentDeviceEv",                .out = nh_symoutptr(Device__getCurrentDevice),        .desc = "Device::getCurrentDevice",               .optional = true},
+    {.name = "_ZNK6Device9getDbNameEv",                       .out = nh_symoutptr(Device__getDbName),               .desc = "Device::getDbName",                      .optional = true},
     {0},
 };
 
@@ -262,6 +279,21 @@ int nf_watch_init(char const *path, void (*cb)(void)) {
     }
 
     nf_watch_cb = cb;
+
+    // Whether nf_init runs before or after QCoreApplication exists on THIS
+    // firmware is unestablished -- the spike's poll thread never touched Qt
+    // until trigger time, well after boot, so it never exercised this
+    // ordering. QSocketNotifier needs the current thread's event dispatcher
+    // to already be registered (which needs QCoreApplication to already
+    // exist); if it is not, Qt warns and the notifier is silently never
+    // registered -- a dead notifier that looks, from here, identical to a
+    // working one. The device run has to answer this, not a guess in the
+    // code, so both are logged loudly and the notifier is constructed either
+    // way.
+    if (!QCoreApplication::instance())
+        nh_log("watch: QCoreApplication::instance() is NULL at nf_watch_init -- untested ordering, see nfnickel.cc");
+    if (!QAbstractEventDispatcher::instance())
+        nh_log("watch: QAbstractEventDispatcher::instance() is NULL -- the notifier below will NOT fire, the trigger will silently never work");
 
     // No Q_OBJECT and no moc for anything of ours here, matching the house
     // style (see NFTrigger in nfolders.cc, before this rung): activated() is
