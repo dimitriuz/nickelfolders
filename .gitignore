@@ -18,3 +18,5 @@ compile_commands.json
 # Kobo's own binary, pulled with `tools/kobo.py pull` for the archaeology.
 # 24 MB of proprietary blob: never commit it.
 /libnickel.so.1.0.0
+__pycache__/
+*.pyc
