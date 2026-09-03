@@ -950,8 +950,29 @@ belongs to the flat search result set of §6.5, which is v2.
 
 What v1 needs instead is a **collision guard**, because the per-row bracket
 truncation and `trimmed()` inside `nf_strip_common` are *not* common to all rows
-and could in principle collide. If labels collide, fall back to the raw names
-for the whole listing. Amend §3.4 to say so as part of this task's commit.
+and can collide. If any two labels **within one kind** collide, that kind's rows
+keep their raw names — the check and the fallback are per kind, because §3.2's
+stripping is. Amend §3.4 to say so as part of this task's commit.
+
+**Per kind, not per listing**, and the distinction is observable: a collision
+among folder labels must leave the file labels stripped. Degrading rows that are
+perfectly distinguishable, because two others clashed, is a worse answer than the
+collision it avoids. An earlier draft of this section said "the whole listing",
+which contradicted the per-pass code it shipped alongside — caught in review.
+
+A collision is reachable, not theoretical. Measured on the host:
+
+```
+["Vol zz(a", "Vol zz(b"]   -> [zz] [zz]
+["Set abc(1", "Set abc(2"] -> [abc] [abc]
+```
+
+With **no** space between the common text and the bracket, the prefix backs off
+to the earlier whitespace, so the remainder keeps `zz(a`/`zz(b` and the per-row
+truncation at the unclosed `(` collapses both to `zz` — two characters, so the
+post-loop length guard does not catch it either. Note that the same shape **with**
+a space (`Vol zz (a`) refuses instead of colliding, so the fixture's exact shape
+is load-bearing; the wrong one yields a test that passes for the wrong reason.
 
 - [ ] **Step 1: Write the failing tests**
 
