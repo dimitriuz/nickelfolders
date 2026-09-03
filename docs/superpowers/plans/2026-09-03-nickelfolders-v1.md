@@ -1454,134 +1454,126 @@ All libnickel symbols now live in nfnickel.cc -- one place for every layout
 assumption, which is what CLAUDE.md asks for."
 ```
 
-### Task 7 (Rung 2): An empty screen on Nickel's window stack
+### Task 7 (Rung 2): Nickel's own list controller, showing books we chose
+
+**REPLACES the original Task 7** ("An empty screen on Nickel's window stack",
+which planned a hand-built `AbstractController` subclass). That plan was found
+unbuildable in review and is abandoned. See §1 of the spec for the corrected
+facts and `.superpowers/sdd/.../folder-stack-archaeology.md` for the
+measurements behind this replacement.
+
+**Why this changed.** Building our own controller required a `QObject` base at
+`+0` with the `AbstractController` subobject at `+8`, a real
+`QWeakPointer<QWidget>` at `+4`/`+8`, destructor slots that are zero in Nickel's
+own vtable, and fabricated RTTI so an internal `dynamic_cast<QObject*>` would
+succeed. Archaeology found a concrete controller that supplies **all** of that
+itself, so none of it has to be faked.
 
 **Files:**
-- Create: `nfbrowser.h`, `nfbrowser.cc`
-- Modify: `nfnickel.h`, `nfnickel.cc`, `nfolders.cc`
+- Modify: `nfnickel.h`, `nfnickel.cc` (new symbols, the data-source builder)
+- Rewrite: `nfbrowser.h`, `nfbrowser.cc` — **delete the hand-built vtable and
+  controller entirely.** It is superseded, and leaving fabricated-vtable code in
+  the tree invites someone to use it.
+- Modify: `nfolders.cc` (a trigger verb that shows the list)
 
 **Interfaces:**
-- Consumes: `nf_nickel_resolve`, `nf_watch_init`.
-- Produces: `void nf_browser_show(void)` — constructs the controller and pushes it.
+- Consumes: `nf_nickel_resolve`, `nf_db_name`, `nf_open_book_staged` (unchanged).
+- Produces: `bool nf_browser_show_volumes(QStringList const& contentIds)` —
+  looks each ContentID up, builds a data source, constructs the controller and
+  pushes it. Returns false without side effects if anything is unresolved.
 
-This is the rung the whole architecture rests on, so it deliberately draws
-nothing. A screen that appears, reports itself to the oracle, and pops on back
-is the entire deliverable.
+#### The chain, all measured
 
-- [ ] **Step 1: Measure `sizeof(AbstractController)` — do not guess it**
-
-Read it out of Nickel's **own** `operator new` for a concrete controller, per
-`CLAUDE.md`'s fixed method. `AbstractController::viewLoaded()` returns
-`this+8`, so the object is at least 12 bytes, but "at least" is not a size.
-
-```sh
-NM=~/.cache/koboy-toolchain/arm-linaro-4.9-2014.09/bin/arm-linux-gnueabihf-nm
-OD=~/.cache/koboy-toolchain/arm-linaro-4.9-2014.09/bin/arm-linux-gnueabihf-objdump
-# Find a small concrete controller and its constructor
-$NM -D --defined-only libnickel.so.1.0.0 | grep -E 'ControllerC1E' | head -40
-# Disassemble the caller that news it, and read the movs/mov.w immediate
-$OD -d --start-address=0x<addr> --stop-address=0x<addr+0x80> libnickel.so.1.0.0
-```
-
-Record the number and the address it came from in a comment. Over-allocate on
-top of it, because the constructor cannot be told how much room it has.
-
-- [ ] **Step 2: Resolve every PLT stub in `AbstractController::AbstractController` and `MainWindowController::push`**
-
-Not optional. `tools/plt.sh` does the arithmetic. Skipping this step is what
-cost the crash that `NOTES.md` documents: reading argument registers tells you
-a register holds a pointer, and only the relocation tells you what kind.
-
-```sh
-sh tools/plt.sh 0x<stub-address>
-```
-
-- [ ] **Step 3: Build our vtable**
-
-The measured layout, from `_ZTV18AbstractController` at `0x163ff70` with its
-relocations (see the spec §1):
-
-| Slot | Offset from vptr | Nickel's entry |
+| Step | Symbol / size | Notes |
 |---|---|---|
-| 0 | +0 | `~AbstractController` (D1) |
-| 1 | +4 | `~AbstractController` (D0) |
-| 2 | +8 | `size()` |
-| 3 | +12 | `viewWillAppear()` |
-| 4 | +16 | `viewWillDisappear()` |
-| 5 | +20 | `viewWillBeDestroyed()` |
-| 6 | +24 | `allowedOrientations() const` |
-| 7 | +28 | `navSection() const` |
-| 8 | **+32** | `__cxa_pure_virtual` — **the one we must supply** |
+| Look up a book | `VolumeManager::getById` | already proven on hardware, rung 1 |
+| Hold the books | `QVector<Volume>` | `sizeof(Volume) == 8`, refcounted, cheap to copy |
+| Provide them | `InMemoryDataProvider<Volume>(QVector<Volume> const&)` at `0x1082a90` | refcount-shares the vector, no deep copy |
+| Wrap as a source | `LinearLibraryDataSource<Volume>` at `0xaf88ac` | |
+| The controller | `QuickAccessLibraryController(QSharedPointer<LibraryDataSource<Volume> >)` at `0xf44fb4`, **sizeof 72** (`movs r0,#72` at `0xf499a4`) | a `QObject`; ctor makes **no** `sharedInstance()` calls and **no** connects, so it mutates no shared state |
+| Its view | inherited `GridAndListLibraryController<QuickAccessLibraryView>::loadView` at `0xf46e34` (vtable slot 8, `0x167d8c0`) | allocates the view and writes the `QWeakPointer<QWidget>` itself at `0xf46e8c`/`0xf46e8e` |
+| Show it | `MainWindowController::sharedInstance()` then `::push(controller, animate)` | |
+| Tap opens the book | traced to `_ZN19ReadBookActionProxy10onSelectedEv` | via `setupButton` → `ActionProxyMixin::readBookProxy` → `connectTouchLabel`. **Nickel opens the book with its own bookkeeping — we hook nothing.** |
 
-`ensureViewLoaded` (`0xad1408`) calls slot 8 (`ldr r3,[r3,#32]; blx r3`), which
-is what identifies it as the load-the-view method.
+**Resolve every symbol by name with `nh_dlsym`, `.optional = true`, and NULL-gate
+every call** — the house rule, and the reason rung 1's `nf_db_name` needed a fix.
 
-```cpp
-// Our vtable is Nickel's with slot 8 replaced. Copying the rest rather than
-// reimplementing it is the point: size, viewWillAppear, viewWillDisappear,
-// viewWillBeDestroyed, allowedOrientations and navSection all have real
-// implementations we want, and AbstractController is NOT a QObject so there is
-// no metaobject to fake.
-//
-// Slot 8 is __cxa_pure_virtual in Nickel's own vtable, so leaving it unset is
-// not an option -- it is the only member with no default.
-```
+**Hedge, and use it if the view is wrong:** `ArticleListLibraryController`
+(`0xdcbe70`, sizeof 92) is unambiguously a **full-screen** list and its ctor
+takes the same data source; `VolumeSearchResultsController` (`0xe7511c`,
+sizeof 92) is a third. `QuickAccessLibraryView` normally lives in a menu popup,
+so it may be sized for one. If the pushed screen looks like a popup rather than
+a page, switch controllers — the data source and everything below it is
+identical.
 
-Resolve `_ZTV18AbstractController` by name with `nh_dlsym` like everything else;
-never use the address.
+#### The one thing that is hand-built, and why that is acceptable
 
-- [ ] **Step 4: Wire the NickelMenu entry**
+`QSharedPointer` needs an `ExternalRefCountData` header and Nickel exports no
+way to create a strong one. So build the 12-byte header by hand — but **from the
+public Qt 5.2 source layout**, not from a reverse-engineered offset, which is
+the difference between this and the fabricated RTTI we are avoiding. Use
+libnickel's own exported
+`ExternalRefCountWithCustomDeleter<…<Volume>, NormalDeleter>::deleter` as the
+destroyer, and set `strongref = 2` so the deleter is **never** invoked.
 
-Add to the device's NickelMenu config (`/mnt/onboard/.adds/nm/`):
+That is a deliberate permanent leak of one header per screen. Comment it as
+deliberate, with the reason, so nobody deletes it as a bug: the alternative is
+letting Qt call a deleter on memory whose ownership we cannot prove.
 
-```
-menu_item :library :Folders :cmd_spawn :quiet:/bin/touch /tmp/nfolders-show
-```
+- [ ] **Step 1: Confirm the sizes yourself before writing code**
 
-This is device configuration, not code, and it is why rung 2 needs no new
-trigger mechanism — rung 1 already built the watch.
+Read each `sizeof` out of Nickel's own `operator new` call site and record the
+address in a comment. The addresses above are from the archaeology report;
+confirm rather than copy them. A wrong size here corrupts the heap.
 
-- [ ] **Step 5: Build, push, reboot**
+- [ ] **Step 2: Delete the superseded controller**
 
-Per the protocol at the head of this section.
+Remove the hand-built vtable, the `AbstractController` construction, and
+`nf_browser_show`. Keep nothing "in case" — the archaeology report is the record.
 
-- [ ] **Step 6: Verify — and this is where the negative control matters most**
+- [ ] **Step 3: Build the data source and push**
 
-| Check | Command | Expected |
-|---|---|---|
-| Baseline view | tap into the stock library first | `qndb -m ndbCurrentView` reports a library view, **not** Home |
-| Screen appeared | tap the NickelMenu item, then the oracle | a view that is **not** the baseline |
-| No crash | `pidof nickel` unchanged; unfiltered crash grep | PID same, nothing logged |
-| Back pops | press back, then the oracle | **the baseline view**, not Home |
-| Panel agrees | `python3 tools/kobo.py shot` | an empty screen where the library was |
+Trigger it from the existing inotify path with a distinct verb so the book-open
+path still works unchanged.
 
-**Set the baseline to a library view, never to Home.** This is the exact
-mistake `NOTES.md` records: Home is also what the rival hypothesis predicts, so
-a measurement taken from Home discriminates nothing — and it was written down as
-confirmed anyway. If the baseline is Home, the run proves nothing regardless of
-its result.
+- [ ] **Step 4: Build clean**
 
-**Negative control:** temporarily point slot 8 at a null pointer, push, and
-trigger. Nickel must crash or refuse *visibly*. If a broken slot 8 produces the
-same observation as a working one, the check is vacuous and the rung is not
-verified. Restore, rebuild, re-verify.
+`./nickeltc make` with zero warnings and zero pkg-config noise;
+`nm libnfolders.so | grep GLOBAL__sub_I` **must print nothing** (a file-scope
+object with a dynamic initialiser segfaults Nickel at plugin load — it happened
+in rung 1); `make test` still 63 + 27.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 5: Device verification — the controller runs this**
 
-```bash
-git add nfbrowser.h nfbrowser.cc nfnickel.h nfnickel.cc nfolders.cc
-git commit -m "feat: a real screen on Nickel's window stack
+| Check | Expected |
+|---|---|
+| Baseline | tap into the stock library first; oracle must report a library view, **never Home** |
+| Screen appears | `qndb -m ndbCurrentView` reports something other than the baseline |
+| Panel | screenshot shows a readable list of the books asked for, full-screen rather than a popup |
+| **Tap a book** | it opens in the stock reader — `ReadingView` plus a screenshot of the right book |
+| Back from reader | returns to **our list**, not Home |
+| Back from list | returns to the **library baseline** |
+| No crash | PID unchanged; unfiltered `logread \| grep -iE 'hindenburg\|segfault\|SIGSEGV'` empty |
+| Responsiveness | the UI must answer touch — a GUI-thread hang shows no crash and an unchanged PID |
+| Negative control | ask for a list containing one ContentID no book has; that row must be absent or inert, and nothing may crash |
 
-An AbstractController subclass over Nickel's own vtable with slot 8 replaced --
-the single __cxa_pure_virtual, at +32, which ensureViewLoaded calls. Every other
-slot keeps Nickel's implementation, and AbstractController is not a QObject so
-there is no metaobject to fake.
+- [ ] **Step 6: Commit, and record the measurements in `NOTES.md`**
 
-It draws nothing on purpose. Appearing, reporting to ndbCurrentView, and popping
-on back is the whole deliverable, measured from a LIBRARY baseline rather than
-Home -- Home is what the rival hypothesis predicts too, and NOTES.md records
-what happened the last time a baseline was set to the expected value."
-```
+### Re-planning note for Tasks 8-11
+
+The original Tasks 8 (draw a list widget) and 10 (wire tap-to-open) are largely
+**absorbed**: Nickel draws the rows and opens the book. Two v1 features are now
+in question and must be re-planned after rung 2 lands, not assumed:
+
+- **Our label shortening** (§3.2) may be unusable, because Nickel renders each
+  row from the `Volume`'s own metadata rather than from a string we supply.
+- **The greyed "on disk, no database row" state** (§3.5) may be inexpressible,
+  because a row *is* a `Volume` and a file without one has nothing to put in the
+  list.
+
+Reading progress conversely becomes free. **Folders are not solved by this
+route** — these controllers list `Volume`s. Three candidates are on record for
+the folder half; pick one after rung 2 proves the chain.
 
 ### Task 8 (Rung 3): A list widget with hardcoded rows
 
