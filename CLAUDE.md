@@ -124,6 +124,11 @@ see `DEVICE.local.md`.
   `.uninstall_xflag = NULL` is there despite being unused.
 - **Library names under 3 letters are reserved** for the upstream mod authors.
   `libnfolders.so`, never `libnf.so`.
+- **`nh_log` truncates at 256 bytes**, silently. Book paths on this device run
+  to 230+ characters and Cyrillic ones are 2 bytes per character, so a logged
+  ContentID is routinely cut. Never build a measurement on a log line that is
+  supposed to carry a whole path — it already produced 15 false results once
+  (`NOTES.md`).
 - The reference device already runs **NickelMenu, NickelDBus, kfmon, KOReader
   and koboy**. That is a feature (`qndb` is an oracle) and a risk (the shared
   failsafe above).
@@ -157,6 +162,13 @@ see `DEVICE.local.md`.
   `file:///mnt/onboard/<relative path>` verbatim; Nickel imports recursively and
   keeps the whole path, it just refuses to show it as a tree. So the browser
   needs **no import step and no filesystem walk** — one query gives the tree.
+- **Import is effectively complete, but not universally.** 226 of the 227 book
+  files on the reference device have a row `getById` finds; the one exception is
+  a truncated 8 MiB copy. Every format present works — `.epub`, `.kepub.epub`,
+  `.cbz`, `.cbr`, `.pdf`, `.txt` — including `.cbr`, which is not on Kobo's
+  official list but imports and renders. Non-ASCII and 230-character paths are
+  a non-issue. So **the browser must treat "file on disk with no row" as a
+  normal case** and say so in the row, rather than asserting or hiding it.
 - **Nickel already contains folder-browsing machinery**, used for notebooks and
   the Dropbox/Drive views: `RootFolder`, `BrowseableFolder`, `FolderItem`,
   `FolderItemManager`, `FolderItemDataSource`, `FolderItemListWidget`,

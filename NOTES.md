@@ -256,28 +256,60 @@ Note also that NickelDBus cannot navigate to the library on its own — its only
 view-changing methods are `mwcHome` and `bwmOpenBrowser` — so a non-Home
 baseline needs either a tap from the owner or the web browser view standing in.
 
+### Formats, and whether the library is fully imported (#2, #5, #4)
+
+Measured 2026-09-03 by censusing **every one of the 227 book files** on the card
+through the mod's own `getById` + `isValid` at stage 2 — no navigation, and
+authoritative because it is Nickel's own lookup rather than a guess about the
+schema.
+
+| | |
+|---|---|
+| Files with a row `getById` finds | **226 of 227** |
+| The one exception | `Fullmetal Alchemist v26 …cbz` at **exactly 8,388,608 bytes** (8 MiB) against 99 MB and 119 MB for v25 and v27 — a **truncated copy**. It still has the `PK\003\004` zip header, so it looks like a file, and Nickel's import rejected it. Not a Nickel limitation. |
+| Formats present | 122 `.cbz`, 94 `.cbr`, 6 `.pdf`, 4 `.epub` (2 of them `.kepub.epub`), 1 `.txt` — **all with rows** |
+| Formats that open | `.kepub.epub`, `.epub`, `.cbz`, `.cbr`, `.pdf`, `.txt` all navigate `HomePageView` → `ReadingView`, nickel PID unchanged |
+| Rendering | Confirmed by framebuffer grab for `.epub` and `.cbr`. **`.cbr` works** — Sandman #50 rendered, rotated to landscape by Nickel's comic reader — which is worth knowing because CBR is not on Kobo's official supported-format list. |
+| Non-ASCII and long paths | **A non-issue.** Accented (`Pokémon …`), Cyrillic, parenthesised and 230-character paths all resolve. This is most of #4. |
+| KEPUB ContentID shape | The plain volume path is what `getById` wants. The worry that a KEPUB needs its chapter-suffixed ContentID was unfounded. |
+
+**What this means for the browser:** the folder tree really is derivable from
+the database alone, and the assumption that a listed file can be opened holds
+for 226 of 227. But it does not hold universally, and the exception is the
+mundane kind — an interrupted copy — so **the browser must handle "file on disk
+with no row" as a normal case**, not an assertion. Greying the row out with the
+reason is better than hiding it, since a silently missing book is how you spend
+an evening wondering where volume 26 went.
+
+### A second instrument mistake, and the constraint behind it
+
+The census first reported **15 files as `STALE`** — no result associable with
+the trigger. The pattern gave it away: the 13 longest paths and the 2 Cyrillic
+ones. `nh_log` **truncates at 256 bytes** (NickelHook.h says so plainly), so
+the `contentId` log line was cut, and the census proved association by matching
+the file's *full* path against the log. Re-run matching a 60-byte **prefix**
+instead, all 15 came back `VALID`.
+
+So: **do not build a measurement on log lines carrying untruncated data.** That
+is now the second time in this project an instrument produced a confident wrong
+answer — after the back-gesture baseline — and both times the tell was that the
+failures were *patterned* rather than random. A patterned failure is almost
+always the instrument.
+
 ### Open questions — what a device run still has to answer
 
 These are cheap now: the mod is installed and `tools/kobo.py open` drives it
 without a rebuild. Numbered so they can be referred to; #1 was answered on
 2026-09-03 and is in Results.
 
-2. **Other formats.** Only a plain sideloaded `.epub` has been opened. The
-   library also holds `.kepub.epub`, `.cbz` and `.pdf`, and KEPUBs matter most
-   because their chapter ContentIDs have a different shape — the volume-level
-   ID may or may not be what `getById` wants.
 3. **Repeated and consecutive opens.** Opening a second book without an
    intervening back, and opening the same book twice, are both untested. The
    proxy is currently leaked per open, so this is also where that shows up.
-4. **A book in a deep folder with awkward characters.** The test book was one
-   level down. The library has paths with accents (`Pokémon …`), parentheses
-   and `+` — worth one open each, since ContentID is a URL and encoding is
-   exactly the kind of thing that silently differs.
-5. **Whether Nickel's import is actually complete.** The browser plan assumes
-   every file on the card has a `content` row. 132 book files were counted on
-   the filesystem; nobody has compared that against the database.
 6. **A book on an SD card**, if the owner uses one — that is the case `dbName`
    most plausibly exists for, and empty may stop being correct.
+
+Answered 2026-09-03: **#1** (back pops, in Results), **#2** and **#5** (below),
+and **#4** as a side effect of #5's census.
 
 Not device questions, but owed before this is a product:
 
