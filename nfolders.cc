@@ -122,7 +122,12 @@ static int nf_init() {
         // (CLAUDE.md), which is a wildly disproportionate response to a mod
         // that, at this rung, still has no UI and cannot be triggered any
         // other way.
-        nh_log("init: could not set up the trigger watch; mod is inert");
+        //
+        // A non-zero return also covers "the watch was built but is already
+        // known dead" (nf_watch_init logged specifically why, above this) --
+        // not just outright setup failure. Either way, the trigger will not
+        // work, so this must not be followed by the "ready" line below.
+        nh_log("init: trigger watch is not usable; mod is inert (see 'watch:' lines above for why)");
         return 0;
     }
 

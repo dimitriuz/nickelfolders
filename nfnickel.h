@@ -55,7 +55,10 @@ bool nf_open_book_staged(QString const& contentId, QString const& dbName, int st
 // nfnickel.cc) -- for IN_CLOSE_WRITE/IN_MOVED_TO events whose name matches
 // path's basename. `cb` runs with no arguments on whatever thread calls
 // nf_watch_init (the GUI thread, in this mod), once per matching event.
-// Returns 0 on success, -1 on failure (already logged).
+// Returns 0 on success, -1 on failure OR if the watch was set up but is
+// known dead on arrival (no QAbstractEventDispatcher for this thread yet --
+// see nfnickel.cc); either way the reason is already logged, and the caller
+// must not report readiness on a non-zero return.
 int nf_watch_init(char const *path, void (*cb)(void));
 
 #endif

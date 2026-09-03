@@ -320,22 +320,74 @@ opened in the session, with no reader lifetime to manage and no accumulating
 state. The `browse → tap → read → back → same folder` loop needs no special
 handling.
 
-It also prices the probe's deliberate leak: 52 bytes × 20 opens is ~1 kB and
-did not register. Still worth fixing before this is a product — a mod lives for
-weeks between reboots — but it is not a correctness problem.
+It also prices the probe's deliberate leak. The measured *object* is 52 bytes
+(see "Object sizes" above), but the probe's own `::operator new(512)` call —
+the same deliberate over-allocation `getById`'s output buffer uses, so the
+constructor is never told it has too little room — is what is actually charged
+per open, so the real cost is 512 bytes × 20 opens, ~10 kB, and it still did
+not register against RSS. Still worth fixing before this is a product — a mod
+lives for weeks between reboots — but it is not a correctness problem at this
+scale. See "The proxy leak, revisited" below for why it is still unpaid as of
+Task 6.
 
 ### Open questions
 
-**None.** #1–#6 are all answered above, as of 2026-09-03.
+**None** of #1–#6 remain open, as of 2026-09-03. Two of the three items below
+were paid in Task 6 (2026-09-03, rung 1: `nfnickel.cc`); the proxy leak was
+not, on purpose, and the paragraph after this list explains why.
 
 Not device questions, but owed before this is a product:
 
-- The 52-byte-per-open proxy leak is a deliberate probe shortcut (see #3 for
-  its measured scale).
-- The 500 ms poll thread is a probe mechanism; a real mod is driven by a menu
-  item or a view, not by a file in `/tmp`.
-- `dbName` must come from `Device::getDbName()` rather than being hardcoded
-  empty — see below.
+- ~~The 500 ms poll thread is a probe mechanism~~ — replaced by an inotify
+  watch through a `QSocketNotifier` in Task 6.
+- ~~`dbName` must come from `Device::getDbName()` rather than being hardcoded
+  empty~~ — done in Task 6; see "dbName, and SD cards (#6)" below, which this
+  no longer contradicts.
+- **The proxy leak is still unpaid.** Task 6 parents every
+  `ReadBookActionProxy` to a `QObject` so Qt *could* own it, but that parent is
+  itself never destroyed (a permanent, process-lifetime placeholder), so
+  nothing is actually freed — the footprint is unchanged from the spike, at
+  **512 bytes/open** (the allocation request above, not the 52-byte object).
+  See "The proxy leak, revisited" below for what would need to be established
+  before this can be paid.
+
+### The proxy leak, revisited (#3, still open)
+
+Task 6 (2026-09-03) tried to settle whether `onSelected()` frees or
+self-deletes the proxy on some path, so that the leak could be closed rather
+than merely deferred to an immortal parent. It could not: `tools/plt.sh`
+could not resolve `onSelected`'s call targets in the time available, so
+whether the object handed to the 28-byte worker mentioned above (in "Object
+sizes") is `this` — which would mean the worker, not our caller, ends up
+responsible for the proxy's lifetime — is still unknown.
+
+**What would settle it**, the next time this is picked up:
+
+1. Disassemble `ReadBookActionProxy::onSelected()` at `0x00c8bacc` in full —
+   the earlier pass only established that it "reads the proxy's own `Volume`
+   at `+12` and otherwise touches only globals" and allocates a 28-byte
+   worker on one path; it did not follow what happens to `this` afterward.
+2. Resolve **every** PLT stub it calls, per the standing method (`tools/plt.sh`,
+   `CLAUDE.md` "Method: adding a new libnickel call") — this is exactly the
+   step that caught `getById`'s missing `this` the first time, and skipping it
+   here would be the same mistake in a new place.
+3. Specifically determine whether the 28-byte worker is handed `this` (the
+   proxy) and takes ownership of it (e.g. deletes it when the worker itself
+   finishes), or whether the proxy is expected to outlive `onSelected()`
+   entirely and be freed by its caller. Nickel's own call site
+   (`ActionProxyMixin::readBookProxy`, see "Object sizes") is worth
+   re-examining for what it does with the proxy pointer *after* calling
+   `onSelected()` on it, if anything — that is the real caller this mod is
+   standing in for.
+
+Do not ship a `deleteLater()` (or a direct `delete`) on the proxy based on a
+guess about the answer. `VolumeManager::getById`'s missing `this` is the
+standing example of what a wrong guess about a Nickel object's ownership
+costs here: it crashed Nickel on the first device run, from code that also
+compiled, linked and resolved cleanly. 512 bytes/open (~300 kB/month at twenty
+opens a day) is a real but small cost; a wrong guess about who owns a live
+`QObject` inside Nickel's own UI is not a comparable risk to take to close it
+before the archaeology above is done.
 
 ## dbName, and SD cards (#6)
 

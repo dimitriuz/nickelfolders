@@ -1,11 +1,15 @@
 // NickelFolders -- libnickel call surface + trigger watch.
 //
-// This is where the three debts nfolders.cc (the spike) deliberately incurred
-// get paid: the hardcoded dbName, the leaked ReadBookActionProxy, and the
-// 500 ms poll thread. Nothing about what the mod DOES changes here -- see
-// nf_open_book_staged, which is nf_open_book(QString,QString,int) from the
-// spike unchanged except for its return value and where the proxy's parent
-// comes from.
+// This is where two of the three debts nfolders.cc (the spike) deliberately
+// incurred get paid -- the hardcoded dbName and the 500 ms poll thread -- and
+// where the third (the leaked ReadBookActionProxy) gets accurately documented
+// instead: parenting it to an immortal owner does not free it, only defers it
+// forever, so the footprint is unchanged from the spike. See the comment on
+// nf_proxy_owner and nf_open_book_staged for why, and NOTES.md's open items
+// for the archaeology freeing it would need. Nothing about what the mod DOES
+// changes here -- see nf_open_book_staged, which is
+// nf_open_book(QString,QString,int) from the spike, unchanged except for its
+// return value.
 
 #include "nfnickel.h"
 
@@ -18,6 +22,8 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/limits.h> // NAME_MAX
+#include <stdio.h>        // snprintf
 #include <string.h>
 #include <sys/inotify.h>
 #include <unistd.h>
@@ -93,7 +99,17 @@ bool nf_nickel_resolve(void) {
 // model that does. Nickel itself never passes a constant: all 117 call sites
 // of getById pass this in a register computed just before the call. NOTES.md
 // #6 has the full derivation.
+//
+// Both callers (nf_open_book, and nf_on_trigger in nfolders.cc) reach this
+// BEFORE nf_open_book_staged's nf_nickel_resolve() gate -- they need a
+// dbName to pass INTO that call, so this cannot lean on that gate having
+// already run. With every NFNickelDlsym entry .optional = true, a firmware
+// that renames either symbol below leaves these two function pointers NULL,
+// and calling through a NULL function pointer is `blx` to address 0 inside
+// Nickel -- so this function guards itself rather than assuming a caller did.
 QString const *nf_db_name(void) {
+    if (!Device__getCurrentDevice || !Device__getDbName)
+        return NULL;
     Device *dev = Device__getCurrentDevice();
     if (!dev)
         return NULL;
@@ -102,10 +118,14 @@ QString const *nf_db_name(void) {
 
 // The proxy's `parent` argument is passed straight through to its QObject
 // base -- confirmed in the disassembly of readBookProxy, NOTES.md -- so any
-// QObject of ours works as the parent and Qt owns the proxy from construction
-// onward. This one QObject has no other job: constructed once, on first use,
-// and never freed -- a permanent, process-lifetime placeholder, not a
-// per-open leak, exactly like the spike's nf_trigger was.
+// QObject of ours works as the parent, and Qt destroys a child no later than
+// when its parent is destroyed. But `owner` here is NEVER destroyed -- it is
+// a function-local static, constructed once on first use and never freed --
+// so parenting every proxy to it does not free anything; it only defers every
+// proxy to an object that outlives the process. THIS DOES NOT PAY THE LEAK
+// DEBT. See the comment where the proxy is constructed, below, for what is
+// and is not established about freeing it, and why this rung ships it
+// unfreed on purpose rather than guessing.
 static QObject *nf_proxy_owner() {
     static QObject *owner = new QObject();
     return owner;
@@ -166,17 +186,33 @@ bool nf_open_book_staged(QString const& contentId, QString const& dbName, int st
         return true;
     }
 
-    // 52 bytes on this firmware, read out of the `operator new` call inside
-    // ActionProxyMixin::readBookProxy -- i.e. Nickel's own allocation for this
-    // exact object. Over-allocated for the same reason as volbuf above.
+    // sizeof(ReadBookActionProxy) == 52 on this firmware, read out of the
+    // `operator new` call inside ActionProxyMixin::readBookProxy -- i.e.
+    // Nickel's own allocation for this exact object. We ask our own operator
+    // new for 512, not 52: over-allocated for the same reason as volbuf
+    // above, and that headroom is what makes the real per-open cost 512
+    // bytes, not the measured object size -- see below.
     ReadBookActionProxy *proxy = static_cast<ReadBookActionProxy*>(::operator new(512));
     memset(proxy, 0, 512);
 
-    // Qt owns the proxy through the parent below, so there is nothing to
-    // delete here and nothing leaks -- the parent's destruction takes it.
-    // This replaces the spike's deliberate 52-byte-per-open leak (~1 kB per
-    // 20 opens, measured; immaterial in a probe, wrong in a mod that runs for
-    // weeks).
+    // NOT FREED, and parenting to nf_proxy_owner() (above) does not change
+    // that: that owner is never destroyed, so Qt never destroys this child
+    // either -- the proxy is deferred to an immortal object, not freed. The
+    // per-open footprint is therefore UNCHANGED from the spike's deliberate
+    // leak: 512 bytes/open (this call's own allocation request, not the
+    // measured 52-byte object), ~10 kB per 20 opens, on the order of 300 kB a
+    // month at twenty opens a day.
+    //
+    // This is a known, documented debt, not an oversight: freeing it needs
+    // first establishing whether onSelected() (0x00c8bacc) frees or
+    // self-deletes the proxy on some path. NOTES.md already records that it
+    // allocates a 28-byte worker on one path -- exactly why the spike never
+    // freed it -- and resolving onSelected's PLT stubs with tools/plt.sh to
+    // settle that did not succeed. Shipping a speculative deleteLater() on an
+    // object whose lifetime Nickel may already control is the same class of
+    // guess that crashed Nickel once already (VolumeManager::getById's
+    // history, this file's opening comment) -- not a trade worth making
+    // blind. NOTES.md's open items records the archaeology this needs.
     ReadBookActionProxy__ctor(proxy, nf_proxy_owner(), v);
     nh_log("open: proxy constructed at %p", proxy);
 
@@ -221,7 +257,23 @@ bool nf_open_book(QString const& contentId) {
 // reboot, same as before.
 
 static void (*nf_watch_cb)(void) = NULL;
-static QByteArray       nf_watch_name;      // basename to match, e.g. "nfolders-open"
+
+// POD, NOT QByteArray, and this is load-bearing, not style: a file-scope
+// QByteArray here previously segfaulted Nickel on every boot. NickelHook's
+// __attribute__((constructor)) nh_init runs from THIS library's .init_array
+// before this translation unit's own C++ dynamic initialiser
+// (_GLOBAL__sub_I_nfnickel.cc) does -- confirmed with readelf, see the fix
+// report -- and nh_init calls straight through nf_init -> nf_watch_init
+// before that initialiser has run. A QByteArray assignment there dereferenced
+// a `d` pointer that had never been constructed (still zeroed .bss), which is
+// a load from address 0. POD types are always zero-initialised by .bss
+// itself, with no constructor to race against, which is why NO file-scope
+// object in this translation unit may have a non-trivial (dynamically
+// initialised) constructor: this is the only kind of global whose
+// initialisation order relative to nh_init is not guaranteed. Every other
+// static above and below this line is a plain pointer for exactly this
+// reason -- do not add another QString/QByteArray/QObject/etc. at file scope.
+static char             nf_watch_name[NAME_MAX + 1]; // basename to match, e.g. "nfolders-open"
 static QSocketNotifier *nf_watch_notifier = NULL;
 
 // Reads and discards whatever inotify has queued, invoking nf_watch_cb once
@@ -241,8 +293,12 @@ static void nf_watch_ready(int fd) {
 
     for (char *p = buf; p < buf + n; ) {
         struct inotify_event *ev = reinterpret_cast<struct inotify_event*>(p);
+        // ev->name is NUL-terminated by the kernel (padded with NULs to
+        // ev->len), so a plain strcmp is safe -- no QByteArray construction
+        // per event, and no file-scope Qt object to compare against (see
+        // nf_watch_name's own comment for why there cannot be one).
         if (ev->len && (ev->mask & (IN_CLOSE_WRITE | IN_MOVED_TO)) &&
-            nf_watch_name == QByteArray(ev->name)) {
+            strcmp(nf_watch_name, ev->name) == 0) {
             if (nf_watch_cb)
                 nf_watch_cb();
         }
@@ -257,7 +313,13 @@ int nf_watch_init(char const *path, void (*cb)(void)) {
     // a real possibility -- the fallback exists only so a malformed argument
     // fails safely (an empty dir string) rather than reading before index 0.
     QByteArray dir  = (slash >= 0 ? qpath.left(slash) : QStringLiteral(".")).toUtf8();
-    nf_watch_name   = qpath.mid(slash + 1).toUtf8();
+    // A byte copy into the POD buffer, not a QByteArray assignment -- see
+    // nf_watch_name's declaration for why it is POD in the first place.
+    // `dir` and `name` above/here are LOCAL QByteArrays, constructed at
+    // runtime when this function executes, which is safe; the file-scope
+    // object is the one that cannot have a constructor to run.
+    QByteArray name = qpath.mid(slash + 1).toUtf8();
+    snprintf(nf_watch_name, sizeof nf_watch_name, "%s", name.constData());
 
     // IN_NONBLOCK: this fd is driven entirely by the Qt event loop and must
     // never block the GUI thread. IN_CLOEXEC: it must not leak across a
@@ -288,11 +350,14 @@ int nf_watch_init(char const *path, void (*cb)(void)) {
     // exist); if it is not, Qt warns and the notifier is silently never
     // registered -- a dead notifier that looks, from here, identical to a
     // working one. The device run has to answer this, not a guess in the
-    // code, so both are logged loudly and the notifier is constructed either
-    // way.
+    // code, so both are logged loudly, and the notifier is still constructed
+    // either way -- but the caller (nf_init) must NOT report readiness when
+    // this is going to be dead on arrival, so the return value reflects the
+    // dispatcher check, not just whether the syscalls above succeeded.
     if (!QCoreApplication::instance())
         nh_log("watch: QCoreApplication::instance() is NULL at nf_watch_init -- untested ordering, see nfnickel.cc");
-    if (!QAbstractEventDispatcher::instance())
+    bool dispatcherLive = QAbstractEventDispatcher::instance() != NULL;
+    if (!dispatcherLive)
         nh_log("watch: QAbstractEventDispatcher::instance() is NULL -- the notifier below will NOT fire, the trigger will silently never work");
 
     // No Q_OBJECT and no moc for anything of ours here, matching the house
@@ -305,5 +370,10 @@ int nf_watch_init(char const *path, void (*cb)(void)) {
     QObject::connect(nf_watch_notifier, &QSocketNotifier::activated,
                       [fd](int) { nf_watch_ready(fd); });
 
-    return 0;
+    // -1 here does not mean the notifier wasn't built -- it was, just above,
+    // deliberately (see the comment on the dispatcher check). It means the
+    // caller must not claim the watch is ready when it demonstrably is not:
+    // nf_init logs "could not set up" and stays silent on "ready" rather than
+    // printing a readiness line for a watch that already knows it is dead.
+    return dispatcherLive ? 0 : -1;
 }
