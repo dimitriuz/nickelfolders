@@ -1,0 +1,9 @@
+#!/bin/sh
+# Runs a command inside the NickelTC toolchain image, which is the only
+# compiler NickelHook mods are supposed to be built with -- it is GCC 4.9
+# against Nickel's own Qt 5.2.1, so a mod built with anything else can link
+# fine here and still be subtly wrong on the device.
+exec docker run --rm \
+    -v "$(pwd):$(pwd)" -w "$(pwd)" \
+    -u "$(id -u):$(id -g)" \
+    ghcr.io/pgaskin/nickeltc:1.0 "$@"

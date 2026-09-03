@@ -1,0 +1,20 @@
+# make gitignore
+.kdev4/
+*.kdev4
+.kateconfig
+.vscode/
+.idea/
+.clangd/
+.cache/
+compile_commands.json
+/KoboRoot.tgz
+/libnfolders.so
+/nfolders.o
+
+# device credentials and local scratch
+/device.local
+/.fb.raw
+/screen*.png
+# Kobo's own binary, pulled with `tools/kobo.py pull` for the archaeology.
+# 24 MB of proprietary blob: never commit it.
+/libnickel.so.1.0.0
