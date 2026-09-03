@@ -176,6 +176,46 @@ static void test_sort_is_deterministic(void) {
     }
 }
 
+// Every book format measured on the card, plus the .kepub.epub special case.
+static void test_allowlist_admits_the_measured_formats(void) {
+    CHECK(nf_is_book_name("Some Book.epub"));
+    CHECK(nf_is_book_name("Some Book.kepub.epub"));
+    CHECK(nf_is_book_name("Volume 1.cbz"));
+    CHECK(nf_is_book_name("Sandman 50.cbr"));
+    CHECK(nf_is_book_name("Booklet.pdf"));
+    CHECK(nf_is_book_name("SHOUTING.CBZ"));
+}
+
+// Every non-book actually present on the card on 2026-09-03. If this list ever
+// shrinks, something started leaking into the listing.
+static void test_allowlist_rejects_the_measured_junk(void) {
+    CHECK(!nf_is_book_name("metadata.calibre"));
+    CHECK(!nf_is_book_name("driveinfo.calibre"));
+    CHECK(!nf_is_book_name("KOBOY-INSTALL.md"));
+    CHECK(!nf_is_book_name("sketch1.svg"));
+    CHECK(!nf_is_book_name("metadata.pdf.lua"));
+    CHECK(!nf_is_book_name("WPSettings.dat"));
+    CHECK(!nf_is_book_name("IndexerVolumeGuid"));
+}
+
+// The card's ONLY .txt is koboy's probe file, which Nickel imported as a book.
+// It HAS a database row, so no greyed-row logic would catch it -- the allowlist
+// is the only thing that keeps it out. Spec section 3.5.
+static void test_allowlist_excludes_txt_deliberately(void) {
+    CHECK(!nf_is_book_name("koboy-probe-Io.txt"));
+}
+
+static void test_hidden_dirs(void) {
+    CHECK(nf_is_hidden_dir(".kobo"));
+    CHECK(nf_is_hidden_dir(".adds"));
+    // Measured: a KOReader sidecar sits in plain sight at the card root.
+    CHECK(nf_is_hidden_dir("calibrewebdownload2055pdf2055.sdr"));
+    CHECK(nf_is_hidden_dir("System Volume Information"));
+    CHECK(!nf_is_hidden_dir("books"));
+    CHECK(!nf_is_hidden_dir("Comics"));
+    CHECK(!nf_is_hidden_dir("Sandman Mystery Theatre"));
+}
+
 int main(void) {
     test_unpadded_volume_dirs();
     test_strip_fullmetal();
@@ -189,5 +229,9 @@ int main(void) {
     test_sort_folders_before_files();
     test_sort_uses_natural_order_within_kind();
     test_sort_is_deterministic();
+    test_allowlist_admits_the_measured_formats();
+    test_allowlist_rejects_the_measured_junk();
+    test_allowlist_excludes_txt_deliberately();
+    test_hidden_dirs();
     NF_TEST_MAIN_END
 }

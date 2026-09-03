@@ -204,3 +204,20 @@ void nf_sort_entries(QVector<nf_entry> *entries) {
         (*entries)[j + 1] = key;
     }
 }
+
+bool nf_is_book_name(QString const& name) {
+    return !nf_book_extension(name).isEmpty();
+}
+
+bool nf_is_hidden_dir(QString const& name) {
+    if (name.startsWith(QLatin1Char('.')))
+        return true;
+    // A KOReader sidecar directory, and one sits at the reference card's root
+    // in plain sight rather than hidden.
+    if (name.endsWith(QStringLiteral(".sdr"), Qt::CaseInsensitive))
+        return true;
+    // Windows leaves this on any FAT volume it has touched. Not ours to show.
+    if (name.compare(QStringLiteral("System Volume Information"), Qt::CaseInsensitive) == 0)
+        return true;
+    return false;
+}

@@ -33,4 +33,12 @@ void nf_strip_common(QStringList *names);
 // Stable. Spec section 3.3.
 void nf_sort_entries(QVector<nf_entry> *entries);
 
+// True for a name v1 will show as a book. Extension allowlist only -- see
+// NF_EXTS in nffmt.cc for why ".txt" is not on it.
+bool nf_is_book_name(QString const& name);
+
+// True for a directory v1 hides. An extension allowlist does not touch
+// directories, so they need their own rule.
+bool nf_is_hidden_dir(QString const& name);
+
 #endif
