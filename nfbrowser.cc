@@ -27,22 +27,43 @@ bool nf_browser_show_volumes(QStringList const& contentIds) {
         return false;
     }
 
-    // NULL only if Device::getCurrentDevice() itself failed -- see
-    // nf_db_name's own comment -- in which case "" (this device's own
-    // internal-storage value) is the least surprising fallback, same
-    // default nf_open_book uses.
-    QString const *db = nf_db_name();
-    static QString const empty;
-
-    NFSharedPtr source;
-    if (!nf_build_volume_source(contentIds, db ? *db : empty, &source)) {
-        nh_log("browser: could not build a data source, refusing");
-        return false;
-    }
-
+    // Checked BEFORE building the data source, not after: nf_build_volume_
+    // source allocates real memory (the provider, the source, two refcount
+    // headers) and hands it nowhere else if this function stops before
+    // constructing the controller. Rather than building that, discovering
+    // sharedInstance() failed, and then having to free four separate
+    // objects correctly (including reasoning about the by-value refcount
+    // chain nf_build_volume_source's own comment describes, which is not
+    // something to redo casually on a rarely-exercised failure path), this
+    // just fails fast before anything is allocated -- sharedInstance()
+    // returning null this early in Nickel's life is implausible anyway, so
+    // this reordering costs nothing on the success path.
     void *mwc = MainWindowController__sharedInstance();
     if (!mwc) {
         nh_log("browser: MainWindowController::sharedInstance() returned null, refusing");
+        return false;
+    }
+
+    // NULL only if Device::getCurrentDevice() itself failed -- see
+    // nf_db_name's own comment -- in which case a fresh, empty QString (this
+    // device's own internal-storage value) is the least surprising
+    // fallback, same default nf_open_book uses. A plain local, not a
+    // function-local static like nf_open_book's own `empty` (nfnickel.cc):
+    // a second static-local-with-nontrivial-type in this mod would pull in
+    // its own __cxa_guard_acquire/__cxa_guard_release pair, which brushes
+    // against CLAUDE.md's "no C++ standard library runtime" rule -- avoided
+    // here since a default-constructed QString costs nothing (Qt5's own
+    // shared-null-sentinel pattern, the same one nf_qvector_shared_null
+    // relies on for QVector) and this call site has no hot-path reason to
+    // dodge that cost the way nf_open_book's, called once per book-open,
+    // arguably does.
+    QString const *db = nf_db_name();
+    QString const dbName = db ? *db : QString();
+
+    NFSharedPtr source;
+    int kept = 0;
+    if (!nf_build_volume_source(contentIds, dbName, &source, &kept)) {
+        nh_log("browser: could not build a data source, refusing");
         return false;
     }
 
@@ -63,7 +84,11 @@ bool nf_browser_show_volumes(QStringList const& contentIds) {
     // never by us reaching into its layout.
     QuickAccessLibraryController__ctor(controller, &source);
 
-    nh_log("browser: pushing a list of %d ContentIDs", static_cast<int>(contentIds.size()));
+    // `kept`, not contentIds.size(): the input list may include ContentIDs
+    // that resolved to nothing (nf_build_volume_source's own negative-
+    // control handling), so the count that matters here is how many rows
+    // will actually be on screen, not how many were asked for.
+    nh_log("browser: pushing a list of %d ContentIDs", kept);
     // `true`: animate the transition in, matching a user-tap-driven push --
     // not independently established what this bool controls beyond being
     // passed straight through to whatever was on top before (NOTES.md); a

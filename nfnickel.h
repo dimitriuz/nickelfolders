@@ -110,9 +110,18 @@ extern void (*QuickAccessLibraryController__ctor)(AbstractController *_this, voi
 // (QSharedPointer<LibraryDataProvider<Volume> > and
 // QSharedPointer<LibraryDataSource<Volume> >). Confirmed against this
 // binary's own calling convention, not merely assumed: every constructor
-// that takes one of these by const-reference (QuickAccessLibraryController's,
-// LinearLibraryDataSource<Volume>'s) receives a plain pointer in r1 and
-// reads value at +0, d at +4 -- archaeology part 2, P2.2.
+// that takes one of these receives a plain pointer in r1 and reads value at
+// +0, d at +4 -- archaeology part 2, P2.2. NOTE: both
+// LinearLibraryDataSource<Volume>'s and QuickAccessLibraryController's own
+// ctors take this BY VALUE, not by const reference -- neither mangled name
+// carries an `RK` -- so the CALLEE destroys whatever is passed at `r1`.
+// This does not change how nf_build_volume_source/nfbrowser.cc pass one
+// (still the address of a local NFSharedPtr; the ABI for a non-trivial
+// by-value parameter is the same "pass an address" shape as a reference),
+// but it does mean the passed-in object's underlying refcount is
+// deliberately consumed by the call, not left alone -- see
+// nf_build_volume_source's own comment on why strongref/weakref start at 2,
+// not 1.
 struct NFSharedPtr { void *value; void *d; };
 
 // Looks up every ContentID in contentIds via VolumeManager::getById (the
@@ -126,9 +135,15 @@ struct NFSharedPtr { void *value; void *d; };
 // untouched and false is returned if a required symbol never resolved
 // (checks BOTH nf_nickel_resolve(), for getById itself, and the data-source
 // chain's own symbols -- see nf_browser_resolve's comment for why these are
-// two independent gates). See nfnickel.cc for the one hand-built structure
-// this needs (the QSharedPointer control block) and why it is acceptable.
-bool nf_build_volume_source(QStringList const& contentIds, QString const& dbName, NFSharedPtr *outSource);
+// two independent gates) OR if not one ContentID resolved to a real book --
+// a caller cannot otherwise tell "the chain is broken" from "the reference
+// list is stale," so an empty result is treated as failure, not as an
+// empty-but-valid screen. *outKept receives how many rows were actually
+// found (<= contentIds.size()), for the caller to log; unlike *outSource it
+// is written even on a false return (0, in that case), so a caller can log
+// it unconditionally. See nfnickel.cc for the one hand-built structure this
+// needs (the QSharedPointer control block) and why it is acceptable.
+bool nf_build_volume_source(QStringList const& contentIds, QString const& dbName, NFSharedPtr *outSource, int *outKept);
 
 // Sets up an inotify watch on the DIRECTORY containing `path` -- never on
 // `path` itself, because a watch cannot be established on a file that does

@@ -347,23 +347,49 @@ static void *nf_qvector_shared_null() {
     return *reinterpret_cast<void* const*>(&probe);
 }
 
-// Qt 5.2's public qsharedpointer_impl.h: ExternalRefCountData is three
-// words -- two QAtomicInt counters and a DestroyerFn -- 12 bytes total (no
-// padding: three 4-byte fields, naturally 4-byte aligned). THE ONE
-// hand-built structure this rung allows itself (CLAUDE.md; the task brief's
-// "the one hand-built thing"): Nickel exports no way to construct a strong
-// QSharedPointer's control block, only the QObject weak-pointer helpers.
-// Field NAMES follow the public header's own declaration order, but nothing
-// below actually depends on getting that order right -- both counters are
-// always set to the SAME value (see nf_build_volume_source), so a
-// strongref/weakref swap would produce byte-identical output.
+// Qt 5.2's public qsharedpointer_impl.h: ExternalRefCountData is FOUR
+// words, not three -- caught in review, and confirmed directly against the
+// one place Nickel's own code builds exactly this pair:
+// QuickAccessMenuView::QuickAccessMenuView (0xf49850-0xf498c4 on
+// 4.38.23684). `movs r0,#16` at 0xf498a2, `blx operator new`, then
+// `str.w r9,[r3,#12]` at 0xf498b2 writes the FOURTH word -- the managed T*
+// pointer -- into the freshly-allocated block, followed immediately by
+// `[+0]=1, [+4]=1, [+8]=deleter`. **Field order matters, and the first
+// draft had it backwards**: both
+// `ExternalRefCountWithCustomDeleter<T,NormalDeleter>::deleter` functions
+// (0xc280f8 for the provider, 0xb10920 for the source) begin with
+// `ldr r?,[r0,#12]` -- confirmed by direct disassembly of both -- reading
+// the managed pointer this struct stores at +12, not their own `this` at
+// some other offset; and
+// `QSharedPointer<LinearLibraryDataSource<Volume>>::deref` (0x1082bd8)
+// decrements [+4] FIRST, and [+4] reaching zero is what invokes `[+8](d)`
+// (the deleter) -- which only makes sense if [+4] is **strongref**, the
+// managed object's own count. [+0] is decremented SECOND, unconditionally,
+// and [+0] reaching zero is what tail-calls `operator delete(d)` to free
+// the header itself -- so [+0] is **weakref**, per Qt5's real declaration
+// order (weakref before strongref). Getting this backwards was harmless
+// only because both counters happen to be set to the identical value below
+// -- a future edit that set them differently would silently corrupt this.
+//
+// THE ONE hand-built structure this rung allows itself (CLAUDE.md; the
+// task brief's "the one hand-built thing"): Nickel exports no way to
+// construct a strong QSharedPointer's control block, only the QObject
+// weak-pointer helpers. Allocated as 64 bytes, not the measured 16, and
+// zeroed first -- CLAUDE.md's "over-allocate for every Nickel constructor"
+// rule, extended to this hand-built object even though nothing here is a
+// literal Nickel constructor call; the alternative (allocating exactly 16)
+// was the one exception to that rule in this file, and review correctly
+// called it out as needing the same margin as everything else.
 struct NFRefCountData {
-    int  strongref;
-    int  weakref;
-    void (*destroyer)(void *refCountData);
+    int   weakref;
+    int   strongref;
+    void  (*destroyer)(void *refCountData);
+    void  *managed;
 };
 
-bool nf_build_volume_source(QStringList const& contentIds, QString const& dbName, NFSharedPtr *outSource) {
+bool nf_build_volume_source(QStringList const& contentIds, QString const& dbName, NFSharedPtr *outSource, int *outKept) {
+    *outKept = 0;
+
     if (!nf_nickel_resolve()) {
         nh_log("browser: a getById-path symbol never resolved, refusing to build a data source");
         return false;
@@ -400,26 +426,54 @@ bool nf_build_volume_source(QStringList const& contentIds, QString const& dbName
         }
         Volume__dtor(v);
     }
+    *outKept = kept;
     nh_log("browser: %d of %d ContentIDs resolved to a book", kept, static_cast<int>(contentIds.size()));
 
-    // sizeof(InMemoryDataProvider<Volume>): UNLIKE QuickAccessLibraryController
-    // (measured from a real `operator new` call site, nfnickel.h), this class
-    // has NO caller anywhere in this firmware's libnickel to read a size
-    // from -- confirmed by sweeping the FULL .rel.plt/.rel.dyn table (152,960
-    // entries) for any relocation naming either this constructor or
-    // LinearLibraryDataSource's, below, and finding none, and by a chunked
-    // disassembly sweep of the whole of .text for a direct `bl`/`blx` to
-    // either address, also finding none. The archaeology report treated
-    // "exported" as sufficient evidence without checking this; it was not
-    // sufficient, and this is that finding.
+    if (kept == 0) {
+        // A caller cannot otherwise distinguish "the chain is broken" from
+        // "the reference list is stale" -- the primary device test is
+        // `touch /tmp/nfolders-show` against 28 hardcoded filenames off one
+        // card (nfolders.cc), and if those have moved, silently pushing an
+        // empty screen would look identical to a real failure. Refuse
+        // instead: nothing has been allocated yet at this point (`vec`
+        // holds only the shared-null sentinel, never own storage), so
+        // there is nothing to clean up on this path.
+        nh_log("browser: no ContentID resolved to a book, refusing to build an empty screen");
+        return false;
+    }
+
+    // sizeof(InMemoryDataProvider<Volume>) == 16, sizeof(LinearLibraryDataSource
+    // <Volume>) == 12: BOTH corrected in review from an earlier claim that
+    // neither had any real Nickel allocation site in this firmware. That
+    // claim was wrong, and the reason is worth recording so it is not
+    // repeated: `readelf -r` TRUNCATES the symbol column (confirmed:
+    // `_ZN20InMemoryDataProviderI6VolumeEC1E...` prints as
+    // `_ZN20InMemoryDataProvi` and nothing past it), so a grep for either
+    // constructor's FULL mangled name matched nothing and the sweep
+    // silently reported empty -- a sweep that cannot fail visibly is not a
+    // sweep. `objdump -R` does not truncate and finds both:
+    // `016b7b98 R_ARM_JUMP_SLOT _ZN20InMemoryDataProviderI6VolumeEC1E...`
+    // and `016ad074 R_ARM_JUMP_SLOT _ZN23LinearLibraryDataSourceI6VolumeEC1E...`,
+    // with PLT stubs at 0x699820 and 0x67775c respectively (`tools/plt.sh`
+    // resolves both), each with real callers in `.text`.
     //
-    // The size below is instead a LOWER BOUND read the way CLAUDE.md's own
-    // AbstractController was: from the constructor's OWN writes to `this`,
-    // at 0x1082a90 -- offsets 0, 4, 8 and 12 (four words), nothing beyond
-    // +12 anywhere in the function. Over-allocated by roughly 16x on top of
-    // that bound, the same margin AbstractController's old 12->256 used, to
-    // survive both firmware growth AND the residual uncertainty of a
-    // lower-bound-only measurement.
+    // The two sizes themselves, each read at a genuine Nickel `operator
+    // new` call site, the strongest measurement this project uses:
+    //   - InMemoryDataProvider<Volume>: `movs r0,#16` at **0x1081112**,
+    //     inside `ShelfListBuilder::refresh()`, immediately before
+    //     `blx operator new` then `blx 0x699820` (this exact ctor).
+    //   - LinearLibraryDataSource<Volume>: `movs r0,#12` at **0xf498b8**,
+    //     inside `QuickAccessMenuView::QuickAccessMenuView` -- the SAME
+    //     function QuickAccessLibraryController's own sizeof(72) was read
+    //     from (nfnickel.h) -- immediately before `blx operator new` then
+    //     `blx 0x67775c` (this exact ctor).
+    // Both exactly match this file's own earlier LOWER-BOUND derivation
+    // (read from each constructor's own writes to `this`, the technique
+    // CLAUDE.md's AbstractController precedent established for when no
+    // call site can be found): the lower bounds were 16 and 12, and the
+    // real, Nickel-measured sizes are 16 and 12. Still over-allocated to
+    // 256 below -- CLAUDE.md's margin, not a reaction to any remaining
+    // doubt about the number itself.
     void *providerBuf = ::operator new(256);
     memset(providerBuf, 0, 256);
     InMemoryDataProvider__ctor(providerBuf, &vec);
@@ -434,49 +488,57 @@ bool nf_build_volume_source(QStringList const& contentIds, QString const& dbName
     // of the deliberate leak below.
     QVectorVolume__dtor(&vec);
 
-    // strongref/weakref are set to 2, not the real ctor's 1: every
-    // constructor that takes one of these QSharedPointers by const
-    // reference (LinearLibraryDataSource's below, and
-    // QuickAccessLibraryController's in nfbrowser.cc) makes and unwinds its
-    // own temporary copies before returning, which nets to AT MOST one
-    // decrement of each counter by the time construction is done (read
-    // directly off each ctor's own disassembly: paired atomic increments on
-    // both counters together, for every copy, with a matching decrement for
-    // every temporary that goes out of scope). Starting one higher than
-    // that guarantees NEITHER counter can reach zero through any legitimate
-    // decrement this chain performs, so the deleter is NEVER invoked -- a
-    // deliberate, permanent leak of one 12-byte header per QSharedPointer
+    // strongref = weakref = 2, not the real ctor's 1 -- and this is an
+    // EXACT, load-bearing value, not merely "high enough." Both
+    // LinearLibraryDataSource's and QuickAccessLibraryController's own
+    // ctors take their QSharedPointer argument BY VALUE (neither mangled
+    // name carries `RK` -- NFSharedPtr's own comment, nfnickel.h), which
+    // means the CALLEE destroys what it was handed, not the caller. Traced
+    // through both ctors' disassembly: starting from 2, +1 for a local
+    // copy the ctor makes for itself, +1 more for an in-place bump as that
+    // copy is handed onward, by value again, to the base ctor's own
+    // parameter; the base ctor itself does +1 as it copies the parameter
+    // into its own stored member and -1 as its now-redundant parameter
+    // copy is destroyed; then -1 as the caller's local copy unwinds, and
+    // -1 as the original by-value argument (ours) is destroyed by the
+    // callee per the by-value calling convention above -- net back to
+    // exactly 2, unchanged, by the time construction returns. The ONE
+    // decrement this chain still owes happens far later, when Nickel
+    // itself eventually destroys the controller: THAT is what brings the
+    // count to 1. **Not 0 -- if this started at 1 instead of 2, that final
+    // decrement would reach zero and fire the deleter on a controller
+    // still nominally in use.** So 2 is the smallest correct value, not an
+    // arbitrary safety margin, and NEITHER counter may be lowered without
+    // re-deriving this chain.
+    //
+    // A deliberate, permanent leak of one 64-byte header per QSharedPointer
     // this function builds (two per screen: one for the provider, one for
-    // the source), same as the leaked InMemoryDataProvider/
+    // the source), same treatment as the leaked InMemoryDataProvider/
     // LinearLibraryDataSource/QuickAccessLibraryController objects
     // themselves (never freed for the same reason: the deleter that would
     // free them is what these headers exist to permanently suppress).
-    // CLAUDE.md asks a deliberate leak to carry the reason so nobody deletes
-    // it as a bug: the alternative is letting Qt call a deleter on memory
-    // whose ownership this mod cannot prove.
-    NFRefCountData *providerRef = static_cast<NFRefCountData*>(::operator new(sizeof(NFRefCountData)));
-    providerRef->strongref = 2;
+    // CLAUDE.md asks a deliberate leak to carry the reason so nobody
+    // deletes it as a bug: the alternative is letting Qt call a deleter on
+    // memory whose ownership this mod cannot prove.
+    NFRefCountData *providerRef = static_cast<NFRefCountData*>(::operator new(64));
+    memset(providerRef, 0, 64);
     providerRef->weakref   = 2;
+    providerRef->strongref = 2;
     providerRef->destroyer = NFRefCountDeleter_Provider;
+    providerRef->managed   = providerBuf;
 
     NFSharedPtr sp_provider = { providerBuf, providerRef };
 
-    // sizeof(LinearLibraryDataSource<Volume>): same situation as the
-    // provider above -- no operator-new call site anywhere in this
-    // firmware, lower bound read from this ctor's own writes at 0xaf88ac
-    // (offsets 0, 4 and 8 -- three words, nothing beyond +8 anywhere in the
-    // function; no base-class constructor call was found either, so
-    // LibraryDataSource<Volume> itself appears to carry no state of its
-    // own beyond the vtable pointer this class already provides). Same
-    // ~16x over-allocation margin as the provider above.
     void *sourceBuf = ::operator new(256);
     memset(sourceBuf, 0, 256);
     LinearLibraryDataSource__ctor(sourceBuf, &sp_provider);
 
-    NFRefCountData *sourceRef = static_cast<NFRefCountData*>(::operator new(sizeof(NFRefCountData)));
-    sourceRef->strongref = 2;
+    NFRefCountData *sourceRef = static_cast<NFRefCountData*>(::operator new(64));
+    memset(sourceRef, 0, 64);
     sourceRef->weakref   = 2;
+    sourceRef->strongref = 2;
     sourceRef->destroyer = NFRefCountDeleter_Source;
+    sourceRef->managed   = sourceBuf;
 
     outSource->value = sourceBuf;
     outSource->d      = sourceRef;

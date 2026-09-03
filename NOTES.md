@@ -961,3 +961,176 @@ at.
   copied from the live vtable) runs on an object this mod allocated with its
   own `::operator new` rather than Nickel's. This is exactly what Step 6
   (device-only, not this rung's job) exists to check.
+
+## Task 7, rung 2, REPLACED: Nickel's own `QuickAccessLibraryController`
+
+Everything under "Task 7, rung 2: a screen on the window stack" above is
+superseded, not deleted (this project's practice: leave a wrong turn in
+place, record the correction alongside it). Review found the hand-built
+`AbstractController` subclass unbuildable; archaeology
+(`.superpowers/sdd/2026-09-03-nickelfolders-v1/folder-stack-archaeology.md`,
+Part 2) found a concrete Nickel controller — `QuickAccessLibraryController`
+— that supplies everything the hand-built version would have had to fake.
+The code is in `nfnickel.cc`/`.h` and `nfbrowser.cc`/`.h`.
+
+### A method trap that cost a wrong claim in the first draft: `readelf -r` truncates the symbol column
+
+The "Resolving a PLT stub" section above already documents one variant of
+this danger (`objdump` printing a `bl` inside a literal pool). This is a
+different one, found the same way — by a review catching a wrong conclusion
+— and worth its own entry because the failure mode is silent, not merely
+misleading.
+
+Looking for a real Nickel `operator new` call site for
+`InMemoryDataProvider<Volume>::InMemoryDataProvider` and
+`LinearLibraryDataSource<Volume>::LinearLibraryDataSource`, the first pass
+ran:
+
+```sh
+readelf -r libnickel.so.1.0.0 | grep 'InMemoryDataProviderI6VolumeE'
+```
+
+— and got **nothing**, across the whole 152,960-entry relocation table, for
+either mangled name. That looked like a real finding ("these constructors
+have no caller in this firmware") and got written up as one. It was wrong:
+
+```sh
+$ readelf -r libnickel.so.1.0.0 | grep '^016b7b98'
+016b7b98  00c9cf16 R_ARM_JUMP_SLOT   01082a91   _ZN20InMemoryDataProvi
+```
+
+**`readelf -r` truncates the symbol name column** — the line above ends at
+`_ZN20InMemoryDataProvi`, with the rest of the mangled name simply cut off.
+A `grep` for the FULL mangled name therefore matches nothing, and the sweep
+returns empty — not because there is nothing to find, but because the tool
+never showed it. `objdump -R` does not truncate:
+
+```sh
+$ objdump -R libnickel.so.1.0.0 | grep 'InMemoryDataProviderI6VolumeEC1'
+016b7b98 R_ARM_JUMP_SLOT   _ZN20InMemoryDataProviderI6VolumeEC1ERK7QVectorIS0_E
+```
+
+Same address, full name, real relocation. Sixteen call sites exist in
+`.text` for these two constructors combined; PLT stubs at `0x699820`
+(`InMemoryDataProvider<Volume>`) and `0x67775c`
+(`LinearLibraryDataSource<Volume>`), both resolved with `tools/plt.sh`.
+
+**The lesson, stated flatly: a sweep that cannot fail visibly is not a
+sweep.** `readelf -r | grep <full mangled name>` silently returning nothing
+looks identical whether the symbol truly has no caller or the grep simply
+never had a chance to match. Prefer `objdump -R` for this kind of search, or
+verify a `readelf -r` sweep against a KNOWN-present symbol first (as this
+correction did, using `QuickAccessLibraryController`'s own already-confirmed
+relocation as the control) before trusting a negative result from it on an
+unknown one.
+
+### The corrected measurements
+
+Both classes ARE real, called Nickel code, with real `operator new` call
+sites — the strongest measurement this project uses, not the constructor-
+writes lower bound the first draft fell back to (which, for what it is
+worth, landed on the exact right numbers anyway: 16 and 12).
+
+- **`sizeof(InMemoryDataProvider<Volume>) == 16`** — `movs r0, #16` at
+  **`0x1081112`**, inside `ShelfListBuilder::refresh()`, immediately before
+  `blx` to `operator new` then `blx 0x699820` (the PLT stub for this exact
+  constructor).
+- **`sizeof(LinearLibraryDataSource<Volume>) == 12`** — `movs r0, #12` at
+  **`0xf498b8`**, inside `QuickAccessMenuView::QuickAccessMenuView` — the
+  SAME function `QuickAccessLibraryController`'s own `sizeof == 72` was read
+  from (`0xf499a4`) — immediately before `blx` to `operator new` then
+  `blx 0x67775c` (the PLT stub for this exact constructor).
+
+### `ExternalRefCountData` is 16 bytes, not 12, and the managed pointer lives at `+12`
+
+Also caught in review, and also settled by reading the one place Nickel's
+own code builds exactly this pair — the SAME `QuickAccessMenuView`
+constructor, `0xf49850`–`0xf498c4`:
+
+```
+f49892: movs r0, #28          ; a DIFFERENT provider (QuickAccessLibraryDataProvider,
+f49894: blx  operator new     ; this popup's own single-Volume provider -- NOT
+f4989a: blx  677998           ; InMemoryDataProvider<Volume> -- unrelated to rung 2's own chain)
+...
+f498a2: movs r0, #16          ; <-- the ExternalRefCountData header
+f498a4: str.w r9, [r7, #32]
+f498a8: blx  operator new
+f498ac: ldr.w r2, [pc, #1940] ; the deleter function's address
+f498b0: mov  r3, r0           ; r3 = the new 16-byte header
+f498b2: str.w r9, [r3, #12]   ; header[+12] = r9, the MANAGED POINTER (the 28-byte provider above)
+f498b6: movs r1, #1
+f498b8: movs r0, #12          ; <-- LinearLibraryDataSource<Volume>'s own sizeof, see above
+f498ba: ldr  r2, [r6, r2]     ; the deleter address, loaded
+f498bc: str  r1, [r3, #4]     ; header[+4] = 1
+f498be: str  r1, [r3, #0]     ; header[+0] = 1
+f498c0: str  r2, [r3, #8]     ; header[+8] = the deleter
+```
+
+Four words: `[+0]`, `[+4]`, `[+8]` (the deleter), `[+12]` (the managed
+pointer) — not three. Confirmed independently by both deleter functions,
+which read `[+12]` as their very first instruction:
+
+```
+00c280f8 <...ExternalRefCountWithCustomDeleter<LibraryDataProvider<Volume>,NormalDeleter>::deleter>:
+  c280f8: ldr r0, [r0, #12]
+...
+00b10920 <...ExternalRefCountWithCustomDeleter<LibraryDataSource<Volume>,NormalDeleter>::deleter>:
+  b10920: push {r4, r5, r7, lr}
+  b10922: add  r7, sp, #0
+  b10924: ldr  r4, [r0, #12]
+```
+
+Missing the fourth word meant these deleters, if ever actually invoked,
+would read four bytes past this mod's own allocation — uninitialised heap,
+not zero, so a `cbz`/null-guard would not save it — and `delete` whatever
+garbage pointer was there. **No reachable path to that was found** (the
+whole point of pinning both counters so the deleter is never invoked at
+all — see below), so this was latent, not live; fixed anyway, and the
+object is now allocated at 64 bytes (over-provisioned, matching every other
+Nickel-adjacent allocation in this file) rather than the measured 16.
+
+### Field order: `[+0]` is `weakref`, `[+4]` is `strongref` — the opposite of the first draft
+
+`QSharedPointer<LinearLibraryDataSource<Volume>>::deref` (`0x1082bd8`, seen
+already above as part of `InMemoryDataProvider<Volume>`'s own neighbourhood)
+is the read that settles it:
+
+```
+1082be0: adds r3, r0, #4
+1082be2: [atomic decrement of [+4]]
+1082bf4: cbz  r2, 1082c18        ; [+4] reaching zero -> ...
+1082c18: ldr  r3, [r0, #8]       ; ... read the deleter ...
+1082c1a: blx  r3                 ; ... and CALL it.
+1082c1c: b.n  1082bf6             ; then fall through to decrementing [+0] too
+1082bf6: [atomic decrement of [+0]]
+1082c08: cbnz r3, 1082c16
+1082c0a: mov  r0, r4
+1082c12: b.w  672400 <operator delete>   ; [+0] reaching zero -> free the header itself
+```
+
+`[+4]` reaching zero invokes the deleter (destroys the MANAGED object) —
+that is `strongref`, by definition. `[+0]` reaching zero frees `d` itself —
+that is `weakref`, the header's own count, exactly matching Qt 5.2's real
+declaration order (`weakref` before `strongref`, not the reverse the first
+draft assumed). Harmless while both are set to the same value, but a future
+edit that set them differently on the old, swapped names would have set the
+wrong field.
+
+### Why `strongref = weakref = 2` is exact, not merely "high enough"
+
+Neither `LinearLibraryDataSource<Volume>::LinearLibraryDataSource` nor
+`QuickAccessLibraryController::QuickAccessLibraryController` takes its
+`QSharedPointer` argument by const reference — neither mangled name carries
+an `RK` — **both take it by value**, so the callee destroys what it was
+handed, not the caller. Traced through both ctors' disassembly: starting
+from 2, +1 for a local copy the ctor makes for itself, +1 more as that copy
+is handed onward, by value again, to the base ctor's own parameter; the base
+ctor does +1 storing into its own member and -1 destroying its now-
+redundant parameter copy; then -1 as the caller's local copy unwinds, and -1
+as the original by-value argument is destroyed by the callee — net back to
+exactly 2, unchanged, by the time construction returns. The one decrement
+this chain still owes happens when Nickel eventually destroys the
+controller: that brings the count to 1, not 0. If this had started at 1
+instead of 2, that final decrement WOULD reach zero and fire the deleter on
+a controller Nickel still considers live. `nfnickel.cc`'s own comment on
+`nf_build_volume_source` carries this in full.
