@@ -28,8 +28,42 @@ rather than assumed:
   "load your view". `size`, `viewWillAppear`, `viewWillDisappear`,
   `viewWillBeDestroyed`, `allowedOrientations` and `navSection` all have
   inheritable non-pure implementations.
-- `AbstractController::viewLoaded() const` returns `this+8`, so the view
-  pointer lives at offset `+8`.
+- `AbstractController::viewLoaded() const` returns a **bool**, not the view
+  pointer. **An earlier draft of this section said it "returns `this+8`" and
+  that was wrong** — the instructions at `0xad13ac` are
+  `ldr r3,[r0,#4]` … `ldr r3,[r3,#4]` … `ldr r3,[r0,#8]` … `adds r0,r3,#0` /
+  `it ne` / `movne r0,#1`, i.e. a three-condition test normalised to 0/1. The
+  error was read off a partial disassembly that stopped before the `movne`, and
+  it propagated into the implementation plan and one task brief before a review
+  caught it.
+
+  What `+4`/`+8` actually are: a **`QWeakPointer<QWidget>`** pair — `d` at `+4`
+  and `value` at `+8` — and every consumer in Nickel gates on
+  `this[+4] && this[+4][+4]` *before* reading `this[+8]`. So the pure virtual at
+  slot `+32` must leave a real weak pointer behind, not merely store a `QWidget*`
+  at `+8`. Leaving only the raw pointer makes Nickel's view fetch return NULL and
+  the screen never appears.
+
+- **Nickel's own controllers are QObjects, and the window stack requires it.**
+  `MainWindowController::push` appends to a `QVector<QPointer<QObject>>` at
+  `MainWindowController+60`, and `topController()` (`0xea8acc`) returns the last
+  element. `PasswordController` and `HelpDialogController` place a `QObject` base
+  at `+0` with the `AbstractController` subobject at `+8`. A controller that is
+  not a QObject is *accepted* by `push` — the failed internal
+  `dynamic_cast<QObject*>` only skips optional bookkeeping — but it enters the
+  stack as a **null** `QPointer`, so `topController()` returns NULL and there is
+  nothing for a back gesture to pop. The "no metaobject to fake" remark below is
+  therefore only half true: no *moc* metaobject is needed (we declare no signals
+  or slots of our own, exactly as `nfolders.cc`'s trigger object does), but a
+  real `QObject` base is.
+
+- The vtable's **destructor slots at `+0` and `+4` are zero in the file and have
+  no relocations** (verified: `objdump -R` lists entries at `0x163ff74` and
+  `0x163ff80`-`0x163ff98` and nothing between). So copying Nickel's live table
+  yields NULL destructor slots, and any virtual destruction of our controller
+  jumps to address 0. `_ZN18AbstractControllerD1Ev` (`0xad1358`) and
+  `_ZN18AbstractControllerD0Ev` (`0xad1398`) are both exported and must be
+  resolved by name and stored explicitly rather than copied.
 
 So the native screen costs about what `getById` cost: one vtable to build, one
 pure virtual to implement, one `push` to call. `sizeof(AbstractController)`
