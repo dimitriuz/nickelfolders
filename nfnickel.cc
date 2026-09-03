@@ -62,12 +62,16 @@ static Device        *(*Device__getCurrentDevice)(void);
 static QString const *(*Device__getDbName)(Device const *_this);
 
 // NOT static, unlike everything below this point -- nfbrowser.cc calls
-// these three directly to construct and push the real controller, the same
-// way it used to call AbstractController__ctor directly before this rung
-// replaced that plan. nfnickel.h has the full rationale for each.
+// these directly to construct and push the real controller, the same way
+// it used to call AbstractController__ctor directly before this rung
+// replaced that plan. nfnickel.h has the full rationale for each, including
+// NF_BROWSER_USE_ARTICLE_LIST -- the device-run finding that made
+// ArticleListLibraryController the one actually used, with
+// QuickAccessLibraryController kept resolved only for comparison.
 void  *(*MainWindowController__sharedInstance)(void);
 void   (*MainWindowController__push)(MainWindowController *_this, AbstractController *controller, bool animate);
 void   (*QuickAccessLibraryController__ctor)(AbstractController *_this, void const *source);
+void   (*ArticleListLibraryController__ctor)(AbstractController *_this, void const *source);
 
 // Nickel's classes stay opaque, same discipline as Volume/ReadBookActionProxy
 // above: these are the four classes the rung 2 data-source chain constructs,
@@ -137,6 +141,7 @@ struct nh_dlsym NFNickelDlsym[] = {
     {.name = "_ZN20MainWindowController14sharedInstanceEv",   .out = nh_symoutptr(MainWindowController__sharedInstance), .desc = "MainWindowController::sharedInstance", .optional = true},
     {.name = "_ZN20MainWindowController4pushEP18AbstractControllerb", .out = nh_symoutptr(MainWindowController__push), .desc = "MainWindowController::push",           .optional = true},
     {.name = "_ZN28QuickAccessLibraryControllerC1E14QSharedPointerI17LibraryDataSourceI6VolumeEE", .out = nh_symoutptr(QuickAccessLibraryController__ctor), .desc = "QuickAccessLibraryController::QuickAccessLibraryController", .optional = true},
+    {.name = "_ZN28ArticleListLibraryControllerC1E14QSharedPointerI17LibraryDataSourceI6VolumeEE", .out = nh_symoutptr(ArticleListLibraryController__ctor), .desc = "ArticleListLibraryController::ArticleListLibraryController", .optional = true},
     {.name = "_ZN7QVectorI6VolumeE6appendERKS0_",             .out = nh_symoutptr(QVectorVolume__append),           .desc = "QVector<Volume>::append",                .optional = true},
     {.name = "_ZN7QVectorI6VolumeED1Ev",                      .out = nh_symoutptr(QVectorVolume__dtor),             .desc = "QVector<Volume>::~QVector",              .optional = true},
     {.name = "_ZN20InMemoryDataProviderI6VolumeEC1ERK7QVectorIS0_E", .out = nh_symoutptr(InMemoryDataProvider__ctor), .desc = "InMemoryDataProvider<Volume>::InMemoryDataProvider", .optional = true},
@@ -163,11 +168,22 @@ bool nf_nickel_resolve(void) {
 // two features' failure domains independent, the same way each is already
 // independently .optional in the table above.
 bool nf_browser_resolve(void) {
-    return MainWindowController__sharedInstance && MainWindowController__push &&
-           QuickAccessLibraryController__ctor &&
-           QVectorVolume__append && QVectorVolume__dtor &&
-           InMemoryDataProvider__ctor && LinearLibraryDataSource__ctor &&
-           NFRefCountDeleter_Provider && NFRefCountDeleter_Source;
+    if (!(MainWindowController__sharedInstance && MainWindowController__push &&
+          QVectorVolume__append && QVectorVolume__dtor &&
+          InMemoryDataProvider__ctor && LinearLibraryDataSource__ctor &&
+          NFRefCountDeleter_Provider && NFRefCountDeleter_Source))
+        return false;
+
+    // Only the controller NF_BROWSER_USE_ARTICLE_LIST actually selects
+    // (nfnickel.h) needs to have resolved -- the other one is kept resolved
+    // for a possible comparison rebuild (see its own comment), but is not
+    // on this build's critical path, so its absence must not disable the
+    // browser screen.
+#if NF_BROWSER_USE_ARTICLE_LIST
+    return ArticleListLibraryController__ctor != NULL;
+#else
+    return QuickAccessLibraryController__ctor != NULL;
+#endif
 }
 
 // dbName is a Repository cache-partition key. Device::calcDbName compares the

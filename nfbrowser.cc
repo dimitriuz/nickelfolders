@@ -3,14 +3,24 @@
 // This file used to build a raw AbstractController-shaped object over a
 // hand-copied vtable, the way every one of Nickel's own controllers builds
 // itself -- and that was the right pattern for a controller Nickel has NO
-// concrete implementation of. But QuickAccessLibraryController IS a concrete
-// Nickel implementation: a real QObject, with real RTTI Nickel's own
-// compiler generated, whose inherited loadView() builds its own view and its
-// own QWeakPointer<QWidget> -- see nfnickel.h and
-// folder-stack-archaeology.md Part 2 for the full account of why this
-// replaces the earlier plan rather than sitting alongside it. There is
-// nothing here to fabricate: this file just constructs and pushes Nickel's
-// own object.
+// concrete implementation of. But both QuickAccessLibraryController and
+// ArticleListLibraryController are concrete Nickel implementations: real
+// QObjects, with real RTTI Nickel's own compiler generated, whose inherited
+// loadView() builds their own view and their own QWeakPointer<QWidget> --
+// see nfnickel.h and folder-stack-archaeology.md Part 2 for the full
+// account of why this replaces the earlier plan rather than sitting
+// alongside it. There is nothing here to fabricate: this file just
+// constructs and pushes Nickel's own object.
+//
+// A DEVICE RUN pushed QuickAccessLibraryController and it worked -- full-
+// screen, real covers/titles/authors/format/size, reading progress for
+// free, and a tap opened the book with no hook from this mod -- but the
+// screen had no header and no back arrow: QuickAccessLibraryView is the
+// home page's own quick-access WIDGET, not a page, and on a device with no
+// hardware back button there was literally no way off the screen. See
+// NF_BROWSER_USE_ARTICLE_LIST (nfnickel.h) for the swap this drove, and
+// keep it that way -- QuickAccessLibraryController stays resolved and
+// buildable only for a side-by-side comparison, not as the default.
 
 #include "nfbrowser.h"
 #include "nfnickel.h"
@@ -67,22 +77,27 @@ bool nf_browser_show_volumes(QStringList const& contentIds) {
         return false;
     }
 
-    // sizeof(QuickAccessLibraryController) == 72 on 4.38.23684, read at the
-    // `movs r0, #72` inside QuickAccessMenuView::QuickAccessMenuView's own
-    // `operator new` call site (0xf499a4) -- Nickel's OWN allocation for
-    // this exact class (nfnickel.h has the full derivation). Over-allocated
-    // to 512 (roughly 7x), the same margin nf_open_book_staged already uses
-    // for ReadBookActionProxy's own measured-but-padded allocation.
+    // sizeof(ArticleListLibraryController) == 92, sizeof(QuickAccessLibrary
+    // Controller) == 72 -- both on 4.38.23684, both read at a genuine
+    // Nickel `operator new` call site (nfnickel.h has both derivations, with
+    // addresses). 512 comfortably over-allocates either, so the same buffer
+    // size is used regardless of which branch below is compiled in --
+    // nothing here depends on the exact 92-vs-72 difference.
     void *controller = ::operator new(512);
     memset(controller, 0, 512);
 
-    // QuickAccessLibraryController's ctor makes a virtual call THROUGH the
-    // data source we just built (archaeology part 2, P2.2) as part of its
-    // own construction, so `source` must already be a fully valid,
-    // Nickel-constructed object at this point -- which it is: every object
-    // nf_build_volume_source returned was constructed by Nickel's own code,
-    // never by us reaching into its layout.
+    // Both constructors make a virtual call THROUGH the data source we just
+    // built (archaeology part 2, P2.2, confirmed independently for
+    // ArticleListLibraryController's own base ctor when the hedge was
+    // adopted) as part of their own construction, so `source` must already
+    // be a fully valid, Nickel-constructed object at this point -- which it
+    // is: every object nf_build_volume_source returned was constructed by
+    // Nickel's own code, never by us reaching into its layout.
+#if NF_BROWSER_USE_ARTICLE_LIST
+    ArticleListLibraryController__ctor(controller, &source);
+#else
     QuickAccessLibraryController__ctor(controller, &source);
+#endif
 
     // `kept`, not contentIds.size(): the input list may include ContentIDs
     // that resolved to nothing (nf_build_volume_source's own negative-

@@ -89,18 +89,57 @@ typedef void MainWindowController;
 extern void  *(*MainWindowController__sharedInstance)(void);
 extern void   (*MainWindowController__push)(MainWindowController *_this, AbstractController *controller, bool animate);
 
+// Which controller nf_browser_show_volumes (nfbrowser.cc) actually builds.
+// A device run pushed QuickAccessLibraryController successfully -- full-
+// screen, covers/titles/authors/format/size, reading progress, and tap-to-
+// open all worked exactly as archaeology part 2 traced, with no hook from
+// this mod -- but found it has NO header and NO back arrow at all: it is
+// the home page's own quick-access WIDGET, not a page, so it carries no
+// navigation chrome. On a device with no hardware back button that is a
+// dead end, not a cosmetic gap, so ArticleListLibraryController (the
+// brief's own named hedge for exactly this failure) is now the default.
+//
+// Both constructors stay resolved UNCONDITIONALLY below -- one more dlsym
+// lookup at init is negligible, and it means flipping this single macro
+// to 0 is enough to rebuild the proven QuickAccessLibraryController path
+// for a side-by-side comparison, with no other code change anywhere.
+// nf_browser_resolve()'s gate (nfnickel.cc) and nf_browser_show_volumes's
+// own construction branch (nfbrowser.cc) both key off this same macro, so
+// they can never disagree about which one is "the" controller. Do not
+// ship this flipped to 0: it has no way out of the screen on hardware with
+// no hardware back button.
+#define NF_BROWSER_USE_ARTICLE_LIST 1
+
 // QuickAccessLibraryController::QuickAccessLibraryController(QSharedPointer<LibraryDataSource<Volume> >)
 // at 0xf44fb4 on 4.38.23684. sizeof == 72, read at the `movs r0, #72` inside
 // QuickAccessMenuView::QuickAccessMenuView's own `operator new` call site
 // (0xf499a4) -- Nickel's OWN allocation for this exact class, re-confirmed
 // directly against this binary for this rung (archaeology part 2, P2.2).
-// NOT static: nfbrowser.cc calls this directly, the same way it directly
-// called AbstractController__ctor before this rung replaced that plan.
-// `_this` is typed AbstractController* rather than a distinct opaque type
-// for the controller, on purpose -- see AbstractController's own comment
-// above: they are the same address, and this saves nfbrowser.cc a cast
-// between "freshly allocated" and "ready to push".
+// Proven on hardware (see NF_BROWSER_USE_ARTICLE_LIST above); kept only as
+// the comparison path now, not the one the trigger uses.
 extern void (*QuickAccessLibraryController__ctor)(AbstractController *_this, void const *source /* QSharedPointer<LibraryDataSource<Volume> > const& */);
+
+// ArticleListLibraryController::ArticleListLibraryController(QSharedPointer
+// <LibraryDataSource<Volume> >) at 0xdcbe70 on 4.38.23684. sizeof == 92,
+// re-measured for THIS rung (the report's own number was explicitly
+// distrusted and re-derived, per instruction, using objdump -R rather than
+// readelf -r -- see NOTES.md's truncation-trap entry for why that
+// distinction matters): `movs r0, #92` at 0xdc8d16, inside
+// `ArticleLibraryBuilder::newController`'s ELSE branch (its IF branch,
+// 0xdc8b98, builds the same-sized ArticleGridLibraryController instead --
+// same function, same 92, a different class), immediately before
+// `blx operator new` then a call `tools/plt.sh` resolves to this exact
+// constructor. Confirmed, not merely trusted, that its constructor needs
+// nothing new: same NickelGridLibraryControllerBase(int,int,src) base as
+// QuickAccessLibraryController (0x6a2fd4, same stub), plus exactly one
+// more thing, a FRESH `BrowserWorkflowManager(QObject*)` member
+// (0xcfb298) constructed with a null parent -- confirmed by reading that
+// constructor itself: it calls no `sharedInstance()`, touches no shared
+// state, only `QObject::QObject` and its own field writes. No title
+// string, no extra QSharedPointer, no singleton read or write. `_this` is
+// typed AbstractController* for the same reason as
+// QuickAccessLibraryController__ctor, above.
+extern void (*ArticleListLibraryController__ctor)(AbstractController *_this, void const *source /* QSharedPointer<LibraryDataSource<Volume> > const& */);
 
 // QSharedPointer<T>'s complete runtime layout, for every T, per Qt 5.2's
 // public qsharedpointer_impl.h: a value pointer, then an
