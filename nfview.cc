@@ -35,15 +35,40 @@
 // at all -- they are relationships between TYPES, not values a function
 // signature can carry.
 //
-// WHAT STAYS OPAQUE: everything else. The two raw AbstractController
+// WHAT STAYS OPAQUE: everything else. The eight raw AbstractController
 // symbols this file calls (nfnickel.h/.cc: AbstractController__ctor,
-// AbstractController__dtor1) are resolved and called exactly like every
-// other libnickel entry point in this project -- an explicit signature,
-// never a redeclared method, NULL-gated, .optional = true in the shared
-// dlsym table. It is ONLY NFAbstractControllerShim/NFController -- a class
-// this file itself declares, not a redeclaration of any real Nickel class
-// -- that bends the rule, and only for the one property that rule cannot
-// express (a type relationship, not a call signature).
+// __dtor1, __size, __viewWillAppear, __viewWillDisappear,
+// __viewWillBeDestroyed, __allowedOrientations, __navSection) are resolved
+// and called exactly like every other libnickel entry point in this
+// project -- an explicit signature, never a redeclared method, NULL-gated,
+// .optional = true in the shared dlsym table. It is ONLY
+// NFAbstractControllerShim/NFController -- a class this file itself
+// declares, not a redeclaration of any real Nickel class -- that bends the
+// rule, and only for the one property that rule cannot express (a type
+// relationship, not a call signature).
+//
+// WHY SIX OF THOSE EIGHT ARE FORWARDED, NOT STUBBED -- read this before
+// "simplifying" size()/viewWillAppear()/viewWillDisappear()/
+// viewWillBeDestroyed()/allowedOrientations()/navSection() back into
+// placeholders. The ENTIRE reason the earlier, abandoned plan copied
+// Nickel's live vtable rather than hand-building one was that
+// AbstractController's own base implementations of those six are real
+// behaviour Nickel's window-stack machinery may depend on -- that plan
+// got them for free, by copying. A COMPILER-GENERATED shim does not: the
+// compiler emits OUR OWN vtable, so every slot in it is now ours to fill
+// in, and a slot this class does not forward is not a harmless
+// placeholder -- it is a real base-class behaviour silently DROPPED. The
+// clearest instance is size(): if Nickel ever asks this controller how
+// big it is and gets a stub's default answer instead of the real
+// implementation's, the view can lay out to nothing, which looks
+// identical on a screenshot to "the screen never appeared" -- exactly the
+// kind of wrong-place hunting this project's verification culture exists
+// to prevent. So each of the six is resolved and forwarded to the real,
+// disassembled base implementation (nfnickel.h has the full derivation
+// and address for each), with a fallback constant used ONLY if its symbol
+// failed to resolve -- and even then, nf_view_resolve() (nfnickel.cc)
+// refuses to push the controller at all in that case, so the fallback is
+// belt-and-braces, not the expected path.
 //
 // THE THREE MITIGATIONS this task's brief requires, because a bent rule
 // still owes the purpose it was protecting:
@@ -64,16 +89,19 @@
 // RE-MEASURE ON A FIRMWARE BUMP: sizeof(AbstractController) (NOTES.md's
 // three independent readings -- the constructor's own writes, and two
 // independent derived-controller offsets that agree with them), whether
-// _ZN18AbstractControllerC2Ev / D1Ev still exist and still do what
-// NOTES.md describes, and the vtable slot order (9 slots: 2 compiler-
+// _ZN18AbstractControllerC2Ev / D1Ev / the six forwarded symbols
+// (nfnickel.h has every address) still exist and still do what this file
+// and NOTES.md describe, and the vtable slot order (9 slots: 2 compiler-
 // managed destructors, then size()/viewWillAppear()/viewWillDisappear()/
 // viewWillBeDestroyed()/allowedOrientations()/navSection(), then the one
 // pure virtual AbstractController::ensureViewLoaded (0xad1408) actually
 // calls). nf_view_layout_check() catches a changed CTOR-WRITE PATTERN
 // automatically, every time nf_browser_show() first runs; it cannot catch
-// a changed VTABLE SLOT COUNT or ORDER, which is a device question a
-// firmware bump would raise (see this task's report for what a device run
-// alone can settle).
+// a changed VTABLE SLOT COUNT/ORDER or a changed CALLING CONVENTION for
+// one of the six forwards (e.g. size() no longer needing a hidden return
+// buffer), which are device/re-disassembly questions a firmware bump
+// would raise (see this task's report for what a device run alone can
+// settle).
 
 #include "nfview.h"
 #include "nfnickel.h"
@@ -82,6 +110,7 @@
 #include <QObject>
 #include <QPushButton>
 #include <QSharedPointer> // QtSharedPointer::ExternalRefCountData -- see the class comment below
+#include <QSize>          // AbstractController::size()'s real return type -- see nfnickel.h
 #include <QVBoxLayout>
 #include <QWidget>
 
@@ -131,25 +160,55 @@ public:
     // Slots 2-7 of AbstractController's own vtable (NOTES.md: "+8 size(),
     // +12 viewWillAppear(), +16 viewWillDisappear(), +20
     // viewWillBeDestroyed(), +24 allowedOrientations() const, +28
-    // navSection() const"). NOTHING traced in this project calls any of
-    // these -- only AbstractController::ensureViewLoaded (0xad1408)
-    // calling slot 8 (nf_load_view, below) is measured -- so their exact
-    // argument/return contracts are UNKNOWN. Given harmless, inert
-    // defaults rather than guessed-at real behaviour: virtual dispatch
-    // through OUR OWN vtable lands correctly in OUR OWN code regardless of
-    // what we return here -- the SHAPE (9 slots, this order) is what
-    // Nickel's machine code depends on, not any particular value -- but an
-    // untraced Nickel code path (window-stack lifecycle, orientation lock,
-    // back-navigation bookkeeping) calling one of these with a contract
-    // this rung never measured is a real, open possibility. Flagged in
-    // this task's own report as a "what only a device run can settle"
-    // item, not silently assumed safe.
-    virtual int  size() { return 0; }
-    virtual void viewWillAppear() {}
-    virtual void viewWillDisappear() {}
-    virtual void viewWillBeDestroyed() {}
-    virtual int  allowedOrientations() const { return 0; }
-    virtual int  navSection() const { return 0; }
+    // navSection() const"). FORWARDED to the real, resolved
+    // AbstractController implementations, never left as inert stubs --
+    // see nfnickel.h's own comment on each of the six symbols below for
+    // the full disassembly each forward is based on, and the "why
+    // forwarding exists" paragraph in this file's own header comment for
+    // why an inert stub here is not a harmless placeholder: this shim
+    // replaced Nickel's OWN vtable wholesale, so every slot NOT forwarded
+    // is real base-class behaviour silently dropped, not a value nobody
+    // reads. Each fallback below (used only if the matching symbol did
+    // not resolve) reproduces the SAME constant the measured base
+    // implementation returns on 4.38.23684, so a missing symbol degrades
+    // to an IDENTICAL observable value rather than a different one --
+    // this is defence in depth: nf_view_resolve() (nfnickel.cc) already
+    // refuses to push the controller at all unless every one of these
+    // eight symbols resolved, so the fallback path is not expected to run
+    // in practice.
+    virtual QSize size() {
+        QSize s; // QSize()'s own constexpr ctor already yields (-1,-1) --
+                  // the SAME sentinel the real implementation writes, so
+                  // the fallback below (symbol unresolved) and the
+                  // forwarded call (symbol resolved, but Nickel's real
+                  // AbstractController::size() genuinely returns this
+                  // constant on 4.38.23684) produce the same value.
+        if (AbstractController__size)
+            AbstractController__size(&s, this);
+        return s;
+    }
+    virtual void viewWillAppear() {
+        if (AbstractController__viewWillAppear)
+            AbstractController__viewWillAppear(this);
+    }
+    virtual void viewWillDisappear() {
+        if (AbstractController__viewWillDisappear)
+            AbstractController__viewWillDisappear(this);
+    }
+    virtual void viewWillBeDestroyed() {
+        if (AbstractController__viewWillBeDestroyed)
+            AbstractController__viewWillBeDestroyed(this);
+    }
+    virtual int allowedOrientations() const {
+        return AbstractController__allowedOrientations
+             ? AbstractController__allowedOrientations(this)
+             : 5; // the measured constant (0xad1324), not an arbitrary guess
+    }
+    virtual int navSection() const {
+        return AbstractController__navSection
+             ? AbstractController__navSection(this)
+             : 0; // the measured constant (0xad15b0), not an arbitrary guess
+    }
 
     // Slot 8, offset +32 -- the ONLY pure virtual in AbstractController's
     // real vtable (__cxa_pure_virtual there, NOTES.md's vtable-header

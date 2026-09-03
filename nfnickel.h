@@ -189,10 +189,80 @@ extern void (*AbstractController__ctor)(void *_this);
 // would double-decrement, and potentially double-free, the same weakref).
 extern void (*AbstractController__dtor1)(void *_this);
 
-// True once both symbols above resolved. A THIRD, independent gate --
-// nf_nickel_resolve() and nf_browser_resolve() each already guard a
-// disjoint failure domain (book-opening; the borrowed-controller route),
-// and this one guards only the shim controller, so a firmware that breaks
+// --- the shim controller's six OTHER AbstractController symbols -----------
+//
+// A compiler-generated shim (nfview.cc) means the COMPILER emits the
+// vtable, not a copy of Nickel's own -- so every slot AbstractController's
+// vtable carries is now OURS, and a slot this shim does not forward is
+// behaviour a real derived controller had that this one silently drops,
+// not a harmless placeholder. This is the direct consequence of moving off
+// the "hand-copy Nickel's vtable, only slot 8 is ours" plan the original
+// rung-2 attempt used: that plan got these six for free BY COPYING;
+// nothing here copies anything, so nothing here is free. Each was
+// disassembled independently for this task -- resolved by exact address
+// with `nm -D --defined-only`, then read instruction-by-instruction, per
+// CLAUDE.md's "Method: adding a new libnickel call" ("do not infer a
+// calling convention from the name" -- VolumeManager::getById's missing
+// `this` is what guessing here has cost before, NOTES.md).
+//
+// AbstractController::size() -- 0xad12ec. Writes QSize(-1,-1) -- Qt's own
+// "invalid size" sentinel, confirmed against this ARM sysroot's qsize.h
+// ("Q_DECL_CONSTEXPR inline QSize::QSize() : wd(-1), ht(-1) {}") -- through
+// r0, with `this` (r1) loaded but never dereferenced. r0 is a HIDDEN
+// RETURN BUFFER, not `this` doing double duty: this[+0]/this[+4] are the
+// vptr and the QWeakPointer `d` field this shim's own layout depends on
+// (NFAbstractControllerShim, nfview.cc), and a write there would corrupt
+// every controller of this shape on its very first size() call, which no
+// real base-class accessor would do. QSize has user-declared constructors
+// (qsize.h), which is what makes the ARM C++ ABI classify it as "not POD
+// for the purposes of calls" and return it indirectly regardless of its
+// 8-byte size -- stated here as the REASON the measurement makes sense,
+// not as the basis for the signature: the signature below is written from
+// the disassembly, the same discipline as VolumeManager::getById's own
+// hidden-buffer signature (nfnickel.cc).
+extern void (*AbstractController__size)(void *sretQSize, void const *_this);
+
+// AbstractController::viewWillAppear/viewWillDisappear/viewWillBeDestroyed
+// -- 0xad1300, 0xad130c, 0xad1318. Measured, all three: a bare prologue
+// and epilogue with NOTHING between them -- true no-ops in the BASE
+// implementation, on THIS firmware. Forwarded anyway, not left as inert
+// stubs matching that measurement: a firmware where these stop being
+// no-ops would silently start dropping behaviour again if this shim
+// assumed today's measurement holds forever.
+extern void (*AbstractController__viewWillAppear)(void *_this);
+extern void (*AbstractController__viewWillDisappear)(void *_this);
+extern void (*AbstractController__viewWillBeDestroyed)(void *_this);
+
+// AbstractController::allowedOrientations() const -- 0xad1324. `this`
+// loaded, never dereferenced; unconditionally returns the constant 5 in
+// r0. A plain SCALAR return -- unlike size(), no hidden buffer: an `int`
+// has no constructor to trip the "not POD for calls" ARM ABI rule above,
+// so it returns the ordinary way (this in r0/r1 slot per the calling
+// convention, result in r0).
+extern int (*AbstractController__allowedOrientations)(void const *_this);
+
+// AbstractController::navSection() const -- 0xad15b0 (a WEAK symbol,
+// unlike every other symbol in this file -- confirmed with `nm -D`, not
+// significant to how it is called, just noted because it was unexpected).
+// Same shape as allowedOrientations(): `this` loaded, unused, constant 0
+// returned in r0.
+extern int (*AbstractController__navSection)(void const *_this);
+
+// True once every AbstractController symbol this shim needs has resolved
+// -- the original two (ctor, dtor1) AND these six. Deliberately ONE gate,
+// not eight independent ones: these six are no longer "nice to have" the
+// way most .optional entries in this project are -- a firmware missing
+// just size(), for instance, would silently fall back to a
+// default-constructed QSize(-1,-1) everywhere Nickel expects a real size,
+// which can lay a view out to nothing -- indistinguishable, on a
+// screenshot, from "the screen never appeared," which is exactly the kind
+// of wrong-place hunting this gate exists to prevent. So nf_browser_show()
+// (nfview.cc) refuses to push AT ALL if any of these eight is missing,
+// rather than pushing a controller with some slots silently reverted to
+// placeholder behaviour.
+//
+// A THIRD, independent gate from nf_nickel_resolve()/nf_browser_resolve()
+// (book-opening; the borrowed-controller route) -- a firmware that breaks
 // just one of these three features does not silently disable the other
 // two. See nf_browser_resolve()'s own comment for why this independence is
 // deliberate, not merely convenient.

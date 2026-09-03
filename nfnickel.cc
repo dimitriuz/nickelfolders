@@ -73,12 +73,18 @@ void   (*MainWindowController__push)(MainWindowController *_this, AbstractContro
 void   (*QuickAccessLibraryController__ctor)(AbstractController *_this, void const *source);
 void   (*ArticleListLibraryController__ctor)(AbstractController *_this, void const *source);
 
-// The shim controller's two raw AbstractController symbols -- see
+// The shim controller's eight raw AbstractController symbols -- see
 // nfnickel.h's own comment on each for what they are and why they are
 // still resolved by name rather than assumed. NOT static, same reason as
-// the four above: nfview.cc calls both directly.
+// the four above: nfview.cc calls all eight directly.
 void   (*AbstractController__ctor)(void *_this);
 void   (*AbstractController__dtor1)(void *_this);
+void   (*AbstractController__size)(void *sretQSize, void const *_this);
+void   (*AbstractController__viewWillAppear)(void *_this);
+void   (*AbstractController__viewWillDisappear)(void *_this);
+void   (*AbstractController__viewWillBeDestroyed)(void *_this);
+int    (*AbstractController__allowedOrientations)(void const *_this);
+int    (*AbstractController__navSection)(void const *_this);
 
 // Nickel's classes stay opaque, same discipline as Volume/ReadBookActionProxy
 // above: these are the four classes the rung 2 data-source chain constructs,
@@ -151,6 +157,12 @@ struct nh_dlsym NFNickelDlsym[] = {
     {.name = "_ZN28ArticleListLibraryControllerC1E14QSharedPointerI17LibraryDataSourceI6VolumeEE", .out = nh_symoutptr(ArticleListLibraryController__ctor), .desc = "ArticleListLibraryController::ArticleListLibraryController", .optional = true},
     {.name = "_ZN18AbstractControllerC2Ev",                  .out = nh_symoutptr(AbstractController__ctor),        .desc = "AbstractController::AbstractController (base object ctor)", .optional = true},
     {.name = "_ZN18AbstractControllerD1Ev",                  .out = nh_symoutptr(AbstractController__dtor1),       .desc = "AbstractController::~AbstractController (complete object dtor)", .optional = true},
+    {.name = "_ZN18AbstractController4sizeEv",               .out = nh_symoutptr(AbstractController__size),        .desc = "AbstractController::size",               .optional = true},
+    {.name = "_ZN18AbstractController14viewWillAppearEv",    .out = nh_symoutptr(AbstractController__viewWillAppear), .desc = "AbstractController::viewWillAppear",  .optional = true},
+    {.name = "_ZN18AbstractController17viewWillDisappearEv", .out = nh_symoutptr(AbstractController__viewWillDisappear), .desc = "AbstractController::viewWillDisappear", .optional = true},
+    {.name = "_ZN18AbstractController19viewWillBeDestroyedEv", .out = nh_symoutptr(AbstractController__viewWillBeDestroyed), .desc = "AbstractController::viewWillBeDestroyed", .optional = true},
+    {.name = "_ZNK18AbstractController19allowedOrientationsEv", .out = nh_symoutptr(AbstractController__allowedOrientations), .desc = "AbstractController::allowedOrientations", .optional = true},
+    {.name = "_ZNK18AbstractController10navSectionEv",       .out = nh_symoutptr(AbstractController__navSection),  .desc = "AbstractController::navSection",         .optional = true},
     {.name = "_ZN7QVectorI6VolumeE6appendERKS0_",             .out = nh_symoutptr(QVectorVolume__append),           .desc = "QVector<Volume>::append",                .optional = true},
     {.name = "_ZN7QVectorI6VolumeED1Ev",                      .out = nh_symoutptr(QVectorVolume__dtor),             .desc = "QVector<Volume>::~QVector",              .optional = true},
     {.name = "_ZN20InMemoryDataProviderI6VolumeEC1ERK7QVectorIS0_E", .out = nh_symoutptr(InMemoryDataProvider__ctor), .desc = "InMemoryDataProvider<Volume>::InMemoryDataProvider", .optional = true},
@@ -196,15 +208,26 @@ bool nf_browser_resolve(void) {
 }
 
 // A fourth independent gate, for the shim controller (nfview.cc) only --
-// see nfnickel.h's comment on AbstractController__ctor/__dtor1 for why this
-// stays disjoint from the other three (nf_nickel_resolve, nf_browser_resolve).
-// This checks only that the SYMBOLS resolved; it does not run the deeper
-// runtime write-pattern check (nf_view_layout_check, nfview.cc) -- that
-// needs to call through these pointers, which this function deliberately
+// see nfnickel.h's comment on AbstractController__ctor/__dtor1/the six
+// forwarded slots for why this stays disjoint from the other three
+// (nf_nickel_resolve, nf_browser_resolve) and why ALL EIGHT symbols gate
+// together rather than degrading slot-by-slot: the six forwarded slots are
+// not optional-to-behaviour the way most .optional entries in this project
+// are (nfnickel.h's own comment has the full argument -- size() falling
+// back to a placeholder can lay the view out to nothing). This checks only
+// that the SYMBOLS resolved; it does not run the deeper runtime
+// write-pattern check (nf_view_layout_check, nfview.cc) -- that needs to
+// call through the ctor specifically, which this function deliberately
 // does not do, matching nf_nickel_resolve/nf_browser_resolve's own pattern
 // of being a cheap, side-effect-free predicate nf_init can log at boot.
 bool nf_view_resolve(void) {
-    return AbstractController__ctor && AbstractController__dtor1;
+    return AbstractController__ctor && AbstractController__dtor1 &&
+           AbstractController__size &&
+           AbstractController__viewWillAppear &&
+           AbstractController__viewWillDisappear &&
+           AbstractController__viewWillBeDestroyed &&
+           AbstractController__allowedOrientations &&
+           AbstractController__navSection;
 }
 
 // dbName is a Repository cache-partition key. Device::calcDbName compares the
