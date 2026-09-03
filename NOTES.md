@@ -230,7 +230,8 @@ change at any point, i.e. **Nickel survived every stage**.
 | Does `getById` find a **sideloaded** book by ContentID? | **Yes**, with `dbName` empty. `isValid=true` for a real book, `false` for a ContentID no book has — so it discriminates, and the negative control proves the check is not vacuous. |
 | Does the proxy constructor accept an arbitrary `QObject` parent? | **Yes.** Constructed against the mod's own trigger object. |
 | Does `onSelected()` actually navigate? | **Yes.** `ndbCurrentView` went `HomePageView` → `ReadingView`, and a framebuffer grab shows the right book open in the stock reader with Nickel's own header and chapter footer. Took ~4 s. |
-| Where does **back** go? | Structurally, the reader is *pushed on top* of the previous view rather than replacing the stack — the view before was `HomePageView` and the reader appeared above it. So a browser of ours on the stack would be returned to. **The gesture itself has not been driven**; nothing here can press it, so this is the one row a finger still has to confirm. |
+| Does Nickel's own bookkeeping run? | **Yes**, and this is the payoff for choosing `ReadBookActionProxy` over `ReadingController`: the book appeared in Nickel's **Recents** afterwards. A direct `ReadingController` push would have rendered the book with no reading session and no Recents entry. |
+| Where does **back** go? | **It pops.** Confirmed by the owner pressing it: back left the reader and returned to the view beneath (`HomePageView`), with the book now listed in **Recents**. So a browser view of ours on the window stack WILL be returned to — the browser can be a screen, not a one-shot launcher. |
 
 The test used `file:///mnt/onboard/books/Pratchett_ Terry - The Color of Magic_ A Discworld Novel.epub`
 — a plain sideloaded `.epub` one directory down, chosen because it is exactly
@@ -243,12 +244,9 @@ always whether Nickel *navigated*.
 ### Open questions — what a device run still has to answer
 
 These are cheap now: the mod is installed and `tools/kobo.py open` drives it
-without a rebuild. Numbered so they can be referred to.
+without a rebuild. Numbered so they can be referred to. (#1, the back gesture,
+was answered on 2026-09-03 and moved into Results.)
 
-1. **The back gesture.** The reader is pushed on top of the previous view, so a
-   view of ours should be returned to — unverified, and nothing here can press
-   back. Decides whether the browser is a screen you return to or a one-shot
-   launcher, so it is the one that shapes the design.
 2. **Other formats.** Only a plain sideloaded `.epub` has been opened. The
    library also holds `.kepub.epub`, `.cbz` and `.pdf`, and KEPUBs matter most
    because their chapter ContentIDs have a different shape — the volume-level

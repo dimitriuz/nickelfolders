@@ -24,11 +24,14 @@ arbitrary **sideloaded** book in the stock reader. `ndbCurrentView` went
 Nickel's own header and chapter footer, and Nickel's PID never changed. `dbName`
 empty is correct.
 
-Still unconfirmed: the **back gesture**. The reader is pushed *on top* of the
-previous view rather than replacing the stack, so a browser view of ours should
-be returned to — but nothing in this repo can press back, so it needs a finger.
-That row decides whether the browser is a screen you return to or a one-shot
-launcher.
+**Back pops**, confirmed by the owner: it leaves the reader and returns to the
+view beneath, with the book then listed in Nickel's Recents. So the browser can
+be a real screen on the window stack that you return to, not a one-shot
+launcher — that is settled, and it is the answer the design wanted.
+
+The Recents entry is also the evidence for using `ReadBookActionProxy` rather
+than pushing a `ReadingController`: Nickel's own bookkeeping ran. Do not
+"simplify" that call site.
 
 ## Build
 
