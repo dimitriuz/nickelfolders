@@ -7,6 +7,7 @@
 #define NFNICKEL_H
 
 #include <QString>
+#include <QStringList>
 
 #include <NickelHook.h>
 
@@ -26,11 +27,16 @@ extern struct nh_dlsym NFNickelDlsym[];
 // could take the owner's other NickelHook mods down with it.
 bool nf_nickel_resolve(void);
 
-// The same idea as nf_nickel_resolve() above, but for the four symbols
-// nfbrowser.cc needs (AbstractController's ctor and vtable,
-// MainWindowController's sharedInstance and push) and NONE of the seven
-// above -- kept as a separate bool on purpose, so a firmware that breaks one
-// feature's symbols does not also disable the other's. See nfnickel.cc.
+// The same idea as nf_nickel_resolve() above, but for the symbols rung 2's
+// screen needs (QuickAccessLibraryController's ctor, the data-source chain
+// underneath it, and MainWindowController's sharedInstance/push) and NONE of
+// the seven above -- kept as a separate bool on purpose, so a firmware that
+// breaks one feature's symbols does not also disable the other's. Note that
+// nf_build_volume_source (below) ADDITIONALLY needs nf_nickel_resolve() to
+// be true too (it calls VolumeManager::getById over each ContentID, the same
+// as book-opening does) and checks that itself -- this bool alone is not
+// sufficient to call nf_browser_show_volumes safely, which is why
+// nfbrowser.cc's own gate checks both. See nfnickel.cc.
 bool nf_browser_resolve(void);
 
 // The dbName VolumeManager::getById wants for THIS device -- see nfnickel.cc
@@ -57,74 +63,72 @@ bool nf_open_book(QString const& contentId);
 bool nf_open_book_staged(QString const& contentId, QString const& dbName, int stage);
 
 // AbstractController is Nickel's base UI-controller class. Opaque per the
-// house rule ("Nickel's classes stay opaque") even though nfbrowser.cc, not
-// this file, is what actually builds an object shaped like one -- the
-// typedef stays here because it is the type the symbols below are resolved
-// AS or against, and every libnickel symbol's resolved type lives in one
-// place per this header's own opening comment. NOT a QObject: its typeinfo
-// (0x163ff68 on 4.38.23684) is a plain __class_type_info with no base --
-// given, device-verified fact, not re-derived here.
+// house rule ("Nickel's classes stay opaque") -- typedef + explicitly
+// written call signatures, never a real C++ class. Kept here (unlike rung
+// 2's original version of this file) purely as the STATIC TYPE
+// MainWindowController::push's second parameter takes: this rung builds no
+// AbstractController-shaped object by hand at all. QuickAccessLibraryController
+// -- the real controller nfbrowser.cc constructs -- has AbstractController
+// as its PRIMARY base at offset 0 (confirmed: NickelGridLibraryControllerBase's
+// own ctor calls AbstractController::AbstractController() with `this` passed
+// straight through, no offset adjustment -- archaeology part 2, P2.2), so a
+// pointer to one IS, bit-for-bit, a valid AbstractController* with no cast
+// arithmetic needed.
 typedef void AbstractController;
 typedef void MainWindowController;
-
-// AbstractController::AbstractController() writes exactly 3 words (a vptr,
-// then zero at +4 and +8) and calls nothing else -- confirmed by its own
-// disassembly containing no bl/blx at all, so calling it through this
-// pointer has no effect beyond those three writes. sizeof(AbstractController)
-// == 12 on 4.38.23684: those same three writes are the lower bound, and two
-// independent derived controllers each place their OWN next field exactly
-// 12 bytes after their AbstractController base subobject starts, with no
-// gap. NOTES.md, "Task 7, rung 2", has the full derivation. nfbrowser.cc
-// over-allocates well past 12 bytes before calling this, per CLAUDE.md's
-// "over-allocate for every Nickel constructor" -- the constructor cannot be
-// told how much room it has.
-extern void (*AbstractController__ctor)(AbstractController *_this);
-
-// The resolved ADDRESS of Nickel's own _ZTV18AbstractController -- an
-// 11-word array (offset-to-top, RTTI pointer, then the 9 slots CLAUDE.md's
-// measured table lists) that nfbrowser.cc copies at runtime rather than
-// hand-transcribing byte-for-byte, for the RTTI pointer and slots 2-8's
-// sake (every one of THOSE carries a normal R_ARM_ABS32 relocation naming
-// the symbol -- readelf -r confirms it -- so reading them live rather than
-// hardcoding an address is just this project's usual "resolve by name"
-// discipline, nothing more). Slots 0 and 1 (the two destructors) are the
-// exception, and copying them from this table is WRONG, not merely
-// unverified: on 4.38.23684 there is no relocation at all for either word
-// -- readelf -r finds nothing at 0163ff78/0163ff7c, and a raw byte dump
-// across that whole range reads zero -- so a copy from this live table
-// puts a null pointer in both destructor slots. AbstractController__dtor1
-// and AbstractController__dtor0 below are resolved BY NAME instead and
-// must be stored into those two slots explicitly; nfbrowser.cc does this.
-// NOTES.md has the full account, including the wrong assumption ("some
-// mechanism this project's tools can't decode will fill them in by
-// runtime") this replaces. A plain `void**`, not a pointer-to-array-of-11,
-// because nfbrowser.cc indexes it with a runtime loop, not a compile-time
-// struct.
-extern void **AbstractController__vtable;
-
-// The two destructor vtable slots _ZTV18AbstractController itself does NOT
-// populate (see AbstractController__vtable's comment, above) -- resolved
-// separately, by name, because that table cannot be trusted for these two
-// words. D1 ("complete object destructor") tears down the object's own
-// state without freeing `this`; D0 ("deleting destructor") does the same
-// and then frees `this` via operator delete -- both exported
-// (_ZN18AbstractControllerD1Ev at 0xad1358, _ZN18AbstractControllerD0Ev at
-// 0xad1398 on 4.38.23684), both take just `this` in r0. Store these into
-// NFControllerVTable's slots 0/1 explicitly; NEVER take them from a copy
-// of AbstractController__vtable.
-extern void (*AbstractController__dtor1)(AbstractController *_this);
-extern void (*AbstractController__dtor0)(AbstractController *_this);
 
 // MainWindowController::sharedInstance() -- a lazily-constructed singleton
 // accessor, not further disassembled (out of this rung's stated scope; see
 // NOTES.md). MainWindowController::push(AbstractController*, bool) puts a
 // controller onto Nickel's own window stack; NOTES.md has its complete PLT
-// stub resolution, including the finding that a controller which is NOT a
-// QObject (ours, by design) is a supported, non-crashing input -- a failed
-// internal dynamic_cast<QObject*> only skips one optional weak-pointer
-// liveness feature, it does not reject the push.
+// stub resolution. Rung 2's replacement plan (folder-stack-archaeology.md,
+// Part 2) is what makes push's internal dynamic_cast<QObject*> succeed for
+// real, rather than merely tolerate failing: QuickAccessLibraryController IS
+// a QObject, with real RTTI Nickel's own compiler generated -- nothing here
+// fabricates that any more.
 extern void  *(*MainWindowController__sharedInstance)(void);
 extern void   (*MainWindowController__push)(MainWindowController *_this, AbstractController *controller, bool animate);
+
+// QuickAccessLibraryController::QuickAccessLibraryController(QSharedPointer<LibraryDataSource<Volume> >)
+// at 0xf44fb4 on 4.38.23684. sizeof == 72, read at the `movs r0, #72` inside
+// QuickAccessMenuView::QuickAccessMenuView's own `operator new` call site
+// (0xf499a4) -- Nickel's OWN allocation for this exact class, re-confirmed
+// directly against this binary for this rung (archaeology part 2, P2.2).
+// NOT static: nfbrowser.cc calls this directly, the same way it directly
+// called AbstractController__ctor before this rung replaced that plan.
+// `_this` is typed AbstractController* rather than a distinct opaque type
+// for the controller, on purpose -- see AbstractController's own comment
+// above: they are the same address, and this saves nfbrowser.cc a cast
+// between "freshly allocated" and "ready to push".
+extern void (*QuickAccessLibraryController__ctor)(AbstractController *_this, void const *source /* QSharedPointer<LibraryDataSource<Volume> > const& */);
+
+// QSharedPointer<T>'s complete runtime layout, for every T, per Qt 5.2's
+// public qsharedpointer_impl.h: a value pointer, then an
+// ExternalRefCountData*. Two pointers, 8 bytes -- nothing here depends on
+// T's own fields, which is why ONE struct describes both distinct
+// QSharedPointer<...> instantiations nf_build_volume_source builds
+// (QSharedPointer<LibraryDataProvider<Volume> > and
+// QSharedPointer<LibraryDataSource<Volume> >). Confirmed against this
+// binary's own calling convention, not merely assumed: every constructor
+// that takes one of these by const-reference (QuickAccessLibraryController's,
+// LinearLibraryDataSource<Volume>'s) receives a plain pointer in r1 and
+// reads value at +0, d at +4 -- archaeology part 2, P2.2.
+struct NFSharedPtr { void *value; void *d; };
+
+// Looks up every ContentID in contentIds via VolumeManager::getById (the
+// SAME getById/isValid/dtor discipline nf_open_book_staged already uses --
+// see nf_open_book_staged's own comments for the measurements behind it; an
+// invalid ContentID's Volume is simply never appended, which IS the negative
+// control the brief's device checklist asks for, with no special-casing
+// needed), builds a QVector<Volume> from what is found, and wraps it in an
+// InMemoryDataProvider<Volume> and a LinearLibraryDataSource<Volume> --
+// Nickel's own classes throughout, resolved by name. *outSource is left
+// untouched and false is returned if a required symbol never resolved
+// (checks BOTH nf_nickel_resolve(), for getById itself, and the data-source
+// chain's own symbols -- see nf_browser_resolve's comment for why these are
+// two independent gates). See nfnickel.cc for the one hand-built structure
+// this needs (the QSharedPointer control block) and why it is acceptable.
+bool nf_build_volume_source(QStringList const& contentIds, QString const& dbName, NFSharedPtr *outSource);
 
 // Sets up an inotify watch on the DIRECTORY containing `path` -- never on
 // `path` itself, because a watch cannot be established on a file that does

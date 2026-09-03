@@ -19,6 +19,8 @@
 #include <QObject>
 #include <QSocketNotifier>
 #include <QString>
+#include <QStringList>
+#include <QVector>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -59,23 +61,55 @@ static void    (*ReadBookActionProxy__onSelected)(ReadBookActionProxy *_this);
 static Device        *(*Device__getCurrentDevice)(void);
 static QString const *(*Device__getDbName)(Device const *_this);
 
-// These six are NOT static, unlike everything above -- nfbrowser.cc needs
-// them directly to build its own vtable and controller object, which is a
-// lower-level operation than anything the book-opening path needed (that
-// path only ever called through a resolved pointer; this rung also reads
-// vtable memory and writes a raw offset). nfnickel.h has the full rationale
-// for each; NOTES.md's "Task 7, rung 2" section has the disassembly.
-void (*AbstractController__ctor)(AbstractController *_this);
-void **AbstractController__vtable;
-// Resolved separately from AbstractController__vtable and NEVER taken from
-// a copy of it -- that table's own slots 0/1 carry no relocation on
-// 4.38.23684 (readelf -r finds nothing at 0163ff78/0163ff7c, file bytes
-// read zero) and reading them live gives NULL, not Nickel's real
-// destructors. See nfnickel.h's comment on AbstractController__vtable.
-void (*AbstractController__dtor1)(AbstractController *_this);
-void (*AbstractController__dtor0)(AbstractController *_this);
+// NOT static, unlike everything below this point -- nfbrowser.cc calls
+// these three directly to construct and push the real controller, the same
+// way it used to call AbstractController__ctor directly before this rung
+// replaced that plan. nfnickel.h has the full rationale for each.
 void  *(*MainWindowController__sharedInstance)(void);
 void   (*MainWindowController__push)(MainWindowController *_this, AbstractController *controller, bool animate);
+void   (*QuickAccessLibraryController__ctor)(AbstractController *_this, void const *source);
+
+// Nickel's classes stay opaque, same discipline as Volume/ReadBookActionProxy
+// above: these are the four classes the rung 2 data-source chain constructs,
+// each typedef'd void and reached only through an explicitly written call
+// signature. LibraryDataProvider and LibraryDataSource never appear as a
+// `this` we construct directly -- they are only ever the STATIC TYPE of a
+// QSharedPointer's value pointer -- but naming them keeps every signature
+// below self-documenting about which QSharedPointer<...> it means.
+typedef void LibraryDataProvider;
+typedef void LibraryDataSource;
+
+// QVector<Volume>::append(Volume const&) and ::~QVector() -- both static and
+// private to this file (nf_build_volume_source, below, is the only caller;
+// nfbrowser.cc never touches a QVector<Volume> itself). `vec` is always the
+// address of an NFVolumeVector, defined just above nf_build_volume_source
+// further down -- QVector<T>'s complete layout for every T is one Data* and
+// nothing else (Qt 5.2's public qvector.h), so a raw `void*` argument here
+// is exactly as precise as a real `QVector<Volume>*` would be, without
+// needing Volume's real definition to declare one.
+static void (*QVectorVolume__append)(void *vec, Volume const *v);
+static void (*QVectorVolume__dtor)(void *vec);
+
+// InMemoryDataProvider<Volume>::InMemoryDataProvider(QVector<Volume> const&)
+// at 0x1082a90, and LinearLibraryDataSource<Volume>::LinearLibraryDataSource
+// (QSharedPointer<LibraryDataProvider<Volume> >) at 0xaf88ac. Both static:
+// only nf_build_volume_source calls them.
+static void (*InMemoryDataProvider__ctor)(LibraryDataProvider *_this, void const *vec);
+static void (*LinearLibraryDataSource__ctor)(LibraryDataSource *_this, void const *provider);
+
+// QtSharedPointer::ExternalRefCountWithCustomDeleter<T, NormalDeleter>::deleter,
+// for T = LibraryDataProvider<Volume> (0xc280f8) and T = LibraryDataSource<Volume>
+// (0xb10920) -- the two DestroyerFn values nf_build_volume_source's hand-built
+// ExternalRefCountData headers store, per the brief ("the one hand-built
+// thing"). Never actually invoked (see nf_build_volume_source): both
+// counters in every header this file builds are set high enough that no
+// legitimate decrement chain reaches zero. Resolving these by name rather
+// than guessing an address is still worth doing even though they are
+// (deliberately) unreachable -- a resolved-but-unused pointer costs nothing,
+// and NULL-gating nf_build_volume_source on them catches a firmware that
+// dropped the symbol before it ever matters, not after.
+static void (*NFRefCountDeleter_Provider)(void *refCountData);
+static void (*NFRefCountDeleter_Source)(void *refCountData);
 
 // Every entry below is .optional = true, and that is not carelessness on
 // getById of all things -- it is the shared-failsafe rule in CLAUDE.md taken
@@ -100,12 +134,15 @@ struct nh_dlsym NFNickelDlsym[] = {
     {.name = "_ZN19ReadBookActionProxy10onSelectedEv",        .out = nh_symoutptr(ReadBookActionProxy__onSelected), .desc = "ReadBookActionProxy::onSelected",        .optional = true},
     {.name = "_ZN6Device16getCurrentDeviceEv",                .out = nh_symoutptr(Device__getCurrentDevice),        .desc = "Device::getCurrentDevice",               .optional = true},
     {.name = "_ZNK6Device9getDbNameEv",                       .out = nh_symoutptr(Device__getDbName),               .desc = "Device::getDbName",                      .optional = true},
-    {.name = "_ZN18AbstractControllerC1Ev",                   .out = nh_symoutptr(AbstractController__ctor),        .desc = "AbstractController::AbstractController", .optional = true},
-    {.name = "_ZTV18AbstractController",                      .out = nh_symoutptr(AbstractController__vtable),      .desc = "AbstractController::vtable",             .optional = true},
-    {.name = "_ZN18AbstractControllerD1Ev",                   .out = nh_symoutptr(AbstractController__dtor1),       .desc = "AbstractController::~AbstractController (D1)", .optional = true},
-    {.name = "_ZN18AbstractControllerD0Ev",                   .out = nh_symoutptr(AbstractController__dtor0),       .desc = "AbstractController::~AbstractController (D0, deleting)", .optional = true},
     {.name = "_ZN20MainWindowController14sharedInstanceEv",   .out = nh_symoutptr(MainWindowController__sharedInstance), .desc = "MainWindowController::sharedInstance", .optional = true},
     {.name = "_ZN20MainWindowController4pushEP18AbstractControllerb", .out = nh_symoutptr(MainWindowController__push), .desc = "MainWindowController::push",           .optional = true},
+    {.name = "_ZN28QuickAccessLibraryControllerC1E14QSharedPointerI17LibraryDataSourceI6VolumeEE", .out = nh_symoutptr(QuickAccessLibraryController__ctor), .desc = "QuickAccessLibraryController::QuickAccessLibraryController", .optional = true},
+    {.name = "_ZN7QVectorI6VolumeE6appendERKS0_",             .out = nh_symoutptr(QVectorVolume__append),           .desc = "QVector<Volume>::append",                .optional = true},
+    {.name = "_ZN7QVectorI6VolumeED1Ev",                      .out = nh_symoutptr(QVectorVolume__dtor),             .desc = "QVector<Volume>::~QVector",              .optional = true},
+    {.name = "_ZN20InMemoryDataProviderI6VolumeEC1ERK7QVectorIS0_E", .out = nh_symoutptr(InMemoryDataProvider__ctor), .desc = "InMemoryDataProvider<Volume>::InMemoryDataProvider", .optional = true},
+    {.name = "_ZN23LinearLibraryDataSourceI6VolumeEC1E14QSharedPointerI19LibraryDataProviderIS0_EE", .out = nh_symoutptr(LinearLibraryDataSource__ctor), .desc = "LinearLibraryDataSource<Volume>::LinearLibraryDataSource", .optional = true},
+    {.name = "_ZN15QtSharedPointer33ExternalRefCountWithCustomDeleterI19LibraryDataProviderI6VolumeENS_13NormalDeleterEE7deleterEPNS_20ExternalRefCountDataE", .out = nh_symoutptr(NFRefCountDeleter_Provider), .desc = "ExternalRefCountWithCustomDeleter<LibraryDataProvider<Volume>>::deleter", .optional = true},
+    {.name = "_ZN15QtSharedPointer33ExternalRefCountWithCustomDeleterI17LibraryDataSourceI6VolumeENS_13NormalDeleterEE7deleterEPNS_20ExternalRefCountDataE", .out = nh_symoutptr(NFRefCountDeleter_Source), .desc = "ExternalRefCountWithCustomDeleter<LibraryDataSource<Volume>>::deleter", .optional = true},
     {0},
 };
 
@@ -115,19 +152,22 @@ bool nf_nickel_resolve(void) {
            Device__getCurrentDevice && Device__getDbName;
 }
 
-// A SEPARATE gate from nf_nickel_resolve() above, deliberately: the browser
-// screen (nfbrowser.cc) needs none of the getById/Volume/ReadBookActionProxy
-// symbols, and book-opening needs none of these four. Folding them into one
-// bool would mean a firmware that renames just MainWindowController::push,
-// say, also disables book-opening for no reason -- exactly the unnecessary
-// coupling CLAUDE.md's "treat anything non-essential as non-fatal" argues
-// against. Two independent bools keep the two features' failure domains
-// independent, the same way each is already independently .optional in the
-// table above.
+// A SEPARATE gate from nf_nickel_resolve() above, deliberately: rung 2's
+// screen needs none of the getById/Volume/ReadBookActionProxy symbols
+// directly (nf_build_volume_source below calls nf_nickel_resolve() itself
+// for the getById step it DOES need), and book-opening needs none of these
+// eight. Folding them into one bool would mean a firmware that renames just
+// MainWindowController::push, say, also disables book-opening for no
+// reason -- exactly the unnecessary coupling CLAUDE.md's "treat anything
+// non-essential as non-fatal" argues against. Two independent bools keep the
+// two features' failure domains independent, the same way each is already
+// independently .optional in the table above.
 bool nf_browser_resolve(void) {
-    return AbstractController__ctor && AbstractController__vtable &&
-           AbstractController__dtor1 && AbstractController__dtor0 &&
-           MainWindowController__sharedInstance && MainWindowController__push;
+    return MainWindowController__sharedInstance && MainWindowController__push &&
+           QuickAccessLibraryController__ctor &&
+           QVectorVolume__append && QVectorVolume__dtor &&
+           InMemoryDataProvider__ctor && LinearLibraryDataSource__ctor &&
+           NFRefCountDeleter_Provider && NFRefCountDeleter_Source;
 }
 
 // dbName is a Repository cache-partition key. Device::calcDbName compares the
@@ -280,6 +320,167 @@ bool nf_open_book(QString const& contentId) {
     QString const *db = nf_db_name();
     static QString const empty;
     return nf_open_book_staged(contentId, db ? *db : empty, 4);
+}
+
+// --- rung 2: the data-source chain -----------------------------------------
+//
+// QVector<T>'s complete runtime layout, for every T, per Qt 5.2's public
+// qvector.h: one implicitly-shared Data* and nothing else -- 4 bytes. A
+// default-constructed QVector<T>'s Data* is Qt5Core's own universal empty
+// sentinel (QArrayData::shared_null[0]); QTypedArrayData<T>::sharedNull() is
+// nothing but a reinterpret_cast of that ONE un-templated global, so its
+// ADDRESS does not depend on T at all. nf_qvector_shared_null(), below,
+// exploits exactly that: a real, host-legal QVector<int> -- int needs no
+// opacity, it is not one of Nickel's own classes -- gives us, by
+// construction, the identical bit pattern an unreachable QVector<Volume>'s
+// own default constructor would produce, without declaring any private Qt
+// struct and without needing Volume's real definition. This is public Qt5
+// architecture (the implicit-sharing empty-sentinel pattern), not a guess:
+// libnickel.so.1.0.0 itself imports _ZN10QArrayData11shared_nullE as an
+// UNDEFINED symbol (readelf -D -r), i.e. from Qt5Core, so every QVector<T>
+// in this whole process -- Nickel's and ours alike -- already shares this
+// one value.
+struct NFVolumeVector { void *d; };
+
+static void *nf_qvector_shared_null() {
+    QVector<int> probe;
+    return *reinterpret_cast<void* const*>(&probe);
+}
+
+// Qt 5.2's public qsharedpointer_impl.h: ExternalRefCountData is three
+// words -- two QAtomicInt counters and a DestroyerFn -- 12 bytes total (no
+// padding: three 4-byte fields, naturally 4-byte aligned). THE ONE
+// hand-built structure this rung allows itself (CLAUDE.md; the task brief's
+// "the one hand-built thing"): Nickel exports no way to construct a strong
+// QSharedPointer's control block, only the QObject weak-pointer helpers.
+// Field NAMES follow the public header's own declaration order, but nothing
+// below actually depends on getting that order right -- both counters are
+// always set to the SAME value (see nf_build_volume_source), so a
+// strongref/weakref swap would produce byte-identical output.
+struct NFRefCountData {
+    int  strongref;
+    int  weakref;
+    void (*destroyer)(void *refCountData);
+};
+
+bool nf_build_volume_source(QStringList const& contentIds, QString const& dbName, NFSharedPtr *outSource) {
+    if (!nf_nickel_resolve()) {
+        nh_log("browser: a getById-path symbol never resolved, refusing to build a data source");
+        return false;
+    }
+    if (!QVectorVolume__append || !QVectorVolume__dtor || !InMemoryDataProvider__ctor ||
+        !LinearLibraryDataSource__ctor || !NFRefCountDeleter_Provider || !NFRefCountDeleter_Source) {
+        nh_log("browser: a data-source symbol never resolved, refusing");
+        return false;
+    }
+
+    NFVolumeVector vec = { nf_qvector_shared_null() };
+
+    int kept = 0;
+    for (int i = 0; i < contentIds.size(); i++) {
+        // Same buffer size, same getById/isValid/dtor discipline as
+        // nf_open_book_staged -- see that function's own comments for the
+        // measurements behind volbuf's size, and for why the dtor is called
+        // ONLY when v is non-null: a null v means getById did not construct
+        // into volbuf, so there is nothing to destroy (this mirrors
+        // nf_open_book_staged's own `if (!v) return false;` guard exactly,
+        // rather than introducing a second, looser discipline here). An
+        // invalid-but-constructed ContentID's Volume is simply never
+        // appended: this IS the negative control the brief's device
+        // checklist asks for (a row for a ContentID no book has must be
+        // absent, not crash), and it needs no special-casing beyond that.
+        unsigned char volbuf[128] __attribute__((aligned(8)));
+        memset(volbuf, 0, sizeof volbuf);
+        Volume *v = VolumeManager__getById(volbuf, &contentIds.at(i), &dbName);
+        if (!v)
+            continue;
+        if (Volume__isValid(v)) {
+            QVectorVolume__append(&vec, v);
+            kept++;
+        }
+        Volume__dtor(v);
+    }
+    nh_log("browser: %d of %d ContentIDs resolved to a book", kept, static_cast<int>(contentIds.size()));
+
+    // sizeof(InMemoryDataProvider<Volume>): UNLIKE QuickAccessLibraryController
+    // (measured from a real `operator new` call site, nfnickel.h), this class
+    // has NO caller anywhere in this firmware's libnickel to read a size
+    // from -- confirmed by sweeping the FULL .rel.plt/.rel.dyn table (152,960
+    // entries) for any relocation naming either this constructor or
+    // LinearLibraryDataSource's, below, and finding none, and by a chunked
+    // disassembly sweep of the whole of .text for a direct `bl`/`blx` to
+    // either address, also finding none. The archaeology report treated
+    // "exported" as sufficient evidence without checking this; it was not
+    // sufficient, and this is that finding.
+    //
+    // The size below is instead a LOWER BOUND read the way CLAUDE.md's own
+    // AbstractController was: from the constructor's OWN writes to `this`,
+    // at 0x1082a90 -- offsets 0, 4, 8 and 12 (four words), nothing beyond
+    // +12 anywhere in the function. Over-allocated by roughly 16x on top of
+    // that bound, the same margin AbstractController's old 12->256 used, to
+    // survive both firmware growth AND the residual uncertainty of a
+    // lower-bound-only measurement.
+    void *providerBuf = ::operator new(256);
+    memset(providerBuf, 0, 256);
+    InMemoryDataProvider__ctor(providerBuf, &vec);
+
+    // Our own reference is no longer needed: InMemoryDataProvider's ctor
+    // refcount-shares the vector's Data* (read directly in its own
+    // disassembly -- an atomic increment on the incoming vector's `d`,
+    // not a deep copy) rather than deep-copying, so destroying our local
+    // copy here does not free the elements -- it just drops the ONE
+    // reference we were holding. This is real cleanup, the same
+    // Volume__dtor discipline as the loop above, one level up -- not part
+    // of the deliberate leak below.
+    QVectorVolume__dtor(&vec);
+
+    // strongref/weakref are set to 2, not the real ctor's 1: every
+    // constructor that takes one of these QSharedPointers by const
+    // reference (LinearLibraryDataSource's below, and
+    // QuickAccessLibraryController's in nfbrowser.cc) makes and unwinds its
+    // own temporary copies before returning, which nets to AT MOST one
+    // decrement of each counter by the time construction is done (read
+    // directly off each ctor's own disassembly: paired atomic increments on
+    // both counters together, for every copy, with a matching decrement for
+    // every temporary that goes out of scope). Starting one higher than
+    // that guarantees NEITHER counter can reach zero through any legitimate
+    // decrement this chain performs, so the deleter is NEVER invoked -- a
+    // deliberate, permanent leak of one 12-byte header per QSharedPointer
+    // this function builds (two per screen: one for the provider, one for
+    // the source), same as the leaked InMemoryDataProvider/
+    // LinearLibraryDataSource/QuickAccessLibraryController objects
+    // themselves (never freed for the same reason: the deleter that would
+    // free them is what these headers exist to permanently suppress).
+    // CLAUDE.md asks a deliberate leak to carry the reason so nobody deletes
+    // it as a bug: the alternative is letting Qt call a deleter on memory
+    // whose ownership this mod cannot prove.
+    NFRefCountData *providerRef = static_cast<NFRefCountData*>(::operator new(sizeof(NFRefCountData)));
+    providerRef->strongref = 2;
+    providerRef->weakref   = 2;
+    providerRef->destroyer = NFRefCountDeleter_Provider;
+
+    NFSharedPtr sp_provider = { providerBuf, providerRef };
+
+    // sizeof(LinearLibraryDataSource<Volume>): same situation as the
+    // provider above -- no operator-new call site anywhere in this
+    // firmware, lower bound read from this ctor's own writes at 0xaf88ac
+    // (offsets 0, 4 and 8 -- three words, nothing beyond +8 anywhere in the
+    // function; no base-class constructor call was found either, so
+    // LibraryDataSource<Volume> itself appears to carry no state of its
+    // own beyond the vtable pointer this class already provides). Same
+    // ~16x over-allocation margin as the provider above.
+    void *sourceBuf = ::operator new(256);
+    memset(sourceBuf, 0, 256);
+    LinearLibraryDataSource__ctor(sourceBuf, &sp_provider);
+
+    NFRefCountData *sourceRef = static_cast<NFRefCountData*>(::operator new(sizeof(NFRefCountData)));
+    sourceRef->strongref = 2;
+    sourceRef->weakref   = 2;
+    sourceRef->destroyer = NFRefCountDeleter_Source;
+
+    outSource->value = sourceBuf;
+    outSource->d      = sourceRef;
+    return true;
 }
 
 // --- inotify watch --------------------------------------------------------

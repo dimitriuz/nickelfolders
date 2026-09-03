@@ -3,13 +3,15 @@
 // Rung 1's whole job was answering whether an injected mod can hand an
 // arbitrary ContentID to Nickel's stock reader and have the book open the
 // way it does when you tap it in the library -- answered, see NOTES.md and
-// README.md. Rung 2's job is a screen of ours on Nickel's own window stack
-// (nfbrowser.cc) -- also drawing nothing on purpose, same as rung 1 opened
-// no UI of its own, because the point of this rung is proving the screen
-// itself works before anything is put on it.
+// README.md. Rung 2's job is Nickel's OWN list controller
+// (QuickAccessLibraryController, nfbrowser.cc) on Nickel's own window stack,
+// showing books we chose -- Nickel draws every row, and a tap on one opens
+// it through the same ReadBookActionProxy path rung 1 already proved; this
+// mod hooks nothing.
 //
-// The libnickel call sequences live in nfnickel.cc (book-opening) and
-// nfbrowser.cc (the screen), along with the inotify watch machinery. This
+// The libnickel call sequences live in nfnickel.cc (book-opening, and the
+// data-source chain rung 2's screen needs) and nfbrowser.cc (constructing
+// and pushing the controller), along with the inotify watch machinery. This
 // file is left with the two trigger protocols and the NickelHook glue.
 //
 // Drive it from a shell, over ssh, with Nickel up:
@@ -22,10 +24,16 @@
 // dbName (blank defers to the device's own correct value -- see nf_db_name in
 // nfnickel.cc -- rather than always meaning "internal storage"), then how far
 // to go, 1 to 4. Stopping short is how a crash gets localised to a single
-// libnickel call; see nf_open_book_staged in nfnickel.cc. The show-trigger
-// file's content is not read at all -- its EXISTENCE is the whole signal,
-// matching the NickelMenu action Task 7's brief adds
-// (`cmd_spawn :quiet:/bin/touch /tmp/nfolders-show`).
+// libnickel call; see nf_open_book_staged in nfnickel.cc.
+//
+// The show-trigger file's content is OPTIONAL, unlike the open-trigger's: a
+// plain `touch /tmp/nfolders-show` -- matching the NickelMenu action Task 7's
+// brief adds (`cmd_spawn :quiet:/bin/touch /tmp/nfolders-show`) -- falls back
+// to nf_default_reference_volumes() below, a handful of known-good ContentIDs
+// off the reference card, so a quick device test needs no file content
+// authored by hand. Non-empty content is one ContentID per line (same bare-
+// path-gets-file://-prepended convenience as the open-trigger), for testing
+// an arbitrary set of books without rebuilding.
 
 #include "nfbrowser.h"
 #include "nfnickel.h"
@@ -109,24 +117,74 @@ static void nf_on_trigger() {
     nf_open_book_staged(contentId, dbName, stage);
 }
 
-// The show-trigger has no content protocol to parse -- its existence is the
-// whole signal (see this file's opening comment) -- so this is a thin
-// adapter from "the file appeared" to nf_browser_show()'s own signature.
+// A handful of known-good ContentIDs, for the empty-content fallback this
+// file's opening comment describes. Real filenames off the reference card
+// (device-verified 2026-09-03): one standalone book (NOTES.md's own device
+// run used this exact ContentID), plus all 27 Fullmetal Alchemist volumes
+// generated from the naming pattern tests/test_nffmt.cc's own fixture was
+// validated against, rather than hand-typed -- hand-typing 27 near-identical
+// filenames is exactly the kind of transcription this project's
+// "resolve by name, not by guess" discipline warns against elsewhere.
+// v26 on the reference card is a known truncated file Nickel's own import
+// rejected (NOTES.md's Comics census) -- if that holds, it doubles as a
+// free negative control (isValid()==false, the row simply absent); this is
+// NOT confirmed on device by this rung, so it is noted, not relied on.
+static QStringList nf_default_reference_volumes() {
+    QStringList ids;
+    ids << QStringLiteral("file:///mnt/onboard/books/Pratchett_ Terry - The Color of Magic_ A Discworld Novel.epub");
+    for (int v = 1; v <= 27; v++) {
+        ids << QStringLiteral("file:///mnt/onboard/books/Comics/English/Fullmetal Alchemist (v01-v27) (2005-2011) (Digital)/Fullmetal Alchemist v%1 (2005) (Digital) (LostNerevarine-Empire).cbz")
+                   .arg(v, 2, 10, QLatin1Char('0'));
+    }
+    return ids;
+}
+
 // Runs on the GUI thread for the same reason nf_on_trigger does: nf_init
 // (below) calls nf_watch_init from the GUI thread, and every callback it
 // registers is invoked from the QSocketNotifier's activated() signal on
-// that same thread -- no cross-thread hop to get wrong.
+// that same thread -- no cross-thread hop to get wrong, and
+// nf_browser_show_volumes (like nf_open_book_staged) is Nickel UI code.
 static void nf_on_trigger_show() {
+    // The watch fires on IN_CLOSE_WRITE/IN_MOVED_TO for this exact name, so
+    // by the time this runs the file exists (a plain `touch` gives a
+    // zero-byte file, which is a valid, immediately-EOF open, not a
+    // failure) and, if written to, is fully written.
+    int fd = open(NF_TRIGGER_SHOW, O_RDONLY);
+    QStringList ids;
+    if (fd < 0) {
+        nh_log("trigger: %s fired but could not be opened: %s", NF_TRIGGER_SHOW, strerror(errno));
+    } else {
+        char buf[4096];
+        ssize_t n = read(fd, buf, sizeof buf - 1);
+        close(fd);
+        if (n > 0) {
+            buf[n] = '\0';
+            QStringList lines = QString::fromUtf8(buf).split(QLatin1Char('\n'));
+            for (int i = 0; i < lines.size(); i++) {
+                QString id = lines.at(i).trimmed();
+                if (id.isEmpty())
+                    continue;
+                if (!id.contains(QStringLiteral("://")))
+                    id = QStringLiteral("file://") + id;
+                ids << id;
+            }
+        }
+    }
     unlink(NF_TRIGGER_SHOW);
-    nf_browser_show();
+
+    if (ids.isEmpty())
+        ids = nf_default_reference_volumes();
+
+    nh_log("trigger: showing %d ContentIDs", static_cast<int>(ids.size()));
+    nf_browser_show_volumes(ids);
 }
 
 static int nf_init() {
     // Every NFNickelDlsym entry is optional (nfnickel.cc), so a miss here is
     // a real, reachable outcome now -- not hypothetical -- and this is the
     // only place it gets logged loudly. nf_open_book_staged and
-    // nf_browser_show both still refuse to run rather than call through a
-    // null pointer either way; the two checks are independent
+    // nf_browser_show_volumes both still refuse to run rather than call
+    // through a null pointer either way; the two checks are independent
     // (nf_nickel_resolve/nf_browser_resolve) so a firmware that breaks one
     // feature's symbols does not silently disable the other's too.
     if (!nf_nickel_resolve())
@@ -163,7 +221,7 @@ static int nf_init() {
 
 static struct nh_info NFInfo = (struct nh_info){
     .name           = "NickelFolders",
-    .desc           = "SPIKE: opens a book in the stock reader by ContentID, and can push an empty screen onto the window stack.",
+    .desc           = "SPIKE: opens a book in the stock reader by ContentID, and can push Nickel's own list controller showing books we chose.",
     .uninstall_flag = "/mnt/onboard/nfolders_uninstall",
     // Spelled out although it is unused: GCC 4.9's C++ frontend rejects a
     // designated initializer that SKIPS a field ("non-trivial designated
