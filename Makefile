@@ -20,7 +20,7 @@ include NickelHook/NickelHook.mk
 # on the next device build rather than failing quietly on the panel -- which is
 # why the skew is acceptable rather than merely tolerated.
 HOST_CXX      ?= g++
-HOST_PURE     := nffmt.cc
+HOST_PURE     := nffmt.cc nflist.cc
 HOST_TESTSRC  := $(wildcard tests/test_*.cc)
 HOST_TESTBIN  := $(patsubst tests/%.cc,build/%,$(HOST_TESTSRC))
 # Header prerequisites are load-bearing, not tidiness: without them a test

@@ -194,13 +194,26 @@ sort-before-cap "the original bug's fix" and says it must survive any change:
 what survives a truncation must be alphabetical, never an artifact of readdir
 order. Inherited verbatim.
 
-### 3.4 Duplicate labels show their folder
+### 3.4 v1: a collision guard, not folder-on-row
 
-Stripping folder context from a label means two same-named files in different
-folders render as the same row — `FOLLOWUPS.md` #31 in koboy, and not
-hypothetical here with `v01.cbz`-shaped names. The recorded fix is to show the
-folder on the row **only for the rows that collide**, never to prefix every
-row.
+`FOLLOWUPS.md` #31 in koboy shows two same-named files, from different
+folders, rendering as the same row once folder context is stripped from the
+label. That is real, but it cannot happen **within a single directory**: a
+directory's filenames are already unique, and `nf_strip_common` removes only
+text that is identical across every row in the set, so unique names minus a
+common run stay unique. v1 lists one directory at a time, so this failure mode
+does not arise there.
+
+What v1 still needs is a **guard**, not a fix for a case it cannot hit: the
+per-row bracket truncation and `trimmed()` inside `nf_strip_common` are *not*
+common to every row and could in principle make two labels collide by
+accident. If any two labels in a listing collide, the whole listing falls back
+to raw names rather than showing an ambiguous pair.
+
+Showing the folder on the row **only for the rows that collide** is the right
+fix for the case `FOLLOWUPS.md` #31 actually describes — a *pooled* result set
+whose rows come from different folders — which is §6.5's flat search result
+set, and belongs to v2.
 
 ### 3.5 What is hidden, and one accepted wart
 
@@ -326,7 +339,8 @@ list the directory
   -> order within group   (§3.3's comparator; FUTURE: key + direction)
   -> cap                  (none in v1; §3.3 says this stays after ordering)
   -> derive labels        (§3.2: strip the common run, on the rows shown)
-  -> disambiguate         (§3.4: folder on the row, only where labels collide)
+  -> disambiguate         (§3.4: v1 is a collision guard, raw-name fallback;
+                                 folder-on-row is v2's flat search, §6.5)
 ```
 
 The order of the last three is load-bearing rather than tidy. **Labels are
