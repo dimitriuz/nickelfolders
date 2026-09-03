@@ -269,7 +269,8 @@ schema.
 | The one exception | `Fullmetal Alchemist v26 …cbz` at **exactly 8,388,608 bytes** (8 MiB) against 99 MB and 119 MB for v25 and v27 — a **truncated copy**. It still has the `PK\003\004` zip header, so it looks like a file, and Nickel's import rejected it. Not a Nickel limitation. |
 | Formats present | 122 `.cbz`, 94 `.cbr`, 6 `.pdf`, 4 `.epub` (2 of them `.kepub.epub`), 1 `.txt` — **all with rows** |
 | Formats that open | `.kepub.epub`, `.epub`, `.cbz`, `.cbr`, `.pdf`, `.txt` all navigate `HomePageView` → `ReadingView`, nickel PID unchanged |
-| Rendering | Confirmed by framebuffer grab for `.epub` and `.cbr`. **`.cbr` works** — Sandman #50 rendered, rotated to landscape by Nickel's comic reader — which is worth knowing because CBR is not on Kobo's official supported-format list. |
+| Rendering | Confirmed by framebuffer grab for `.epub`, `.cbr` and `.pdf`. **`.cbr` works** — Sandman #50 rendered, rotated to landscape by Nickel's comic reader — worth knowing because CBR is not on Kobo's official supported-format list. The `.pdf` rendered Cyrillic body text cleanly. |
+| Reading position | The PDF opened at *Об авторах*, near the END of the book rather than page 1 — the bookmark was restored. Third independent sign that `ReadBookActionProxy` runs Nickel's real bookkeeping (the others being the Recents entry and the reading session). |
 | Non-ASCII and long paths | **A non-issue.** Accented (`Pokémon …`), Cyrillic, parenthesised and 230-character paths all resolve. This is most of #4. |
 | KEPUB ContentID shape | The plain volume path is what `getById` wants. The worry that a KEPUB needs its chapter-suffixed ContentID was unfounded. |
 
