@@ -499,9 +499,26 @@ static bool nf_view_layout_check() {
     // address point. +8 mirrors the SAME adjustment the real
     // constructor's own disassembly makes (`adds r3, #8` after loading
     // this exact symbol's GOT-relocated address, NOTES.md) -- not a
-    // separately guessed offset. realSlots[0] is D1, realSlots[1] is D0
-    // (unchecked below -- this file never resolves D0Ev, see nfnickel.h),
-    // realSlots[2..7] are the six forwarded slots, realSlots[8] is the
+    // separately guessed offset.
+    //
+    // realSlots[0] and realSlots[1] (D1/D0) are BOTH ZERO IN THE FILE, and
+    // that is correct, not a gap: AbstractController is abstract (slot 8
+    // is `__cxa_pure_virtual`), and `_ZTV18AbstractController`'s own
+    // relocations (checked directly: `readelf -r` / `objdump -R` show
+    // entries at 0x163ff74 (the RTTI pointer) and 0x163ff80-0x163ff98
+    // (slots 2-8), and NOTHING at 0x163ff78/0x163ff7c) confirm GCC never
+    // emitted a destructor into either slot for an abstract class --
+    // there is no relocation to fill them with an address, so they read
+    // as the zeroed bytes the file already has. This is WHY both real
+    // destructors (D1Ev, D0Ev) have to be resolved BY NAME
+    // (AbstractController__dtor1, nfnickel.h) rather than read out of the
+    // table the way the six slots below are cross-checked against it --
+    // the table has nothing there to read. (Our OWN emitted
+    // `_ZTV18AbstractController`, in this file's own object code, has the
+    // identical two zero words, for the identical reason: NFController is
+    // the only CONCRETE class in this hierarchy, so the ABSTRACT base's
+    // own vtable-if-it-had-one is never what gets instantiated.)
+    // realSlots[2..7] are the six forwarded slots; realSlots[8] is the
     // pure virtual nf_load_view's real counterpart occupies.
     void * const *realSlots = reinterpret_cast<void* const*>(
         reinterpret_cast<char const*>(AbstractController__vtable) + 8);
@@ -535,23 +552,21 @@ static bool nf_view_layout_check() {
                                                      // firmware and this shim's QObject
                                                      // base would land on top of live data.
 
-    // Best-effort: also exercises the resolved destructor on the same
-    // scratch memory the ctor just initialised, so a firmware where D1Ev
-    // itself is broken is caught here too, rather than the first time a
-    // real, pushed controller is destroyed.
-    AbstractController__dtor1(scratch);
-
     // (b), the check that actually validates the SLOT ORDER -- see this
-    // function's own header comment for the full argument. Slot [0] (D1)
-    // is included as a free bonus beyond what was specifically asked for,
-    // since it costs nothing once realSlots is resolved; slot [1] (D0) is
-    // NOT checked, because this file never resolves D0Ev at all (there is
-    // nothing to cross-validate it against); slot [8] can only be checked
-    // for non-nullness -- it is `__cxa_pure_virtual`, an external
-    // libstdc++ symbol this file has no reason to resolve just to compare
-    // against itself.
+    // function's own header comment for the full argument, and realSlots'
+    // own comment above for why [0]/[1] are checked for ZERO rather than
+    // against a resolved pointer. `realSlots[0] == NULL && realSlots[1]
+    // == NULL` is a genuine assertion, not a placeholder: it is the
+    // positive form of "AbstractController is still abstract" -- it
+    // passes today for a real, relocation-backed reason (see above), and
+    // it CATCHES a firmware where AbstractController stopped being
+    // abstract (gained a real destructor there), which would invalidate
+    // this whole shim's premise that slot 8 is the one and only pure
+    // virtual. Slot [8] can only be checked for non-nullness -- it is
+    // `__cxa_pure_virtual`, an external libstdc++ symbol this file has no
+    // reason to resolve just to compare against itself.
     bool slotsMatch =
-        realSlots[0] == reinterpret_cast<void*>(AbstractController__dtor1) &&
+        realSlots[0] == 0 && realSlots[1] == 0 &&
         realSlots[2] == reinterpret_cast<void*>(AbstractController__size) &&
         realSlots[3] == reinterpret_cast<void*>(AbstractController__viewWillAppear) &&
         realSlots[4] == reinterpret_cast<void*>(AbstractController__viewWillDisappear) &&
@@ -559,6 +574,16 @@ static bool nf_view_layout_check() {
         realSlots[6] == reinterpret_cast<void*>(AbstractController__allowedOrientations) &&
         realSlots[7] == reinterpret_cast<void*>(AbstractController__navSection) &&
         realSlots[8] != 0;
+
+    // Best-effort, and deliberately LAST: exercises the resolved
+    // destructor on the same scratch memory the ctor just initialised, so
+    // a firmware where D1Ev itself is broken is caught here too, rather
+    // than the first time a real, pushed controller is destroyed. Run
+    // AFTER every scratch word above has already been read, not before --
+    // harmless either way today (D1Ev on a zeroed this[+4] is a no-op,
+    // per its own disassembly), but reading scratch and then mutating it
+    // is the less fragile order to keep.
+    AbstractController__dtor1(scratch);
 
     if (!vptrCorrect || !plus4Zero || !plus8Zero || !plus12Untouched || !slotsMatch) {
         nh_log("view: AbstractController layout check FAILED -- vptrCorrect=%d plus4Zero=%d "
@@ -592,15 +617,18 @@ bool nf_browser_show(void) {
         return false;
     }
 
-    // sizeof(NFController) is whatever THIS build's own compiler produces
-    // -- unlike nfbrowser.cc's controller allocation, this is not a Nickel
-    // constructor whose size this rung has to read off a disassembly, so
-    // no measurement-derived margin is needed for correctness. 512 bytes
-    // is used anyway, matching nfbrowser.cc's own allocation size, so a
-    // future field added to NFController does not silently need a second,
-    // separate change here.
-    void *mem = ::operator new(512);
-    memset(mem, 0, 512);
+    // sizeof(NFController), exactly -- NOT an over-allocated margin like
+    // nfbrowser.cc's 512-byte controller buffer or nf_open_book_staged's
+    // volbuf. Those exist because THEIR size is read off a Nickel
+    // constructor this project cannot ask, so the margin absorbs a
+    // firmware that grows the real object underneath an unchanged
+    // measurement. NFController is not that: it is THIS FILE'S OWN class,
+    // compiled by THIS SAME build, so `sizeof(NFController)` is never a
+    // guess -- allocating exactly that (rather than a round number that
+    // LOOKS like CLAUDE.md's over-allocation convention but isn't one) is
+    // the correct amount, not slack pretending to be a measurement.
+    void *mem = ::operator new(sizeof(NFController));
+    memset(mem, 0, sizeof(NFController));
 
     // AbstractController__ctor is NOT called here, UNLIKE an earlier
     // draft of this function -- that draft's comment claimed calling it
@@ -645,20 +673,19 @@ bool nf_browser_show(void) {
     // MainWindowController::push's internal cross-cast to QObject*
     // FAILED, which skips `QObject::setParent(controller, view)` --
     // Nickel's own mechanism for taking ownership of a pushed controller
-    // -- so this object genuinely WAS a permanent leak (512 bytes plus
-    // its refcount header, per call). WITH Critical 1's fix, the
-    // cross-cast succeeds, `setParent` runs, and this object becomes a
+    // -- so this object genuinely WAS a permanent leak (sizeof(NFController)
+    // bytes plus its refcount header, per call). WITH Critical 1's fix,
+    // the cross-cast succeeds, `setParent` runs, and this object becomes a
     // real child in Qt's own parent/child tree: Qt deletes a child
     // whenever ITS parent is destroyed, and that `delete` reaches THIS
     // object through its REAL vtable, correctly running `~NFController()`
     // (which correctly tears down nf_weak_d/nf_weak_widget and calls the
     // resolved AbstractController__dtor1 -- see that destructor's own
     // comment) and then `operator delete` on the SAME address
-    // `::operator new(512)` returned above (a deleting destructor always
-    // recovers the complete object's own start address before
-    // deallocating, regardless of which base subobject pointer was used
-    // to reach it -- so the 512-vs-sizeof(NFController) mismatch above is
-    // not a problem here either).
+    // `::operator new(sizeof(NFController))` returned above (a deleting
+    // destructor always recovers the complete object's own start address
+    // before deallocating, regardless of which base subobject pointer was
+    // used to reach it).
     //
     // So: this object is NOT a leak once Critical 1 is in effect (i.e.
     // right now, in this build) -- and NOTHING in this file should ever
