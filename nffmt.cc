@@ -176,3 +176,31 @@ void nf_strip_common(QStringList *names) {
     }
     *names = out;
 }
+
+// Insertion sort, and the choice is deliberate rather than lazy. std::sort is
+// a libstdc++ template and CLAUDE.md forbids compiling stdlib templates into
+// the library; Qt 5.2's qSort is deprecated in the host Qt 5.15 the tests build
+// against, so -Werror rejects it. The largest listing measured on the reference
+// card is 27 entries, where an insertion sort is not worth optimising -- and it
+// is STABLE, which is what keeps the order reproducible when two names tie.
+//
+// Spec section 6.1 keeps grouping and ordering separate stages so that a future
+// descending toggle reverses WITHIN each kind and never floats files above
+// folders. Do not collapse the isDir test into the comparator.
+static bool nf_entry_before(nf_entry const& a, nf_entry const& b) {
+    if (a.isDir != b.isDir)
+        return a.isDir;
+    return nf_natural_compare(a.name, b.name) < 0;
+}
+
+void nf_sort_entries(QVector<nf_entry> *entries) {
+    for (int i = 1; i < entries->size(); i++) {
+        nf_entry key = entries->at(i);
+        int j = i - 1;
+        while (j >= 0 && nf_entry_before(key, entries->at(j))) {
+            (*entries)[j + 1] = entries->at(j);
+            j--;
+        }
+        (*entries)[j + 1] = key;
+    }
+}

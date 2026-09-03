@@ -115,6 +115,67 @@ static void test_strip_refuses_short_remainder_even_when_mixed(void) {
     CHECK_EQ_STR(n.at(1), "Vol 2.pdf");
 }
 
+static nf_entry ent(char const *name, bool isDir) {
+    nf_entry e;
+    e.name  = QString::fromUtf8(name);
+    e.isDir = isDir;
+    return e;
+}
+
+// Measured: books/Comics/English/Sandman holds 11 subfolders AND 3 files, so a
+// folder of both kinds is real on this card rather than hypothetical.
+static void test_sort_folders_before_files(void) {
+    QVector<nf_entry> e;
+    e << ent("zeta.cbz", false) << ent("alpha", true) << ent("beta.cbz", false)
+      << ent("omega", true);
+    nf_sort_entries(&e);
+    CHECK(e.at(0).isDir);
+    CHECK(e.at(1).isDir);
+    CHECK_EQ_STR(e.at(0).name, "alpha");
+    CHECK_EQ_STR(e.at(1).name, "omega");
+    CHECK_EQ_STR(e.at(2).name, "beta.cbz");
+}
+
+static void test_sort_uses_natural_order_within_kind(void) {
+    QVector<nf_entry> e;
+    e << ent("v10 - The Wake", true) << ent("v2 - The Doll's House", true)
+      << ent("v1 - Preludes", true) << ent("v9 - The Kindly Ones", true);
+    nf_sort_entries(&e);
+    CHECK_EQ_STR(e.at(0).name, "v1 - Preludes");
+    CHECK_EQ_STR(e.at(1).name, "v2 - The Doll's House");
+    CHECK_EQ_STR(e.at(2).name, "v9 - The Kindly Ones");
+    CHECK_EQ_STR(e.at(3).name, "v10 - The Wake");
+}
+
+// Determinism, which is what makes a listing reproducible across runs.
+//
+// This deliberately does NOT try to test stability directly: nf_entry carries
+// no payload beyond name and isDir, so two tied entries are indistinguishable
+// and any "stability" assertion over them can only restate the input. What IS
+// observable is that the sort is idempotent and independent of input order,
+// which is the property the listing actually depends on.
+static void test_sort_is_deterministic(void) {
+    QVector<nf_entry> sorted;
+    sorted << ent("alpha", true) << ent("omega", true)
+           << ent("v1.cbz", false) << ent("v2.cbz", false);
+
+    QVector<nf_entry> again = sorted;
+    nf_sort_entries(&again);          // sorting sorted input changes nothing
+    for (int i = 0; i < sorted.size(); i++) {
+        CHECK_EQ_STR(again.at(i).name, sorted.at(i).name.toUtf8().constData());
+        CHECK(again.at(i).isDir == sorted.at(i).isDir);
+    }
+
+    QVector<nf_entry> reversed;
+    for (int i = sorted.size() - 1; i >= 0; i--)
+        reversed << sorted.at(i);
+    nf_sort_entries(&reversed);       // and reversed input reaches the same order
+    for (int i = 0; i < sorted.size(); i++) {
+        CHECK_EQ_STR(reversed.at(i).name, sorted.at(i).name.toUtf8().constData());
+        CHECK(reversed.at(i).isDir == sorted.at(i).isDir);
+    }
+}
+
 int main(void) {
     test_unpadded_volume_dirs();
     test_strip_fullmetal();
@@ -125,5 +186,8 @@ int main(void) {
     test_strip_single_row_untouched();
     test_strip_refuses_when_remainder_too_short();
     test_strip_refuses_short_remainder_even_when_mixed();
+    test_sort_folders_before_files();
+    test_sort_uses_natural_order_within_kind();
+    test_sort_is_deterministic();
     NF_TEST_MAIN_END
 }
