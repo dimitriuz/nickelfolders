@@ -405,6 +405,23 @@ static void test_strip_refuses_when_remainder_too_short(void) {
     nf_strip_common(&n);
     CHECK_EQ_STR(n.at(0), "Book A.cbz");
 }
+
+// The case that makes the keep guard NON-REDUNDANT, and it took a mutation
+// coming back green to find it. The test above exercises the POST-LOOP length
+// guard, not the keep guard -- with a same-extension listing the two are
+// indistinguishable. Here the extension is appended after the length check, so
+// a one-character remainder would become "1.cbz" and slip past the post-loop
+// guard entirely.
+//
+// Measured on the host: with `keep < 2` these stay whole; with `keep < 0` they
+// become [1.cbz] and [2.pdf].
+static void test_strip_refuses_short_remainder_even_when_mixed(void) {
+    QStringList n;
+    n << "Vol 1.cbz" << "Vol 2.pdf";
+    nf_strip_common(&n);
+    CHECK_EQ_STR(n.at(0), "Vol 1.cbz");
+    CHECK_EQ_STR(n.at(1), "Vol 2.pdf");
+}
 ```
 
 Add each to `main()` beside `test_unpadded_volume_dirs()`.
@@ -580,7 +597,22 @@ Two mutations, applied and reverted one at a time:
 1. Delete the `if (unclosed >= 0) pw = unclosed;` lines.
    Run `make test`. Expected: `test_strip_backs_off_past_open_bracket` fails.
 2. Change `if (keep < 2) return;` to `if (keep < 0) return;`.
-   Run `make test`. Expected: `test_strip_refuses_when_remainder_too_short` fails.
+   Run `make test`. Expected:
+   `test_strip_refuses_short_remainder_even_when_mixed` fails — **not**
+   `test_strip_refuses_when_remainder_too_short`, which stays green.
+
+   That distinction cost a round and is the whole reason the mixed-extension
+   test exists. With a **same**-extension listing the post-loop
+   `out.at(i).length() < 2` check fully backstops the `keep` guard, so mutating
+   the `keep` guard changes nothing and the mutation comes back green — which is
+   what happened the first time this step was run. With **mixed** extensions the
+   extension is appended *after* the length check, so a one-character remainder
+   becomes `"1.cbz"`, five characters, and sails past the post-loop guard.
+
+   Note also that negative `keep` is unreachable and is not what the guard is
+   for: the suffix loop is bounded `while (s < minLen - p)`, so
+   `p + s <= minLen <= n.length()` and `pw <= p`, `sw <= s`, therefore
+   `keep >= 0` always.
 
 Revert both and confirm `make test` passes. If either mutation leaves the suite green, the test is wrong, not the mutation.
 
