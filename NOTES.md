@@ -231,7 +231,7 @@ change at any point, i.e. **Nickel survived every stage**.
 | Does the proxy constructor accept an arbitrary `QObject` parent? | **Yes.** Constructed against the mod's own trigger object. |
 | Does `onSelected()` actually navigate? | **Yes.** `ndbCurrentView` went `HomePageView` → `ReadingView`, and a framebuffer grab shows the right book open in the stock reader with Nickel's own header and chapter footer. Took ~4 s. |
 | Does Nickel's own bookkeeping run? | **Yes**, and this is the payoff for choosing `ReadBookActionProxy` over `ReadingController`: the book appeared in Nickel's **Recents** afterwards. A direct `ReadingController` push would have rendered the book with no reading session and no Recents entry. |
-| Where does **back** go? | **It pops.** Confirmed by the owner pressing it: back left the reader and returned to the view beneath (`HomePageView`), with the book now listed in **Recents**. So a browser view of ours on the window stack WILL be returned to — the browser can be a screen, not a one-shot launcher. |
+| Where does **back** go? | **STILL OPEN — see open question #1.** The owner pressed back and landed on the home screen, but that observation is worthless: the test had run `mwcHome` first, so Home *was* the view beneath the reader. "Pops to the view beneath" and "always goes Home" predict the same result. |
 
 The test used `file:///mnt/onboard/books/Pratchett_ Terry - The Color of Magic_ A Discworld Novel.epub`
 — a plain sideloaded `.epub` one directory down, chosen because it is exactly
@@ -244,8 +244,26 @@ always whether Nickel *navigated*.
 ### Open questions — what a device run still has to answer
 
 These are cheap now: the mod is installed and `tools/kobo.py open` drives it
-without a rebuild. Numbered so they can be referred to. (#1, the back gesture,
-was answered on 2026-09-03 and moved into Results.)
+without a rebuild. Numbered so they can be referred to.
+
+1. **Where the back gesture goes — pop, or always Home?** This decides whether
+   the browser can be a screen you return to or is only a one-shot launcher, so
+   it shapes the whole design.
+
+   **It was recorded as answered on 2026-09-03 and that was a mistake worth
+   keeping here as a warning.** `tools/nftest.sh` deliberately ran
+   `qndb -m mwcHome` before triggering, "so the back-destination is known" —
+   which made Home the view beneath the reader. Both hypotheses then predict
+   landing on Home, so the observation discriminated nothing. **Setting a
+   baseline to the value you expect to measure destroys the measurement.**
+
+   To actually answer it, the view beneath the reader must NOT be Home:
+   put Nickel on the Library view, confirm with `ndbCurrentView`, trigger the
+   open, press back, and read `ndbCurrentView` again. Library means it pops;
+   `HomePageView` means it always goes Home. NickelDBus cannot navigate to the
+   library itself (its only view-changing methods are `mwcHome` and
+   `bwmOpenBrowser`), so this needs either a tap or the browser view as the
+   non-Home baseline.
 
 2. **Other formats.** Only a plain sideloaded `.epub` has been opened. The
    library also holds `.kepub.epub`, `.cbz` and `.pdf`, and KEPUBs matter most

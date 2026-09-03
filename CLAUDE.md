@@ -24,14 +24,16 @@ arbitrary **sideloaded** book in the stock reader. `ndbCurrentView` went
 Nickel's own header and chapter footer, and Nickel's PID never changed. `dbName`
 empty is correct.
 
-**Back pops**, confirmed by the owner: it leaves the reader and returns to the
-view beneath, with the book then listed in Nickel's Recents. So the browser can
-be a real screen on the window stack that you return to, not a one-shot
-launcher — that is settled, and it is the answer the design wanted.
+The book also landed in Nickel's **Recents**, which is the evidence for using
+`ReadBookActionProxy` rather than pushing a `ReadingController`: Nickel's own
+bookkeeping ran. Do not "simplify" that call site.
 
-The Recents entry is also the evidence for using `ReadBookActionProxy` rather
-than pushing a `ReadingController`: Nickel's own bookkeeping ran. Do not
-"simplify" that call site.
+**Where back goes is still open** (`NOTES.md` #1) and it shapes the design.
+It was briefly recorded as answered; that was wrong, and the mistake is
+documented there because it is the instructive kind: the test set the baseline
+view to Home, which is also what one of the two hypotheses predicts, so the
+observation discriminated nothing. **Never set a baseline to the value you
+expect to measure.**
 
 ## Build
 
