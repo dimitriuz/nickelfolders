@@ -1298,3 +1298,357 @@ and `plt.sh` returning nothing proves neither "not a call" nor "is a call
 this tool cannot see" — check which, every time, the same discipline the
 `readelf -r` truncation trap (above) already demands for the opposite
 direction of this same problem.
+
+## Task 8: touch input archaeology, and a measured route to a custom interactive screen
+
+Read-only research, no device touched. Same firmware, same local
+`libnickel.so.1.0.0` (4.38.23684), same `tools/plt.sh` discipline. Prompted by
+`nfview.cc`'s own screen rendering full-screen and legible while its
+`QPushButton`'s click handler never once logged a line — a silent input
+failure, not a crash, and exactly the kind this project's verification
+culture exists to catch rather than shrug off as "must be something else."
+
+Full derivation:
+`.superpowers/sdd/2026-09-03-nickelfolders-v1/touch-input-archaeology.md` (the
+disassembly) and `.superpowers/sdd/2026-09-03-nickelfolders-v1/oss-research.md`
+(what NickelMenu and NickelHardcover already do, read from their own source).
+This section is the permanent record; those two are the scratch reports it
+was extracted from.
+
+### Why a plain `QWidget` renders but never receives a tap
+
+**[measured]** Nickel does not use Qt's mouse-event delivery. It reads the
+touch panel itself and injects `QTouchEvent`s into Qt
+(`qt_handleTouchEvent`, `QWindowSystemInterface::registerTouchDevice` are
+both **imported**, undefined symbols in libnickel), then turns them into its
+**own** gestures through six custom `QGestureRecognizer` subclasses
+(`TapGestureRecognizer::install` at `0xb03230` is the fully-decoded example).
+A `QPushButton` reacts to `QMouseEvent`, which this pipeline never produces
+for it — not a Qt version quirk, an architectural choice of Nickel's.
+
+A widget needs **all three** of the following to receive a tap. All three
+are missing from a bare `QWidget`/`QPushButton`, and any one missing is
+enough to make the button dead:
+
+1. **`QWidget::grabGesture(TapGestureRecognizer::_gestureType, 0)`** —
+   `_gestureType` is an exported **data** symbol
+   (`_ZN20TapGestureRecognizer12_gestureTypeE`, `0x16cd184`) holding a
+   `Qt::GestureType` token Qt mints at registration time, not a compile-time
+   constant — so it must be read after Nickel has initialised, never cached
+   at load time. 166 call sites in `.text` go through this exact PLT stub
+   (`0x6abd80` → `QWidget::grabGesture(Qt::GestureType, QFlags<Qt::GestureFlag>)`).
+2. **An `event()` override** that returns `true` for `QEvent::Type` 194–196
+   (TouchBegin/Update/End) and 209 (TouchCancel), and routes 198
+   (`QEvent::Gesture`) into `GestureReceiver::gestureEvent(QGestureEvent*)`.
+   `ReversibleTouchWidget::event` at `0x011016e8` is the reference
+   implementation, decoded in full in the archaeology report — ten
+   instructions, every branch target resolved. `QWidget::event()` does
+   neither of these things, which is the entire explanation: it is not that
+   the button "doesn't get the tap," it is that `QWidget::event` throws the
+   touch event away before a gesture could ever be recognised from it.
+3. **`GestureDelegate`-named RTTI**, because dispatch is a genuine Itanium
+   cross-cast — `GestureReceiver::gestureEvent` (`0xafc71c`) calls
+   `__dynamic_cast(delegate, &_ZTI7QObject, &_ZTI15GestureDelegate, -2)` on a
+   `QWeakPointer<QObject>` stored at construction, the identical `src2dst=-2`
+   pattern `MainWindowController::push`'s own cross-cast uses (see the
+   `AbstractController` shim comment in `nfview.cc`, and "CRITICAL: THE
+   SHIM'S PRIMARY BASE MUST BE NAMED EXACTLY..." above) — a mangled-name
+   `strcmp`, not pointer identity, so only the type's own compiled RTTI can
+   satisfy it.
+
+`GestureReceiver`'s vtable (`_ZTV15GestureReceiver`, `0x1641148`) carries one
+unnamed pure virtual at slot +8 — `__cxa_pure_virtual`, never identified in
+this pass; irrelevant unless a `GestureReceiver` is ever hand-built (it
+should not be — see below).
+
+### The correction worth carrying: `registerForTapGestures` looked like the whole answer and is not
+
+**[measured, from source]** `MenuTextItem::registerForTapGestures()` at
+`0xed4804` does exactly the `grabGesture` + `setGestureDelegate` pair above,
+and it was briefly mistaken, mid-investigation, for a complete "make this
+tappable" call. It is not. pgaskin's own comment in NickelMenu
+(`src/nickelmenu.cc:436`, quoted verbatim because it is the clearest
+statement of the gap) says so:
+
+> `MenuTextItem_registerForTapGestures(mti); // this only makes the
+> MenuTextItem::tapped signal connect so it highlights on tap, doesn't apply
+> to the QAction::triggered below (which needs another GestureReceiver
+> somewhere)`
+
+The call wires the gesture *pipeline*, which makes the item highlight when
+tapped. Making the tap **act** is a separate step: connecting the widget's
+own `tapped(bool)` signal to whatever should happen
+(`src/nickelmenu.cc:451`: `QWidget::connect(mti, SIGNAL(tapped(bool)), ac,
+SIGNAL(triggered()))`). A single suggestive symbol name was mistaken for the
+whole mechanism during this investigation, the same way `getById`'s mangled
+name once hid the missing `this` above — recorded because this file already
+carries other wrong turns for the same reason, and the pattern is worth
+naming: a plausible-sounding method name is not evidence of what it does.
+
+### The route that works, with prior art
+
+**[measured, from source]** NickelHardcover (`RedHatter/StrayRose`, MIT,
+codeberg.org/StrayRose/NickelHardcover, HEAD 2026-07-21, current for the 4.x
+line) builds whole custom screens inside Nickel — settings, book search with
+a keyboard, an editions picker, a reading-journal browser — with **no
+`AbstractController` subclass at all**. `hook/src/widgets/dialog.cc`, in
+full:
+
+```cpp
+dialog = N3DialogFactory__getDialog(this, true);
+N3Dialog__setTitle(dialog, title);
+MainWindowController *mwc = MainWindowController__sharedInstance();
+MainWindowController__pushView(mwc, dialog);
+QObject::connect(dialog, SIGNAL(closeTapped()), dialog, SLOT(deleteLater()));
+dialog->show();
+```
+
+`grep -rn QPushButton hook/src` in that tree returns **zero matches**. A mod
+that builds the most UI-heavy screen set in the Nickel-mod ecosystem never
+once relies on Qt mouse delivery for a real touch target — every tappable
+thing is a Nickel class (`TouchLabel`, `N3ButtonLabel`, `SettingContainer`,
+`MenuTextItem`, `TouchCheckBox`, `TouchLineEdit`), each with its own
+`tapped()`/`tapped(bool)` signal wired to old-style `SIGNAL()` connects.
+NickelMenu, independently, converges on the identical shape (`grep -n
+'grabGesture\|installEventFilter\|mousePressEvent' src/nickelmenu.cc` →
+zero matches there too).
+
+**This supersedes `nfview.cc`'s entire approach.** That file's own header
+comment argues at length that a real, compiler-generated C++ class was the
+only way to satisfy `MainWindowController::push`'s cross-cast — true **for
+the `AbstractController` route specifically**, and the whole reason that
+file exists. `N3DialogFactory::getDialog` + `MainWindowController::pushView`
+needs no controller, no fabricated vtable, no fabricated RTTI, and no
+cross-cast to satisfy at all: `pushView` takes a plain `QWidget*` and its own
+disassembly (below) touches none of the controller-stack machinery `push`
+does.
+
+### `N3DialogFactory::getDialog` — static, and what it does with the widget
+
+**[measured]** `_ZN15N3DialogFactory9getDialogEP7QWidgetb` at `0xead698`.
+Disassembled in full, every PLT stub resolved:
+
+```
+ead6a4: movs r0, #68
+ead6a6: blx  6732f0   ; operator new(68)
+ead6b0: blx  6a6a9c   ; N3Dialog::N3Dialog(QWidget *parent=NULL, bool)
+ead6bc: blx  6932b8   ; N3Dialog::setContent(QWidget*)
+ead6de: blx  68f980   ; MainWindowController::sharedInstance()
+ead6f4: blx  676ccc   ; connect(dialog, SIGNAL(closeTapped()), mwc, SLOT(closeActiveN3Dialogs()))
+ead6fe: mov  r0, r5   ; return the dialog
+```
+
+- **It is `static`.** `r0` at entry is the `QWidget*` content, `r1` the
+  `bool` — there is no `this`. Proven the same way `VolumeManager::getById`'s
+  missing `this` was proven: `r1` is forwarded, unexamined, straight into
+  `N3Dialog`'s own `bool` constructor argument, and `r0` is forwarded as
+  `setContent`'s widget — the Itanium ABI mangles static and non-static
+  members identically, so only the disassembly, never the symbol name, can
+  say this. NickelHardcover's own declaration (`bool idk`) happens to be
+  right about the shape but never established there is no `this` — this
+  session's disassembly is what does.
+- **Signature**: `static N3Dialog *N3DialogFactory::getDialog(QWidget
+  *content, bool)`, returning a plain pointer in `r0`, not by value.
+- **`N3Dialog::setContent(QWidget*)`** (`0x10e43e4`) reparents the content
+  into a layout (`QBoxLayout::addWidget`) and calls `content->show()`. If a
+  previous content widget is already set, it removes it from the layout and
+  calls **`deleteLater()`** on it. So `getDialog`/`setContent` take real Qt
+  ownership of the widget handed in — do not `delete` it afterward, and do
+  not swap content and assume the old widget is still alive.
+- **What the `bool` means is NOT established.** It is forwarded verbatim to
+  `N3Dialog::N3Dialog(QWidget*, bool)` (`0x10e4a60`, ~1.5 KB, calls
+  `Ui_N3Dialog::setupUi`) and never otherwise examined inside `getDialog`
+  itself. NickelHardcover passes `true` and never explains it either.
+  Candidates, neither checked: "full-screen view rather than floating
+  dialog" and "show the close button." Settling it means decoding the
+  constructor — not done in this pass.
+- **`N3Dialog` is a complete screen chrome**, all exported:
+  `setTitle`/`setLargeTitle`, `enableBackButton(bool)`, `disableCloseButton`,
+  `enableFullViewMode`, `enableSwipes`, `canGoBack`, `dismissDialog`,
+  `content()`, and the signals **`backTapped()`** (`0x10e3f54`) and
+  `closeTapped()` (`0x10e3f34`, already wired by `getDialog` to
+  `MainWindowController::closeActiveN3Dialogs()`). **This is where "back"
+  comes from on this route** — connect to `backTapped()`. `setupUi` builds
+  the header, back arrow, close button and title label from Nickel's own
+  compiled-in pixmaps, so none of that is drawn by the mod.
+
+### `MainWindowController::pushView`/`popView` — non-static, no controller-stack involvement
+
+**[measured]** `_ZN20MainWindowController8pushViewEP7QWidget` at `0xea968c`:
+warns and returns if the widget is already the stack's current widget;
+otherwise carries three status-bar properties over from the outgoing
+widget, calls `closeActiveTouchMenus()`, then `stack->addWidget(v)` and
+`stack->setCurrentWidget(v)`. **It sets no `objectName` and no
+`"mainNavView"` property**, and it does **not** touch the
+`QVector<QPointer<QObject>>` controller stack at `MainWindowController+60` —
+that is `push(AbstractController*, bool)`'s job, not `pushView`'s. So a
+screen put up this way is invisible to `topController()`, and whatever
+Nickel's generic controller-stack back handling does will not see it —
+consistent with `N3Dialog`'s own `backTapped()`/`closeTapped()` being the
+intended back affordance for this route, not a workaround for one.
+
+`popView(QWidget*)` (`0xea91e0`) is the exact counterpart: `setVisible(false)`,
+`deleteLater()`, `stack->removeWidget(v)` — it destroys the widget, so
+content built for one push must not be cached across a pop.
+
+### Measured sizes, from Nickel's own `operator new` — record even when a working mod already has a number
+
+**[measured]** All read from a single 4.8-second targeted `objdump -d` of
+`.text` (`--start-address=0x6af238 --stop-address=0x12f77e8`, per the
+already-established "never disassemble all of libnickel" technique) piped
+into `grep -B12` for the immediate `movs r0, #N` before each constructor's
+`_Znwj` call, cross-checked across every call site found:
+
+| Class | Size | Constructor symbol | Address |
+|---|---|---|---|
+| `N3Dialog` | 68 | `_ZN8N3DialogC1EP7QWidgetb` | `0x10e4a60` |
+| `TouchLineEdit` | 64 | `_ZN13TouchLineEditC1EP7QWidget` | `0x1113c74` |
+| `TouchCheckBox` | 88 | `_ZN13TouchCheckBoxC1EP7QWidget` | `0x1112148` |
+| `MenuTextItem` | 96 | `_ZN12MenuTextItemC1EP7QWidgetbb` | `0xed489c` |
+| `SettingContainer` | 108 | `_ZN16SettingContainerC1EP7QWidget` | `0x1064d50` |
+| `TouchLabel` | 132 | `_ZN10TouchLabelC1EP7QWidget6QFlagsIN2Qt10WindowTypeEE` | `0xbbae3c` |
+| `N3ButtonLabel` | 152 | `_ZN13N3ButtonLabelC1EP7QWidget` | `0x10e06d0` |
+| `ElidedLabel` | 232 | `_ZN11ElidedLabelC1EP7QWidget` | `0xbb58f8` |
+
+All nine constructors take `this` in `r0` with no hidden return buffer and
+no memory-passed argument (`QFlags<Qt::WindowType>` travels in a register).
+
+**A live cross-check that the method matters, not just the number.**
+NickelMenu's own source comment (`nickelmenu.cc:426`) records `MenuTextItem`
+as **92** bytes on firmware 4.23.15505. This session measures **96** on
+4.38.23684 — the class grew one word across fifteen firmware releases,
+exactly the drift CLAUDE.md's "over-allocate and record the measurement"
+rule exists for.
+
+**NickelHardcover under-allocates `TouchLabel` by 4 bytes on this firmware.**
+`hook/src/nickelhardcover.cc:51`: `calloc(1, 128)` for a class measured here
+at **132** bytes — a live 4-byte heap overflow on every `TouchLabel` it
+constructs on 4.38.23684. Every other class it allocates is comfortably
+over (`N3ButtonLabel` 512≥152, `MenuTextItem` 256≥96,
+`TouchCheckBox`/`TouchLineEdit`/`SettingContainer` 128≥88/64/108) — this is
+the one place its own numbers are an author's estimate rather than a
+measurement, and it is the concrete argument for **always re-measuring from
+Nickel's own `operator new`, even against a working, shipped mod's
+numbers** — a good project got one number wrong in a way its own test
+matrix would never surface (a 4-byte overflow rarely crashes).
+
+### The recommended row widget: `TouchLabel`
+
+**[measured]** 132 bytes (over-allocate; the numbers above suggest ~256 is
+comfortable and matches this project's existing headroom convention).
+Constructor `0xbbae3c`. Inherits `QLabel::setText` via
+`FontSizeAdjustingLabel`, so setting text is plain linked Qt, no symbol
+resolution needed. Emits `tapped(bool)` (`_ZN10TouchLabel6tappedEb`,
+`0xbba3c4`, local signal index 0). **Self-registers for gestures in its own
+constructor** — `TouchLabel::initialize()` (`0xbba540`) does the identical
+`grabGesture` + `setGestureDelegate` pair `MenuTextItem::registerForTapGestures`
+does by hand, so constructing a `TouchLabel` is the entire opt-in; nothing
+extra to call. Also auto-shrinks its font to fit
+(`FontSizeAdjustingLabel`), useful for long folder names, with `ElidedLabel`
+(232 bytes, does not self-register, no-argument `tapped()`) as the fallback
+if that font-shrinking looks wrong for long paths on device.
+
+Beats `N3ButtonLabel` (a `TouchLabel` two levels down plus button chrome and
+a painted background — right for a dialog's OK button, wrong for a hundred
+list rows) and `MenuTextItem` (smallest at 96 bytes, but needs the explicit
+`registerForTapGestures()` call and is a *menu* row with a checkbox/icon
+slot styled for `NickelTouchMenu`).
+
+**The signal-adaptor trick, from NickelMenu — this is what `nfview.cc`'s
+`QPushButton` was missing.** A NickelHook mod has no `moc`, so no slots of
+its own. NickelMenu's answer (`nickelmenu.cc:378`, `:561`) is a hidden,
+never-shown `QPushButton` used purely as an old-style-to-new-style signal
+adaptor:
+
+```cpp
+QPushButton *sh = new QPushButton(parent);   // never shown, not a touch target
+sh->setVisible(false);
+QWidget::connect(row, SIGNAL(tapped(bool)), sh, SIGNAL(pressed()));
+QObject::connect(sh, &QPushButton::pressed, [row]{ /* real lambda, real C++ */ });
+```
+
+`nfview.cc`'s bug was using a `QPushButton` as the *touch target itself*
+(which cannot work, per everything above) instead of as this *adaptor*
+(which is proven, shipped, field-tested technique). Old-style `SIGNAL()` by
+name needs no metaobject of our own; the second `connect` is new-style, so
+a plain capturing lambda works.
+
+### A small correction to this project's own device notes: the `ndbCurrentView` empty reading was cosmetic
+
+**[measured]** Rung 2's own troubleshooting (`nfview.cc`/earlier sessions)
+treated `ndbCurrentView` reading empty for a pushed view as a possible sign
+of a registration failure, and floated two wrong explanations along the way
+(a cosmetic naming issue, a hung GUI thread) before this pass traced it to
+its actual cause. `NDB::NDBDbus::ndbCurrentView()` (in `libndb.so`, not
+libnickel) calls `MainWindowController::currentView()` then
+**`QObject::objectName()`** on the result. Nickel's own views are
+`uic`-generated, and `uic`'s `setupUi` always emits `if
+(X->objectName().isEmpty()) X->setObjectName(QStringLiteral("ClassName"))` —
+which is why real Nickel views report names like `DragonLibraryView`. A bare
+`QWidget` of ours has no `objectName()` at all, hence the empty read.
+
+**One `setObjectName()` call restores the oracle**, and it has nothing to do
+with whether input works — a good outcome, because it means an empty
+`ndbCurrentView` was never evidence that a push failed, only that the pushed
+widget was anonymous. Trust `ndbCurrentView` as the navigation oracle, but
+give any custom screen a name before treating a blank answer as a finding.
+
+### What remains unknown after this pass, ranked
+
+1. **What `getDialog`'s `bool` means.** Forwarded verbatim to `N3Dialog`'s
+   constructor (`0x10e4a60`) and never otherwise examined. Settle by
+   decoding that constructor.
+2. **Who, if anyone, sets `Qt::WA_AcceptTouchEvents`.** Checked the
+   construction path of `ReversibleTouchWidget`, `ElidedLabel`, `TouchLabel`
+   and `MenuTextItem` — none calls `QWidget::setAttribute` for it (only
+   `MenuTextItem` calls `setAttribute` at all, and that sets
+   `WA_StyledBackground`). Yet `ReversibleTouchWidget::event` clearly
+   expects `TouchBegin`/`Update`/`End` to arrive. **[inferred, medium-high]**
+   `grabGesture` (or Qt's gesture manager on first use) is doing this
+   implicitly on this Qt build; unconfirmed from this binary alone, since Qt
+   5.2.1's own source was not available to read. Two `testAttribute` log
+   lines before/after a device-side `grabGesture` call would settle it in
+   one reboot. Only matters if a `GestureReceiver` is ever hand-built rather
+   than borrowed from a Nickel class — see next point.
+3. **What `MainWindowController::closeActiveN3Dialogs()` (`0xeabf1c`) does.**
+   `getDialog` wires it to every dialog's `closeTapped()` unconditionally, so
+   it runs whether this project decides to rely on it or not — worth reading
+   before depending on its side effects.
+4. **`GestureReceiver`'s one unnamed pure virtual** (vtable slot +8,
+   `__cxa_pure_virtual`). Irrelevant to the `getDialog` + Nickel-widget
+   route, which never needs to build a `GestureReceiver` from scratch — only
+   matters if that changes.
+
+### The architecture this points at — measured, not yet built or tested
+
+**[measured on every individual piece above; medium confidence on the whole
+thing behaving on device, because none of it has run there yet]**
+
+```cpp
+QWidget *content = new QWidget();
+content->setObjectName(QStringLiteral("NFBrowserView"));  // restores ndbCurrentView
+QVBoxLayout *l = new QVBoxLayout(content);
+for (each row) {
+    TouchLabel *row = (TouchLabel*)calloc(1, 256);        // measured 132 @ 4.38.23684
+    TouchLabel__ctor(row, content, 0);                    // 0xbbae3c -- self-registers taps
+    row->setText(label);                                  // plain QLabel::setText
+    QPushButton *sh = new QPushButton(content); sh->setVisible(false);
+    QWidget::connect(row, SIGNAL(tapped(bool)), sh, SIGNAL(pressed()));
+    QObject::connect(sh, &QPushButton::pressed, [=]{ /* open book / descend a folder */ });
+    l->addWidget(row);
+}
+N3Dialog *d = N3DialogFactory__getDialog(content, true);  // 0xead698, STATIC, r0=content r1=bool
+N3Dialog__setTitle(d, folderName);                        // 0x10e4168
+N3Dialog__enableBackButton(d, true);                      // 0x10e40ac
+// connect(d, SIGNAL(backTapped()), <adaptor>, SIGNAL(pressed())) for "up one folder"
+MainWindowController__pushView(mwc, d);                   // 0xea968c
+```
+
+No `AbstractController` subclass. No hand-built vtable. No fabricated RTTI.
+No cross-cast to satisfy. This is a strictly smaller surface than
+`nfview.cc`'s shim, and it is what supersedes that file's approach — the
+shim's own `sanctioned exception` header comment argued at length that a
+real, compiler-generated C++ class was the only way, and it was, **for the
+`AbstractController` route specifically**; this route sidesteps the need
+for a controller at all. `nfview.cc` has not been changed as part of this
+research pass — the rewrite to this route is future work.

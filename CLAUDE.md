@@ -25,6 +25,17 @@ made it possible, including the rejected candidate that *would* have given
 folders for free and why it was rejected anyway. Read both before proposing
 anything.
 
+**`nfview.cc`'s own screen — a separate, not-yet-device-tested milestone
+built on our own compiler-generated `AbstractController` shim rather than a
+borrowed Nickel controller — has a proven input bug**, found by disassembly
+research rather than a device run: its `QPushButton` renders but can never
+receive a tap, because Nickel does not deliver touch as Qt mouse events (see
+"What the hardware overruled" below). A measured, un-built replacement route
+exists — `N3DialogFactory::getDialog` + `MainWindowController::pushView`,
+needing no `AbstractController` subclass at all — recorded in `NOTES.md`
+("Task 8"). Rewriting `nfview.cc` to that route is future work, not done as
+part of this research pass.
+
 ## The one thing that was in doubt, and no longer is
 
 Verified on hardware 2026-09-03 (Kobo Libra 2, firmware 4.38.23684):
@@ -267,6 +278,29 @@ see `DEVICE.local.md`.
   `FolderItemMenuController`, and `folder://` among its URL schemes.
 - `MainWindowController::sharedInstance()` / `::push(AbstractController*, bool)`
   and `LibraryNavMixin::pushShelf(QString const&)` are all exported.
+- **A plain `QWidget` renders but can never receive a tap.** Nickel does not
+  deliver touch as Qt mouse events — it reads the panel itself and turns
+  touches into its own gestures via six custom `QGestureRecognizer`
+  subclasses. A widget needs all three of: `grabGesture(TapGestureRecognizer
+  ::_gestureType, 0)`; an `event()` override that accepts `QEvent` types
+  194–196/209 (touch) and routes 198 (gesture) to
+  `GestureReceiver::gestureEvent`; and `GestureDelegate`-named RTTI, because
+  dispatch is a genuine Itanium cross-cast on the mangled name, not pointer
+  identity. `nfview.cc`'s own `QPushButton` has none of the three, which is
+  why its click handler never fires — proven by disassembly, not a device
+  run. **The working route needs no `AbstractController` subclass at all**:
+  `N3DialogFactory::getDialog(QWidget*, bool)` (static — no `this`, the same
+  trap `VolumeManager::getById` set) wraps a plain `QWidget` in Nickel's own
+  screen chrome (title, back arrow, `backTapped()`/`closeTapped()` signals),
+  and `MainWindowController::pushView(QWidget*)` puts it on the stack — both
+  proven in NickelHardcover's own shipped source, and both present on this
+  firmware. Populate the screen with Nickel's own tappable widgets
+  (`TouchLabel` self-registers for taps in its own constructor) rather than
+  Qt ones. This **supersedes `nfview.cc`'s approach**, which built a real,
+  compiler-generated `AbstractController` shim only because
+  `MainWindowController::push`'s cross-cast demanded one — true for that
+  route, unneeded for this one. `NOTES.md` ("Task 8") has the full
+  derivation; not yet built or tested on hardware.
 
 ## Method: adding a new libnickel call
 
@@ -303,6 +337,13 @@ The project's whole risk is here, so the procedure is fixed.
    immediately. Prefer `objdump -R` for this kind of sweep, or verify a
    `readelf -r` search against a KNOWN-present symbol first — a sweep that
    cannot fail visibly is not a sweep.
+   - **Measure a class's size from Nickel's own `operator new`, even when a
+     shipped open-source mod already states a number for it.** NickelHardcover
+     `calloc(1, 128)`s a `TouchLabel`, measured here at **132** bytes on
+     4.38.23684 — a live 4-byte heap overflow in a mod that ships and works,
+     because its own number was an estimate, not a measurement. A working
+     project is evidence the bug is rarely fatal, not evidence the number is
+     right.
 5. Add a rung to `nf_open_book`'s `stage` and advance **one call at a time**.
 6. Give it a **negative control** — an input that must fail — so a passing
    check is known not to be vacuous.
@@ -437,6 +478,31 @@ not a dependency here. What is worth reading across:
 - Its ARM binutils, at
   `~/.cache/koboy-toolchain/arm-linaro-4.9-2014.09/bin`, are what the
   `objdump`/`nm` commands above were run with.
+
+## Related: NickelMenu and NickelHardcover
+
+Two other NickelHook mods, both **open source and both MIT-licensed** —
+**read their source, do not disassemble them.** Reversing
+`registerForTapGestures`/`grabGesture`/`GestureReceiver` from libnickel
+alone, when NickelMenu's own source already names and explains the same
+calls, was real wasted effort in the session that produced `NOTES.md`
+("Task 8") — check whether a mod already does the thing before spending a
+disassembly session re-deriving it from libnickel; disassembly is for
+libnickel's own closed internals, not for another project's public code.
+
+- **[NickelMenu](https://github.com/pgaskin/NickelMenu)** (pgaskin, MIT) —
+  the library-tap gesture wiring (`registerForTapGestures`,
+  `GestureReceiver`) and the hidden-`QPushButton`-as-signal-adaptor trick for
+  reaching a lambda without `moc`, both explained in the author's own
+  comments (`src/nickelmenu.cc:436`, `:378`).
+- **[NickelHardcover](https://codeberg.org/StrayRose/NickelHardcover)**
+  (RedHatter/StrayRose, MIT) — the only mod found that builds full custom
+  screens inside Nickel (`hook/src/widgets/dialog.cc`): the
+  `N3DialogFactory::getDialog` + `MainWindowController::pushView` pattern
+  `NOTES.md` ("Task 8") records came from reading its source, cross-checked
+  against this project's own disassembly of the same firmware. Also the
+  source of the `TouchLabel` under-allocation caught above — read its code,
+  but re-measure its numbers.
 
 ## Conventions
 
