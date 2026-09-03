@@ -1,9 +1,13 @@
 include NickelHook/NickelHook.mk
 
 override LIBRARY  := libnfolders.so
-override SOURCES  += nfolders.cc nfnickel.cc
+override SOURCES  += nfolders.cc nfnickel.cc nfbrowser.cc
 override CFLAGS   += -Wall -Wextra -Werror -Wno-missing-field-initializers -fvisibility=hidden
 override CXXFLAGS += -Wall -Wextra -Werror -Wno-missing-field-initializers -fvisibility=hidden -fvisibility-inlines-hidden
+# QWidget (nfbrowser.cc's view) lives in QtWidgets, not QtGui, on Qt5 -- added
+# on top of NickelHook.mk's own default (Qt5Core Qt5Gui) rather than
+# replacing it, since nfnickel.cc/nfolders.cc still need those two.
+override PKGCONF  += Qt5Widgets
 # `test` isn't an ARM build target, so it must be excluded before the second
 # include below runs NickelHook's configure step -- placed after, `make test`
 # would try to configure the cross toolchain and fail with a confusing error.

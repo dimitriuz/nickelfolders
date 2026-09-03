@@ -571,3 +571,308 @@ throughout the whole run** — no crash, no restart, at any point below.
 elsewhere in this file** — see "The measured value contradicts the
 derivation above, and this is left in on purpose", under "dbName, and SD
 cards (#6)".
+
+## Task 7, rung 2: a screen on the window stack
+
+All addresses below are firmware 4.38.23684, the same image every other
+measurement in this file was taken against. Read `libnickel.so.1.0.0` with
+
+```sh
+NM=~/.cache/koboy-toolchain/arm-linaro-4.9-2014.09/bin/arm-linux-gnueabihf-nm
+OD=~/.cache/koboy-toolchain/arm-linaro-4.9-2014.09/bin/arm-linux-gnueabihf-objdump
+```
+
+and `tools/plt.sh` (`OBJDUMP=$OD sh tools/plt.sh libnickel.so.1.0.0 0x<stub> ...`)
+for every PLT resolution quoted here.
+
+### `sizeof(AbstractController)` == 12 bytes — three independent readings
+
+`AbstractController::AbstractController()` (`_ZN18AbstractControllerC1Ev` and
+`C2Ev` alias to the same address, `0xad1334` — confirmed with
+`nm -D --defined-only`, both destructors alias the same way at `0xad1358`)
+is three instructions of substance:
+
+```
+ad1340: ldr r3, [r3, r1]   ; r3 = resolved address of _ZTV18AbstractController (via GOT)
+ad1342: str r4, [r0, #4]   ; this[+4] = 0
+ad1344: str r4, [r0, #8]   ; this[+8] = 0
+ad1346: adds r3, #8        ; r3 = vtable_addr + 8 -- the Itanium "address point",
+                            ;      skipping the offset-to-top and RTTI header words
+ad1348: str r3, [r0, #0]   ; this[+0] = r3  (the vptr)
+```
+
+**No `bl`/`blx` at all** — the constructor calls nothing. That is the entire
+answer to "resolve every PLT stub in `AbstractController::AbstractController`":
+there are none to resolve. This is also why it is safe to call through a
+resolved pointer to build our own object with it — its only effect is these
+three word-writes.
+
+So the constructor's own writes put a **lower bound** of 12 bytes (offsets 0,
+4, 8, each a word) — "at least 12 bytes" per the task brief, not yet a size.
+The upper bound came from two independent derived classes, each of which
+places its `AbstractController` base subobject at **+8** (right after an
+8-byte `QObject` base — confirmed by the first call in each constructor being
+`QObject::QObject(QObject*)`, per `tools/plt.sh` on the stub each calls) and
+then begins writing **its own** next field at **+20**:
+
+```
+# PasswordController::PasswordController(), 0x1056348
+105635c: blx 6a3708        ; AbstractController::ctor(this = r4+8)   -- 6a3708 -> _ZN18AbstractControllerC2Ev
+1056372: str r0, [r4, #8]  ; overwrite the AbstractController-subobject vptr with
+1056374: str r6, [r4, #0]  ;   PasswordController's own combined vtable (standard:
+                            ;   base ctor sets the base vtable, derived ctor
+                            ;   immediately re-sets it — see "Two vtable writes" below)
+1056378: str r3, [r4, #20] ; PasswordController's OWN first field, at +20
+
+# HelpDialogController::HelpDialogController(), 0xfe1d94
+fe1dac: blx 6a3708         ; AbstractController::ctor(this = r8 = r4+8)
+fe1dc6: blx 67ec30         ; DefaultDialogController::ctor(this = r4+20, AbstractController* = r4+8)
+                            ;   -- 67ec30 -> _ZN23DefaultDialogControllerC2EP18AbstractController
+```
+
+`20 - 8 == 12` in both, independently, matching the constructor's own three
+writes exactly, with no gap. **`sizeof(AbstractController) == 12`.** The mod
+over-allocates to 256 bytes for it — more than 20x — per CLAUDE.md's
+"over-allocate for every Nickel constructor," on the same reasoning as
+`volbuf`/the `ReadBookActionProxy` buffer in `nfnickel.cc`: the constructor
+cannot be told how much room it has.
+
+### The two vtable writes, and what it means for us
+
+Every derived controller checked (`PasswordController`, `HelpDialogController`,
+`AwardsController`, `N3BrowserController`, `N3HotspotController`,
+`N3ToasterController`, `BaseImeController`) follows the same shape: call the
+base's own constructor (which sets the base's OWN vptr), then immediately
+overwrite that same vptr slot with the derived class's own combined vtable
+pointer. This is standard Itanium ABI construction order, and it is exactly
+what the mod's own `nf_browser_show` does: call the real, resolved
+`AbstractController::AbstractController` to zero +4/+8 and set a
+(momentarily correct, soon overwritten) vptr, then immediately overwrite
+`this[+0]` with our own vtable — the pattern is not invented for this mod, it
+is what every one of Nickel's own controllers already does to itself.
+
+### `MainWindowController::push` gracefully handles a controller that is NOT a `QObject`
+
+This is the load-bearing finding of the whole rung, because our controller —
+by design (`AbstractController` is not a `QObject`, so there is no metaobject
+to fake) — is exactly this case, and getting it wrong would mean `push`
+either silently drops the controller or crashes on it.
+
+`push(AbstractController *controller, bool animate)`, `0xeaacac`:
+
+```
+eaacbe: cmp r1, #0
+eaacc0: beq.w eaafb6          ; controller == NULL -> jump into the shared tail below
+eaacd6: blx 6a7fe4             ; __dynamic_cast(controller, srcType=AbstractController, dstType=QObject, -2)
+eaacda: mov r5, r0
+eaacdc: cmp r0, #0
+eaacde: beq.w eaafba           ; dynamic_cast<QObject*>(controller) FAILED -> ALSO the shared tail
+eaace2: blx 673564             ; (only on SUCCESS) QtSharedPointer::ExternalRefCountData::getAndRef(QObject const*)
+...                             ;   -- sets up a QWeakPointer<QObject> used later to notice if the
+                                ;      controller gets destroyed out from under the stack
+eaafb6: add.w r9, r0, #60      ; the NULL-controller landing pad
+eaafba: ldr.w r2, [r8, #60]    ; the failed-cast landing pad -- SAME shared code follows both
+eaafbe: movs r5, #0            ;   -- r5 = "not already on the stack", skipping the weak-ref setup
+```
+
+Both the `controller == NULL` guard and the "controller is not a `QObject`"
+outcome fall into the **same shared tail** — the QVector-based
+already-on-the-stack scan, then the actual push machinery
+(`prepareView`/`pushView` below). A failed `dynamic_cast<QObject*>` does not
+reject the push; it only skips one optional feature (a `QWeakPointer<QObject>`
+Nickel uses to notice if the controller is deleted out from under it — call
+site `QObject::connectImpl`, `0x690760`, further down, wires a signal off that
+weak pointer). Our mod fully owns the controller's lifetime and does not
+delete it while pushed, so this gap costs nothing. **A bare
+`AbstractController` with no `QObject` base is a supported, non-crashing
+input to `push` — not a guess, read directly off this exact branch.**
+
+`push` then calls, as ordinary (PLT-routed — see below) intra-library calls,
+not virtual dispatch: `MainWindowController::unprepareView(topController(),
+animate)` on whatever was on top before, then
+`MainWindowController::prepareView(controller)` and
+`MainWindowController::pushView(QWidget*)`. `prepareView`/`pushView`
+themselves were **not** further disassembled — resolving their names via
+`plt.sh` satisfies "every unexplained PLT stub in `push`," and tracing their
+own bodies is a different function's archaeology, out of this rung's stated
+scope. What matters is established without it: `push` calls something that
+ultimately needs a `QWidget*`, and `AbstractController::ensureViewLoaded`
+(next section) is the only place that widget can come from.
+
+### Every PLT stub in `MainWindowController::push` (27, all resolved)
+
+```
+663de8  _ZN12QWeakPointerI7QObjectED1Ev                    QWeakPointer<QObject>::~QWeakPointer
+665190  __cxa_begin_catch
+66840c  _ZN11QTextStreamlsERK7QString                      QTextStream::operator<<(QString const&)
+66d088  _ZN11QTextStreamlsEc                                QTextStream::operator<<(char)
+670dc8  _ZN7QVectorI8QPointerI7QObjectEE6appendERKS2_        QVector<QPointer<QObject>>::append
+671358  _ZN20MainWindowController13unprepareViewEP18AbstractControllerb
+672404  _ZdlPv                                              operator delete
+6732f0  _Znwj                                               operator new
+673564  _ZN15QtSharedPointer20ExternalRefCountData9getAndRefEPK7QObject
+678264  _ZN7QStringD1Ev                                     QString::~QString
+67ab9c  _ZN10QArrayData10deallocateEPS_jj
+681628  __cxa_end_cleanup
+681f4c  _ZN20MainWindowController8pushViewEP7QWidget
+68e6c8  _ZN11QMetaObject10ConnectionD1Ev
+68f7bc  _ZN7QString15fromUtf8_helperEPKci
+690760  _ZN7QObject11connectImplEPKS_PPvS1_S3_PN9QtPrivate15QSlotObjectBaseEN2Qt14ConnectionTypeEPKiPK11QMetaObject
+6982bc  _ZNK14QMessageLogger7warningEv
+698800  _ZN11QTextStreamlsEPKv                              QTextStream::operator<<(void const*)
+69a304  _Z2uiv                                              (an accessor, not further traced -- see below)
+69a7c8  _ZN20MainWindowController13topControllerEv
+69c900  _ZN11QTextStreamD1Ev
+6a0ba0  __cxa_end_catch
+6a5274  _Z17qt_message_output9QtMsgTypeRK18QMessageLogContextRK7QString
+6a7fe4  __dynamic_cast
+6aaa88  _ZN6QDebugD1Ev
+6ab7e8  _ZN20MainWindowController11prepareViewEP18AbstractController
+6adb28  _ZSt9terminatev
+```
+
+`_Z2uiv` (`ui()`, no args) is called once, inside the QVector already-on-stack
+scan; its result is not chained into anything this mod's own call path
+depends on, and it was not traced further — flagged here rather than silently
+left out, per "resolve EVERY unexplained PLT stub," but its role does not
+change anything this rung relies on.
+
+The rest of `push` (`QMessageLogger::warning` + `QTextStream` +
+`QString::fromUtf8_helper` + `qt_message_output`, repeated several times) is
+Nickel's own `qWarning() << ...` diagnostic logging around edge cases (a
+duplicate push, an already-present controller) — noise for archaeology
+purposes, not calls this mod's own flow needs to understand further.
+
+### `AbstractController::ensureViewLoaded` calls slot 8, and what happens next is non-fatal either way
+
+`0xad1408`, not one of the two functions this rung's stub-resolution
+requirement names, but the caller of slot 8 (per the given measured facts),
+so its immediate aftermath matters for knowing what slot 8's contract is:
+
+```
+ad142a: ldr r3, [r4, #0]   ; r3 = vptr
+ad142e: ldr r3, [r3, #32]  ; r3 = vtable[8]           -- confirms the +32 offset independently
+ad1430: blx r3             ; call it, this = r4, return value DISCARDED (r0 is
+                             ;   overwritten by `mov r0, r4` two instructions later
+                             ;   and never read before that)
+ad1440: blx 6a7fe4          ; __dynamic_cast(this, AbstractController, <some other type>, -2)
+ad1444: cbz r0, ad1456      ; cast failed -> qWarning() (QMessageLogger::warning,
+                             ;   QString::fromUtf8_helper, QTextStream<< -- same
+                             ;   logging shape as push's) and CONTINUE, does not abort
+```
+
+So slot 8's contract, read off its only caller: **it is called with `this` in
+r0, its return value is never used, and it is expected to leave the view
+pointer at `this+8`** — `AbstractController::viewLoaded()` (`0xad13ac`) reads
+exactly that offset (`ldr r3, [r0, #8]`) to answer. The `dynamic_cast`
+afterward targets a type our copied, plain-`AbstractController` RTTI
+(see next section) cannot satisfy, and failing it is already a handled,
+logged, non-fatal outcome in Nickel's own code — not a path this mod needed
+to avoid, just one it will exercise once, harmlessly, the first time the
+screen loads.
+
+### The vtable header matters, not just the 9 slots
+
+`_ZTV18AbstractController` (`0x163ff70`) is preceded by its own `_ZTI` object
+(`0x163ff68`, the `__class_type_info` RTTI struct: vtable-for-type_info +
+name pointer, matches "a plain `__class_type_info`, no base class" from the
+given measured facts) and begins with two Itanium ABI header words the
+constructor's own `adds r3, #8` (above) confirms are there:
+
+```
+0x163ff70  offset-to-top       (0)
+0x163ff74  RTTI pointer        -> _ZTI18AbstractController        [only ABS32 reloc in this range]
+0x163ff78  vtable[0] = D1      \
+0x163ff7c  vtable[1] = D0       |  the address point (vptr value) is 0x163ff78 --
+0x163ff80  vtable[2] = size     |  table_base + 8, exactly matching the ctor
+   ...                          |
+0x163ff98  vtable[8] = __cxa_pure_virtual   -- vptr+32, matching ensureViewLoaded's own `#32` above
+```
+
+Slots 2 through 8 (`size`, `viewWillAppear`, `viewWillDisappear`,
+`viewWillBeDestroyed`, `allowedOrientations`, `navSection`,
+`__cxa_pure_virtual`) each carry an `R_ARM_ABS32` relocation naming the
+symbol — `readelf -r` confirms all seven. **Slots 0 and 1 (the two
+destructors) carry no relocation at all that this build's `objdump`/`readelf`
+can show** — not `R_ARM_ABS32`, not `R_ARM_RELATIVE` — despite other, nearby
+vtables (`QObject`'s) showing plain `R_ARM_RELATIVE` entries with the target
+address baked directly into the file for their own destructor-adjacent slots.
+This was checked, not shrugged off: `readelf -r | grep 163ff7` finds only the
+one RTTI-pointer relocation; a wider byte-for-byte dump of `.data.rel.ro`
+across that whole range reads as zero. Unresolved, and left unresolved on
+purpose rather than guessed at, because it does not matter to correctness
+here: **the mod never hand-constructs these two words.** It resolves
+`_ZTV18AbstractController` by name and copies all 11 words (both header words
+plus all 9 slots) out of the LIVE, already-relocated table at runtime, after
+Nickel's own dynamic linker has resolved every slot by whatever mechanism it
+uses — the mod does not need to know which mechanism that is, only that by
+the time `nf_init` runs, the table in memory is correct, which is the same
+trust every other resolved-by-name symbol in this project already rests on.
+
+### How `ndbCurrentView` almost certainly identifies a view: `MainWindowController::currentViewName()`
+
+Not one of the two required functions either, but the whole point of this
+rung is a screen that "reports itself to the oracle," and the task asked
+specifically not to guess at an `objectName` if the real mechanism could be
+found instead. It could:
+
+`_ZNK20MainWindowController15currentViewNameEv`, `0xea8010`:
+
+```
+ea8018: ldr r0, [r1, #68]      ; this->[+68] -- a QStackedWidget* (confirmed: the same
+                                 ;   field backs currentView(), 0xea8000, which tail-calls
+                                 ;   QStackedWidget::currentWidget() on it directly)
+ea801c: blx 682cd8              ; QStackedWidget::currentWidget()             -> r5
+ea802a: blx 66d000              ; QMetaObject::cast(QObject*) against some fixed
+                                 ;   QMetaObject (an N3Dialog check) -- if the current
+                                 ;   widget IS an N3Dialog, r5 is replaced with...
+ea8030: blx 66c850              ; N3Dialog::content()                        -> r5
+ea804c: blx 69b2ec              ; QObject::property(char const*) on r5, with the
+                                 ;   literal string "mainNavView" (read directly out of
+                                 ;   the binary at the address the call's own PC-relative
+                                 ;   literal resolves to -- confirmed by dumping those raw
+                                 ;   bytes: `mainNavView\0`)
+ea8054: blx 66bd64              ; QVariant::toString() on that property's value
+ea8088: cbnz r6, ea80c4          ; non-empty -> RETURN IT, done
+ea809c: blx 6aaff4               ; (only if empty) QMetaObject::className() -- the fallback
+```
+
+So `currentViewName()` reads `widget->property("mainNavView").toString()`,
+and only falls back to `widget->metaObject()->className()` if that property
+is unset or empty. This was not traced into NickelDBus's own binary (out of
+scope, and NickelDBus's source is not staged here) — so "almost certainly"
+is as far as this goes: the name match to `ndbCurrentView` and the fact that
+the strings NickelDBus is documented to report (`HomePageView`, `ReadingView`,
+...) are exactly what `className()` on Nickel's own view classes would
+produce, is what makes the fallback plausible as what real views normally
+hit (most of Nickel's own views presumably never set `mainNavView` and fall
+through to their own class name).
+
+Either mechanism identifies our screen without guessing: `nf_browser_load_view`
+sets `mainNavView` explicitly (`"NFBrowserView"`, taking the primary path if
+this reading is right), and even if the property read is not what
+`ndbCurrentView` actually calls, a bare `QWidget`'s `className()` is
+`"QWidget"` — distinct from every real Nickel view, still enough to prove a
+non-baseline screen appeared. Both paths were kept rather than one guessed
+at.
+
+### What this rung does NOT establish
+
+- Whether `dynamic_cast<QObject*>(controller)` failing costs anything
+  **beyond** skipping the weak-pointer bookkeeping described above — e.g.
+  whether some other, not-yet-found call site also branches on it. Only the
+  one call site inside `push` itself was checked, per the brief's scope.
+- `prepareView`/`pushView`'s own bodies — not traced, per the brief's stated
+  scope (only `AbstractController::AbstractController` and
+  `MainWindowController::push` needed every stub resolved).
+- Whether `ndbCurrentView` genuinely calls `currentViewName()` — plausible,
+  not confirmed, see above.
+- **Back.** NOTES.md's rung-1 back-gesture result (`ReadingView` pops to the
+  view beneath) was measured for a *reader* pushed via
+  `ReadBookActionProxy::onSelected()`, a completely different code path from
+  `MainWindowController::push`. Nothing here establishes that back pops a
+  controller pushed this way, or what happens if the controller's `D0`
+  (deleting destructor, copied verbatim from Nickel's own vtable) runs on an
+  object this mod allocated with its own `::operator new` rather than
+  Nickel's. This is exactly what Step 6 (device-only, not this rung's job)
+  exists to check.

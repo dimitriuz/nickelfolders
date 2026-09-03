@@ -59,6 +59,17 @@ static void    (*ReadBookActionProxy__onSelected)(ReadBookActionProxy *_this);
 static Device        *(*Device__getCurrentDevice)(void);
 static QString const *(*Device__getDbName)(Device const *_this);
 
+// These four are NOT static, unlike everything above -- nfbrowser.cc needs
+// them directly to build its own vtable and controller object, which is a
+// lower-level operation than anything the book-opening path needed (that
+// path only ever called through a resolved pointer; this rung also reads
+// vtable memory and writes a raw offset). nfnickel.h has the full rationale
+// for each; NOTES.md's "Task 7, rung 2" section has the disassembly.
+void (*AbstractController__ctor)(AbstractController *_this);
+void **AbstractController__vtable;
+void  *(*MainWindowController__sharedInstance)(void);
+void   (*MainWindowController__push)(MainWindowController *_this, AbstractController *controller, bool animate);
+
 // Every entry below is .optional = true, and that is not carelessness on
 // getById of all things -- it is the shared-failsafe rule in CLAUDE.md taken
 // seriously. NickelHook.c resolves this array BEFORE nf_init ever runs
@@ -82,6 +93,10 @@ struct nh_dlsym NFNickelDlsym[] = {
     {.name = "_ZN19ReadBookActionProxy10onSelectedEv",        .out = nh_symoutptr(ReadBookActionProxy__onSelected), .desc = "ReadBookActionProxy::onSelected",        .optional = true},
     {.name = "_ZN6Device16getCurrentDeviceEv",                .out = nh_symoutptr(Device__getCurrentDevice),        .desc = "Device::getCurrentDevice",               .optional = true},
     {.name = "_ZNK6Device9getDbNameEv",                       .out = nh_symoutptr(Device__getDbName),               .desc = "Device::getDbName",                      .optional = true},
+    {.name = "_ZN18AbstractControllerC1Ev",                   .out = nh_symoutptr(AbstractController__ctor),        .desc = "AbstractController::AbstractController", .optional = true},
+    {.name = "_ZTV18AbstractController",                      .out = nh_symoutptr(AbstractController__vtable),      .desc = "AbstractController::vtable",             .optional = true},
+    {.name = "_ZN20MainWindowController14sharedInstanceEv",   .out = nh_symoutptr(MainWindowController__sharedInstance), .desc = "MainWindowController::sharedInstance", .optional = true},
+    {.name = "_ZN20MainWindowController4pushEP18AbstractControllerb", .out = nh_symoutptr(MainWindowController__push), .desc = "MainWindowController::push",           .optional = true},
     {0},
 };
 
@@ -89,6 +104,20 @@ bool nf_nickel_resolve(void) {
     return VolumeManager__getById && Volume__isValid && Volume__dtor &&
            ReadBookActionProxy__ctor && ReadBookActionProxy__onSelected &&
            Device__getCurrentDevice && Device__getDbName;
+}
+
+// A SEPARATE gate from nf_nickel_resolve() above, deliberately: the browser
+// screen (nfbrowser.cc) needs none of the getById/Volume/ReadBookActionProxy
+// symbols, and book-opening needs none of these four. Folding them into one
+// bool would mean a firmware that renames just MainWindowController::push,
+// say, also disables book-opening for no reason -- exactly the unnecessary
+// coupling CLAUDE.md's "treat anything non-essential as non-fatal" argues
+// against. Two independent bools keep the two features' failure domains
+// independent, the same way each is already independently .optional in the
+// table above.
+bool nf_browser_resolve(void) {
+    return AbstractController__ctor && AbstractController__vtable &&
+           MainWindowController__sharedInstance && MainWindowController__push;
 }
 
 // dbName is a Repository cache-partition key. Device::calcDbName compares the
@@ -256,12 +285,24 @@ bool nf_open_book(QString const& contentId) {
 // corruption. It also means the watch directory is recreated after every
 // reboot, same as before.
 
-static void (*nf_watch_cb)(void) = NULL;
+// Rung 2 needs a SECOND trigger (nfolders.cc: /tmp/nfolders-show, alongside
+// the existing /tmp/nfolders-open), and both live directly in /tmp -- so
+// this is now a small table of (basename -> callback) pairs sharing ONE
+// inotify fd/watch/notifier on that one directory, rather than the single
+// (name, callback) pair rung 1 needed. NF_WATCH_MAX_ENTRIES is a small fixed
+// cap, not a QVector, for the same POD-at-file-scope reason as the buffer
+// below -- see its comment.
+#define NF_WATCH_MAX_ENTRIES 4
 
-// POD, NOT QByteArray, and this is load-bearing, not style: a file-scope
-// QByteArray here previously segfaulted Nickel on every boot. NickelHook's
-// __attribute__((constructor)) nh_init runs from THIS library's .init_array
-// before this translation unit's own C++ dynamic initialiser
+struct NFWatchTarget {
+    char name[NAME_MAX + 1]; // basename to match, e.g. "nfolders-open"
+    void (*cb)(void);
+};
+
+// POD, NOT QByteArray/QVector, and this is load-bearing, not style: a
+// file-scope QByteArray here previously segfaulted Nickel on every boot.
+// NickelHook's __attribute__((constructor)) nh_init runs from THIS library's
+// .init_array before this translation unit's own C++ dynamic initialiser
 // (_GLOBAL__sub_I_nfnickel.cc) does -- confirmed with readelf, see the fix
 // report -- and nh_init calls straight through nf_init -> nf_watch_init
 // before that initialiser has run. A QByteArray assignment there dereferenced
@@ -271,15 +312,18 @@ static void (*nf_watch_cb)(void) = NULL;
 // object in this translation unit may have a non-trivial (dynamically
 // initialised) constructor: this is the only kind of global whose
 // initialisation order relative to nh_init is not guaranteed. Every other
-// static above and below this line is a plain pointer for exactly this
-// reason -- do not add another QString/QByteArray/QObject/etc. at file scope.
-static char             nf_watch_name[NAME_MAX + 1]; // basename to match, e.g. "nfolders-open"
+// static above and below this line is POD for exactly this reason -- do not
+// add a QString/QByteArray/QObject/QVector/etc. at file scope.
+static NFWatchTarget    nf_watch_targets[NF_WATCH_MAX_ENTRIES];
+static int              nf_watch_target_count = 0;
+static char             nf_watch_dir[PATH_MAX]; // the one directory this mod watches; set by the first call
 static QSocketNotifier *nf_watch_notifier = NULL;
 
-// Reads and discards whatever inotify has queued, invoking nf_watch_cb once
-// per matching event. Events for any other name in the watched directory are
-// ignored -- matching by name rather than by watch descriptor, because a
-// directory watch reports every file in it, not just the one asked for.
+// Reads and discards whatever inotify has queued, invoking the matching
+// target's callback once per matching event. An event whose name matches
+// none of nf_watch_targets is ignored -- matching by name rather than by
+// watch descriptor, because a directory watch reports every file in it, not
+// just the ones asked for.
 static void nf_watch_ready(int fd) {
     // inotify_event is variable-length: a name of up to NAME_MAX bytes
     // follows the fixed struct. This buffer is sized for several events at
@@ -296,11 +340,14 @@ static void nf_watch_ready(int fd) {
         // ev->name is NUL-terminated by the kernel (padded with NULs to
         // ev->len), so a plain strcmp is safe -- no QByteArray construction
         // per event, and no file-scope Qt object to compare against (see
-        // nf_watch_name's own comment for why there cannot be one).
-        if (ev->len && (ev->mask & (IN_CLOSE_WRITE | IN_MOVED_TO)) &&
-            strcmp(nf_watch_name, ev->name) == 0) {
-            if (nf_watch_cb)
-                nf_watch_cb();
+        // nf_watch_targets' own comment for why there cannot be one).
+        if (!ev->len || !(ev->mask & (IN_CLOSE_WRITE | IN_MOVED_TO)))
+            continue;
+        for (int i = 0; i < nf_watch_target_count; i++) {
+            if (strcmp(nf_watch_targets[i].name, ev->name) == 0 && nf_watch_targets[i].cb) {
+                nf_watch_targets[i].cb();
+                break; // basenames are unique by construction (one nf_watch_init call each)
+            }
         }
         p += sizeof(struct inotify_event) + ev->len;
     }
@@ -313,34 +360,65 @@ int nf_watch_init(char const *path, void (*cb)(void)) {
     // a real possibility -- the fallback exists only so a malformed argument
     // fails safely (an empty dir string) rather than reading before index 0.
     QByteArray dir  = (slash >= 0 ? qpath.left(slash) : QStringLiteral(".")).toUtf8();
-    // A byte copy into the POD buffer, not a QByteArray assignment -- see
-    // nf_watch_name's declaration for why it is POD in the first place.
-    // `dir` and `name` above/here are LOCAL QByteArrays, constructed at
-    // runtime when this function executes, which is safe; the file-scope
-    // object is the one that cannot have a constructor to run.
+    // `dir` and `name` are LOCAL QByteArrays, constructed at runtime when
+    // this function executes, which is safe; the file-scope objects are the
+    // ones that cannot have a constructor to run -- see nf_watch_targets'
+    // comment above.
     QByteArray name = qpath.mid(slash + 1).toUtf8();
-    snprintf(nf_watch_name, sizeof nf_watch_name, "%s", name.constData());
 
-    // IN_NONBLOCK: this fd is driven entirely by the Qt event loop and must
-    // never block the GUI thread. IN_CLOEXEC: it must not leak across a
-    // future fork.
-    int fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
-    if (fd < 0) {
-        nh_log("watch: inotify_init1 failed: %s", strerror(errno));
+    if (nf_watch_target_count >= NF_WATCH_MAX_ENTRIES) {
+        nh_log("watch: already tracking %d watches (the fixed cap), refusing %s", NF_WATCH_MAX_ENTRIES, path);
         return -1;
     }
 
-    // Watching the DIRECTORY, not the file: a watch cannot be established on
-    // a path that does not exist yet, and the trigger file is created fresh
-    // on every use (by `touch`, or NickelMenu), so it never exists ahead of
-    // time.
-    if (inotify_add_watch(fd, dir.constData(), IN_CLOSE_WRITE | IN_MOVED_TO) < 0) {
-        nh_log("watch: inotify_add_watch(%s) failed: %s", dir.constData(), strerror(errno));
-        close(fd);
+    bool firstWatch = (nf_watch_notifier == NULL);
+
+    if (firstWatch) {
+        snprintf(nf_watch_dir, sizeof nf_watch_dir, "%s", dir.constData());
+
+        // IN_NONBLOCK: this fd is driven entirely by the Qt event loop and
+        // must never block the GUI thread. IN_CLOEXEC: it must not leak
+        // across a future fork.
+        int fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+        if (fd < 0) {
+            nh_log("watch: inotify_init1 failed: %s", strerror(errno));
+            return -1;
+        }
+
+        // Watching the DIRECTORY, not the file: a watch cannot be
+        // established on a path that does not exist yet, and every trigger
+        // file this mod uses is created fresh on every use (by `touch`, or
+        // NickelMenu), so it never exists ahead of time.
+        if (inotify_add_watch(fd, dir.constData(), IN_CLOSE_WRITE | IN_MOVED_TO) < 0) {
+            nh_log("watch: inotify_add_watch(%s) failed: %s", dir.constData(), strerror(errno));
+            close(fd);
+            return -1;
+        }
+
+        // No Q_OBJECT and no moc for anything of ours here, matching the
+        // house style (see NFTrigger in nfolders.cc, before rung 1):
+        // activated() is already mocced inside Qt itself, so a plain functor
+        // connect needs neither a QObject subclass nor a build-system moc
+        // step. The notifier has no parent and is never freed -- a
+        // permanent, process-lifetime singleton, like nf_proxy_owner above,
+        // not a per-event leak.
+        nf_watch_notifier = new QSocketNotifier(fd, QSocketNotifier::Read);
+        QObject::connect(nf_watch_notifier, &QSocketNotifier::activated,
+                          [fd](int) { nf_watch_ready(fd); });
+    } else if (strcmp(nf_watch_dir, dir.constData()) != 0) {
+        // Every trigger file this mod uses lives directly in /tmp, so this
+        // is not a real limitation in practice -- but it is checked rather
+        // than silently watching the wrong directory for a second trigger
+        // that happens to live elsewhere.
+        nh_log("watch: %s is in '%s', already watching '%s' -- a second directory is not supported, refusing",
+               path, dir.constData(), nf_watch_dir);
         return -1;
     }
 
-    nf_watch_cb = cb;
+    snprintf(nf_watch_targets[nf_watch_target_count].name,
+             sizeof nf_watch_targets[nf_watch_target_count].name, "%s", name.constData());
+    nf_watch_targets[nf_watch_target_count].cb = cb;
+    nf_watch_target_count++;
 
     // Whether nf_init runs before or after QCoreApplication exists on THIS
     // firmware is unestablished -- the spike's poll thread never touched Qt
@@ -353,24 +431,18 @@ int nf_watch_init(char const *path, void (*cb)(void)) {
     // code, so both are logged loudly, and the notifier is still constructed
     // either way -- but the caller (nf_init) must NOT report readiness when
     // this is going to be dead on arrival, so the return value reflects the
-    // dispatcher check, not just whether the syscalls above succeeded.
+    // dispatcher check, not just whether the syscalls above succeeded. This
+    // check runs on EVERY call (not just firstWatch), because it is this
+    // CALL's caller that needs an honest answer, even when the underlying
+    // notifier was already built for an earlier target.
     if (!QCoreApplication::instance())
         nh_log("watch: QCoreApplication::instance() is NULL at nf_watch_init -- untested ordering, see nfnickel.cc");
     bool dispatcherLive = QAbstractEventDispatcher::instance() != NULL;
     if (!dispatcherLive)
         nh_log("watch: QAbstractEventDispatcher::instance() is NULL -- the notifier below will NOT fire, the trigger will silently never work");
 
-    // No Q_OBJECT and no moc for anything of ours here, matching the house
-    // style (see NFTrigger in nfolders.cc, before this rung): activated() is
-    // already mocced inside Qt itself, so a plain functor connect needs
-    // neither a QObject subclass nor a build-system moc step. The notifier
-    // has no parent and is never freed -- a permanent, process-lifetime
-    // singleton, like nf_proxy_owner above, not a per-event leak.
-    nf_watch_notifier = new QSocketNotifier(fd, QSocketNotifier::Read);
-    QObject::connect(nf_watch_notifier, &QSocketNotifier::activated,
-                      [fd](int) { nf_watch_ready(fd); });
-
-    // -1 here does not mean the notifier wasn't built -- it was, just above,
+    // -1 here does not mean the notifier wasn't built -- it was, on the
+    // firstWatch branch above (or on an earlier call, for a reused watch),
     // deliberately (see the comment on the dispatcher check). It means the
     // caller must not claim the watch is ready when it demonstrably is not:
     // nf_init logs "could not set up" and stays silent on "ready" rather than

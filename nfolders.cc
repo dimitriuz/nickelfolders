@@ -1,33 +1,33 @@
-// NickelFolders -- SPIKE, rung 1.
+// NickelFolders -- rungs 1 and 2.
 //
-// This file is still a probe, not a product: its whole job remains answering
-// whether an injected mod can hand an arbitrary ContentID to Nickel's stock
-// reader and have the book open the way it does when you tap it in the
-// library. That question is answered -- see NOTES.md and README.md -- so this
-// rung's job is different: it pays off the three things the spike knowingly
-// got wrong (a hardcoded dbName, a leaked proxy, a 500 ms poll thread) before
-// five more libnickel calls get built on top of it. Nothing about WHAT the
-// mod does changes here.
+// Rung 1's whole job was answering whether an injected mod can hand an
+// arbitrary ContentID to Nickel's stock reader and have the book open the
+// way it does when you tap it in the library -- answered, see NOTES.md and
+// README.md. Rung 2's job is a screen of ours on Nickel's own window stack
+// (nfbrowser.cc) -- also drawing nothing on purpose, same as rung 1 opened
+// no UI of its own, because the point of this rung is proving the screen
+// itself works before anything is put on it.
 //
-// The libnickel call sequence itself -- VolumeManager::getById, then a
-// ReadBookActionProxy over the Volume, then onSelected() -- now lives in
-// nfnickel.cc, along with the inotify watch that replaces the poll thread.
-// This file is left with the trigger protocol and the NickelHook glue.
+// The libnickel call sequences live in nfnickel.cc (book-opening) and
+// nfbrowser.cc (the screen), along with the inotify watch machinery. This
+// file is left with the two trigger protocols and the NickelHook glue.
 //
 // Drive it from a shell, over ssh, with Nickel up:
 //
 //     echo 'file:///mnt/onboard/books/it/Some Book.epub' > /tmp/nfolders-open
+//     touch /tmp/nfolders-show
 //     logread | grep -i nickelfolders
 //
-// The trigger file is up to three lines: the ContentID, then getById's dbName
-// (blank now defers to the device's own correct value -- see nf_db_name in
+// The open-trigger file is up to three lines: the ContentID, then getById's
+// dbName (blank defers to the device's own correct value -- see nf_db_name in
 // nfnickel.cc -- rather than always meaning "internal storage"), then how far
 // to go, 1 to 4. Stopping short is how a crash gets localised to a single
-// libnickel call; see nf_open_book_staged in nfnickel.cc.
-//
-// Nothing here draws anything. The browser is the next step and only makes
-// sense once this has been seen to work.
+// libnickel call; see nf_open_book_staged in nfnickel.cc. The show-trigger
+// file's content is not read at all -- its EXISTENCE is the whole signal,
+// matching the NickelMenu action Task 7's brief adds
+// (`cmd_spawn :quiet:/bin/touch /tmp/nfolders-show`).
 
+#include "nfbrowser.h"
 #include "nfnickel.h"
 
 #include <QString>
@@ -40,7 +40,8 @@
 
 #include <NickelHook.h>
 
-#define NF_TRIGGER "/tmp/nfolders-open"
+#define NF_TRIGGER      "/tmp/nfolders-open"
+#define NF_TRIGGER_SHOW "/tmp/nfolders-show"
 
 // nf_on_trigger runs on the GUI thread already: nf_watch_init's callback is
 // invoked from the QSocketNotifier's activated() signal, which the Qt event
@@ -108,36 +109,61 @@ static void nf_on_trigger() {
     nf_open_book_staged(contentId, dbName, stage);
 }
 
+// The show-trigger has no content protocol to parse -- its existence is the
+// whole signal (see this file's opening comment) -- so this is a thin
+// adapter from "the file appeared" to nf_browser_show()'s own signature.
+// Runs on the GUI thread for the same reason nf_on_trigger does: nf_init
+// (below) calls nf_watch_init from the GUI thread, and every callback it
+// registers is invoked from the QSocketNotifier's activated() signal on
+// that same thread -- no cross-thread hop to get wrong.
+static void nf_on_trigger_show() {
+    unlink(NF_TRIGGER_SHOW);
+    nf_browser_show();
+}
+
 static int nf_init() {
     // Every NFNickelDlsym entry is optional (nfnickel.cc), so a miss here is
     // a real, reachable outcome now -- not hypothetical -- and this is the
-    // only place it gets logged loudly. nf_open_book_staged still refuses to
-    // run rather than call through a null pointer either way.
+    // only place it gets logged loudly. nf_open_book_staged and
+    // nf_browser_show both still refuse to run rather than call through a
+    // null pointer either way; the two checks are independent
+    // (nf_nickel_resolve/nf_browser_resolve) so a firmware that breaks one
+    // feature's symbols does not silently disable the other's too.
     if (!nf_nickel_resolve())
         nh_log("init: a libnickel symbol did not resolve; book-opening is inert until this is fixed");
+    if (!nf_browser_resolve())
+        nh_log("init: a libnickel symbol did not resolve; the browser screen is inert until this is fixed");
 
-    if (nf_watch_init(NF_TRIGGER, &nf_on_trigger) != 0) {
-        // Non-fatal on purpose. Failing init here would trip NickelHook's
-        // shared failsafe and could take other mods' installs down with it
-        // (CLAUDE.md), which is a wildly disproportionate response to a mod
-        // that, at this rung, still has no UI and cannot be triggered any
-        // other way.
-        //
-        // A non-zero return also covers "the watch was built but is already
-        // known dead" (nf_watch_init logged specifically why, above this) --
-        // not just outright setup failure. Either way, the trigger will not
-        // work, so this must not be followed by the "ready" line below.
-        nh_log("init: trigger watch is not usable; mod is inert (see 'watch:' lines above for why)");
-        return 0;
-    }
+    // Both trigger files live directly in /tmp, so the second nf_watch_init
+    // call below reuses the first's inotify fd/notifier rather than creating
+    // a second one -- see nf_watch_init's own comment (nfnickel.h) for why
+    // that is not a real limitation here. Non-fatal on failure, for both:
+    // failing init here would trip NickelHook's shared failsafe and could
+    // take other mods' installs down with it (CLAUDE.md), which is a wildly
+    // disproportionate response to either trigger not being wired up.
+    //
+    // A non-zero return does not mean the watch wasn't built -- it may have
+    // been, but is already known dead (nf_watch_init logged specifically why,
+    // above this) -- either way the corresponding trigger will not work, so
+    // this must not be followed by that trigger's "ready" line below.
+    bool openReady = nf_watch_init(NF_TRIGGER, &nf_on_trigger) == 0;
+    if (!openReady)
+        nh_log("init: open-trigger watch is not usable; book-opening is inert (see 'watch:' lines above for why)");
 
-    nh_log("init: ready, echo a ContentID into %s", NF_TRIGGER);
+    bool showReady = nf_watch_init(NF_TRIGGER_SHOW, &nf_on_trigger_show) == 0;
+    if (!showReady)
+        nh_log("init: show-trigger watch is not usable; the browser screen is inert (see 'watch:' lines above for why)");
+
+    if (openReady)
+        nh_log("init: ready, echo a ContentID into %s", NF_TRIGGER);
+    if (showReady)
+        nh_log("init: ready, touch %s to show the browser screen", NF_TRIGGER_SHOW);
     return 0;
 }
 
 static struct nh_info NFInfo = (struct nh_info){
     .name           = "NickelFolders",
-    .desc           = "SPIKE: opens a book in the stock reader by ContentID.",
+    .desc           = "SPIKE: opens a book in the stock reader by ContentID, and can push an empty screen onto the window stack.",
     .uninstall_flag = "/mnt/onboard/nfolders_uninstall",
     // Spelled out although it is unused: GCC 4.9's C++ frontend rejects a
     // designated initializer that SKIPS a field ("non-trivial designated
