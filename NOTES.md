@@ -450,6 +450,58 @@ the SD card*. `calcDbName` comparing a per-Device path against
 lookup needs. Using `getDbName()` is strictly better than hardcoding `""` and
 is what Nickel does; the SD path itself needs a device with a slot.
 
+### The measured value contradicts the derivation above, and this is left in on purpose
+
+Measured on hardware 2026-09-03 (Task 6, rung 1, firmware 4.38.23684):
+`Device::getDbName()` did **not** return the empty string on internal
+storage. It returned **`/mnt/onboard/.kobo/KoboReader.sqlite`**:
+
+```
+open: stage=2 contentId='file:///mnt/onboard/books/Pratchett_ Terry - The Color of Magic_ A Discworld Novel.epub' dbName='/mnt/onboard/.kobo/KoboReader.sqlite'
+open: isValid=true
+```
+
+This **contradicts** the `calcDbName()` reading two sections above: that
+reading says the literal-string comparison against `/mnt/onboard/.kobo`
+should return *empty* for internal storage, and the spike's own hardcoded
+`""` was justified on exactly that basis (and worked, on the same device).
+The reading is not being quietly softened into agreement here — it was wrong
+about what the accessor returns, and this project's notes keep wrong turns
+on purpose (see `getById`'s missing `this`, above) rather than editing them
+into looking right in hindsight.
+
+**What is now open, that was not before**: `""` and
+`/mnt/onboard/.kobo/KoboReader.sqlite` are different strings, yet `getById`
+found the book (`isValid=true`) with the runtime-measured
+`/mnt/onboard/.kobo/KoboReader.sqlite` value, and separately, historically,
+with a hardcoded `""` in the spike. Both work; why is unexplained. Three
+candidate explanations, not yet distinguished:
+
+1. `Repository::cacheKey(dbName, ...)` (called from inside `getById`, per
+   "The call sequence" above) normalises both strings to the same cache
+   partition — e.g. by treating `/mnt/onboard/.kobo/<anything>` as
+   equivalent to empty for the internal-storage case, or by deriving the
+   partition key from something other than a literal string match.
+2. The lookup has a fallback path that finds the book regardless of which
+   partition is queried first (a miss in one cache falling through to
+   another).
+3. `Device::getDbName()` is not actually returning `calcDbName()`'s result
+   verbatim — the field it reads (`this->d`, `+48`, per the disassembly
+   above) may be a *database file path* the Device caches for a different
+   purpose than the `dbName` cache-partition key `calcDbName` computes, and
+   the two only happen to coincide in the cases measured so far.
+
+**Archaeology that would settle it**, not yet done: re-read
+`Device::calcDbName()` at `0x009686c0` and `Device::getDbName()` at
+`0x009688f4` against the *current* firmware build (the addresses above are
+from the same 4.38.23684 image the rung-1 device run used, so a re-read is a
+sanity check on the reading, not a re-target), and resolve
+`Repository::cacheKey`'s PLT stubs with `tools/plt.sh` to see what it
+actually does with the two different strings measured. **This does not block
+v1**: `getDbName()`'s value works, is what Nickel's own 117 call sites
+compute rather than a constant, and is strictly better than a hardcoded `""`
+regardless of which explanation above turns out to be right.
+
 ### How the call sites were found
 
 Worth recording, because it is the reverse of `tools/plt.sh` and it took a
@@ -467,3 +519,55 @@ arm-linux-gnueabihf-objdump -d libnickel.so.1.0.0 | grep -E 'blx?\s+69f7f4'
 ```
 
 Step 3 produces a ~500 MB text file from this 24 MB binary. Delete it after.
+
+## Rung 1 device results (Task 6, 2026-09-03)
+
+Verified on hardware, firmware 4.38.23684, Nickel PID 222 **unchanged
+throughout the whole run** — no crash, no restart, at any point below.
+
+- **No boot loop.** The `nf_watch_name` fix (a file-scope `QByteArray`'s
+  dynamic initialiser racing `nh_init` — see `nfnickel.cc`'s comment on the
+  declaration for the mechanism) is confirmed on hardware, not just by the
+  `readelf` check against `.init_array` that predicted it.
+- **All seven `NFNickelDlsym` symbols resolved**, each logged `(optional)`.
+  The failsafe armed and was destroyed after the configured 3s delay, and
+  the `.so` was renamed back to its installed location — the owner's other
+  NickelHook mods (NickelMenu, NickelDBus, kfmon) were never at risk on this
+  run, which is the outcome marking every entry `.optional = true` exists
+  for.
+- **The inotify trigger fires.** `nf_watch_init`'s `QSocketNotifier` path
+  works end to end: writing the trigger file drove `nf_on_trigger` and
+  `nf_open_book_staged` on this firmware.
+- **Negative control passed**: a ContentID no book has gave `isValid=false`
+  and "no book in the library has that ContentID" logged, with no
+  navigation — the evidence that `isValid=true` (below) means something
+  rather than being vacuously true.
+- **Full open (stage 4) reached `ndbCurrentView = ReadingView`**, and a
+  framebuffer grab showed the right book with Nickel's own header and
+  chapter footer — the stock reader, not a bare render. `onSelected()`
+  returned in ~4s.
+- **Zero crash lines**: unfiltered `logread | grep -icE
+  "hindenburg|segfault|SIGSEGV"` = 0 across the run.
+- **The `QCoreApplication`/dispatcher init-ordering question (Task 6's own
+  concern 1) is answered**: `nf_watch_init`'s two instrumentation lines
+  (`nfnickel.cc`) log only on failure, and neither appeared; `init: ready`
+  itself requires `dispatcherLive == true` to be reached at all (see
+  `nf_watch_init`'s return value). So on this firmware, `nf_init` runs
+  *after* `QCoreApplication` exists and the thread's event dispatcher is
+  already live — genuinely unestablished before this instrumentation, and
+  now settled for 4.38.23684 specifically (not necessarily every firmware).
+- **The poll thread's removal is a source fact, not a device measurement.**
+  `nfnickel.cc`/`nfolders.cc` contain no `pthread_create` and no
+  `nanosleep` calls at all — grep confirms it — and the trigger firing
+  above demonstrates the inotify replacement works. A `/proc/<pid>/task`
+  thread count was taken before and after this run (12 threads on a Nickel
+  that had been up four hours with browser use as the baseline, 9 threads
+  post-reboot) but that is **not** a controlled comparison across a reboot
+  — Nickel's own thread count varies with what it has done since boot, for
+  reasons unrelated to this mod — and is not cited here as evidence for
+  anything.
+
+**The dbName measurement from this same run contradicts a written derivation
+elsewhere in this file** — see "The measured value contradicts the
+derivation above, and this is left in on purpose", under "dbName, and SD
+cards (#6)".
