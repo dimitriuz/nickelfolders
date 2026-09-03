@@ -1,0 +1,336 @@
+# NickelFolders v1 — design
+
+Written 2026-09-03, after the spike answered all six of `NOTES.md`'s open
+questions. Nothing in v1 re-derives anything `CLAUDE.md` lists as settled.
+
+**What v1 is:** a folder browser on Nickel's own window stack. You reach it
+from a menu item, walk one directory at a time, tap a book, and it opens in the
+stock reader. One back press returns you to the folder you were in.
+
+**What v1 is not:** covers, search, file operations, network. Those are wanted
+and are addressed under *Keeping the future open*, not built.
+
+## 1. Architecture: a native Nickel screen
+
+An `AbstractController` subclass whose view is a plain Qt widget, pushed with
+`MainWindowController::push`.
+
+Measured off `libnickel.so.1.0.0` (4.38.23684), so the decision is priced
+rather than assumed:
+
+- `AbstractController`'s typeinfo at `0x163ff68` is a plain
+  `__class_type_info` — **no base class. It is not a QObject.**
+- Constructor `_ZN18AbstractControllerC1Ev`, both destructors, and the
+  **vtable** `_ZTV18AbstractController` (`0x163ff70`) are all exported.
+- The vtable holds **exactly one `__cxa_pure_virtual`**, at `+32`.
+  `AbstractController::ensureViewLoaded` (`0xad1408`) calls precisely that slot
+  (`ldr r3,[r3,#32]; blx r3`), so the one method a subclass must supply is
+  "load your view". `size`, `viewWillAppear`, `viewWillDisappear`,
+  `viewWillBeDestroyed`, `allowedOrientations` and `navSection` all have
+  inheritable non-pure implementations.
+- `AbstractController::viewLoaded() const` returns `this+8`, so the view
+  pointer lives at offset `+8`.
+
+So the native screen costs about what `getById` cost: one vtable to build, one
+pure virtual to implement, one `push` to call. `sizeof(AbstractController)`
+still has to come from a concrete controller's own `operator new` call site per
+the fixed method in `CLAUDE.md` — it looks like 12–16 bytes, and that is a
+guess until measured.
+
+### Rejected: reusing `FolderItemListWidget`
+
+The native screen's value is `MainWindowController::push` plus
+`AbstractController` — touch, e-ink refresh, fonts and the back gesture. That
+is four opaque symbols. Reusing `FolderItemListWidget` additionally means
+faking `FolderItemDataSource` and `FolderItem`, which is subclassing more
+Nickel classes whose vtables nobody has measured, for a cosmetic gain a plain
+Qt widget already gets by inheriting Nickel's palette and fonts. It buys little
+and spends the whole risk budget.
+
+### Rejected: an FBInk overlay
+
+Beyond being a second UI, it would draw into a framebuffer that a live Nickel
+is actively repainting, with no arbitration between them. koboy works because
+it takes the panel over entirely; this is the opposite situation.
+
+### Rejected as a fallback: shelves-from-folders
+
+Honestly priced, it is still about an hour of Python, and its real cost is not
+flatness. Writing `Shelf`/`ShelfContent` behind a running Nickel races Nickel's
+own `Repository` cache, and a 27-volume folder becomes one shelf whose name is a
+path. It buys two-tap reach with no crash risk and firmware immunity. Worth
+doing only as a throwaway measurement of how much a tree is actually worth,
+never as v1's fallback.
+
+## 2. Data: no SQL, and no database handle
+
+The tree comes from the **filesystem**, one directory at a time. Per-row
+metadata comes from the **already-proven `getById` call**.
+
+This inverts the emphasis of the settled fact. "The tree is derivable from the
+database alone" says the database *suffices*, not that the filesystem is
+forbidden — and v1 has to read the current directory anyway, because a file
+with no database row exists only on disk. Since that read is happening, the
+filesystem becomes the tree source and the database is reached only through
+Nickel's own lookup:
+
+| Need | How |
+|---|---|
+| Folders and files in the current directory | `QDir::entryList`, non-recursive |
+| Is this file openable? | `getById` then `Volume::isValid()` — proven, with a negative control |
+| Title, reading progress | `Volume::getDbValues() const` (`0x00a63f64`) |
+| Open it | the proven `ReadBookActionProxy` → `onSelected()` sequence |
+
+`Volume::getDbValues()` is the reason this works without resolving a dozen
+accessors: the typed getters (`title()`, percent-read) are **not exported** —
+only `isValid`, `isFolder`, `entitlementId` and a store-related handful are —
+because they are inline in Nickel's header. `getDbValues()` is the ORM's
+serialisation half, paired with the exported
+`Volume::fromAttributes(QHash<QString,QVariant> const&)`, so it hands back
+every column keyed by name in one call.
+
+**What this buys:** no `QSqlDatabase` connection, no handle on the 432 MB
+`KoboReader.sqlite`, no race against Nickel's cache, and no archaeology to
+discover Nickel's SQL connection name.
+
+**Two things it owes, both recorded as rung-4 work:**
+
+- `getDbValues()`'s calling convention. It returns a container by value, so it
+  almost certainly uses a hidden return buffer as argument zero — the same trap
+  that crashed Nickel once for `getById`. Every PLT stub it calls gets resolved
+  before it is called, per the fixed method. No guessing.
+- The cost of N `getById` calls per navigation. `NOTES.md` establishes that
+  `getById` calls `Repository::refreshCache<Volume>(dbName)`, and nobody has
+  timed that. A directory here holds 10–30 rows. If per-row lookup is too slow
+  for e-ink, the fallback is one SQL query per folder — which reintroduces the
+  database handle, so it is a fallback and not the plan.
+
+`dbName` comes from `Device::getCurrentDevice()` then `Device::getDbName()`.
+Never a hardcoded `""`.
+
+## 3. Display rules — where the device measurements landed
+
+Two of these came out of measuring the actual card on 2026-09-03 and neither
+was in the original plan.
+
+### 3.1 A numeric-aware comparator is a v1 requirement, and it applies to directory names
+
+`/mnt/onboard/books/Comics/English/Sandman/` contains **directories** named
+`v1`, `v10`, `v2`, `v3` … `v9` — **unpadded**. A plain case-insensitive sort
+orders them `v1, v10, v2, …`, which puts *The Wake* — the finale — second in
+the list.
+
+This nearly went unnoticed, and the reason is worth carrying: the 27-volume
+Fullmetal Alchemist folder's **files** are zero-padded (`v01` … `v27`), so
+looking at files alone says a plain sort is fine. It is the *folder* names that
+are unpadded. **Measure both kinds or the answer is wrong.**
+
+`QCollator` has a numeric mode but needs ICU, which is not worth betting on in
+Kobo's Qt 5.2.1. v1 ships a small numeric-aware compare of its own: split each
+name into digit and non-digit runs, compare digit runs by value and the rest
+case-insensitively. No stdlib, no ICU.
+
+### 3.2 Strip the common prefix and suffix within a listing — do not use a middle ellipsis
+
+The 13 files in
+`books/Pokémon - La Grande Aventure (01-13+) …/` all begin with the same
+**34 characters** and each carries roughly 60 more characters of release-group
+tail. The token that identifies the volume (`T01`) sits in the **middle**:
+
+```
+Pokémon - La Grande Aventure (Part 1) - Rouge, Bleu et Jaune T01 (Kusaka-Mato) (2014) [Digital-1085] [Manga FR] (PapriKa+).cbz
+```
+
+koboy's `ui_fit_label` middle ellipsis would keep the useless head and the
+useless tail and elide exactly the part that tells the volumes apart. That is
+the same failure koboy recorded at 15 shared characters, made worse by the
+identifier not being at the front.
+
+So the rule is not an elision rule. **Within one listing, find the longest
+common leading and trailing run across the rows and strip both for display**,
+trimmed back to a token boundary so a row never begins mid-word. Applied here:
+
+- Fullmetal Alchemist's 27 rows become `v01` … `v27`
+- Pokémon's 13 become `(Part 1) - Rouge, Bleu et Jaune T01` and so on
+
+Three properties make this safe rather than clever:
+
+- It **cannot create duplicate labels**, because it removes text that is
+  identical in every row.
+- It **degrades correctly**: a folder of mixed formats has no common run, so
+  nothing is stripped.
+- It **strips the extension for free**, as a common suffix, in a folder of one
+  format — and correctly leaves it visible in a folder of several.
+
+### 3.3 Ordering
+
+Kind first — folders before files — then §3.1's comparator, and **the whole
+listing is sorted before any cap is applied**. koboy's `romlist.h` calls
+sort-before-cap "the original bug's fix" and says it must survive any change:
+what survives a truncation must be alphabetical, never an artifact of readdir
+order. Inherited verbatim.
+
+### 3.4 Duplicate labels show their folder
+
+Stripping folder context from a label means two same-named files in different
+folders render as the same row — `FOLLOWUPS.md` #31 in koboy, and not
+hypothetical here with `v01.cbz`-shaped names. The recorded fix is to show the
+folder on the row **only for the rows that collide**, never to prefix every
+row.
+
+### 3.5 What is hidden, and one accepted wart
+
+Files are filtered by an **extension allowlist**: `.epub`, `.kepub.epub`,
+`.cbz`, `.cbr`, `.pdf`. Measured against the whole card on 2026-09-03, that
+allowlist admits 226 files and hides all nine that are not books — five
+`.svg` sketches in `drawings/`, `KOBOY-INSTALL.md`, a KOReader `.lua` sidecar,
+a Windows `.dat`, and one extensionless `IndexerVolumeGuid`.
+
+**`.txt` is deliberately NOT on that list**, and the reason is a small
+correction to the census. There is exactly one `.txt` file on the card and it is
+`koboy-probe-Io.txt` — a probe file the sibling project left on `/mnt/onboard`,
+which Nickel then imported. So the census's "1 `.txt`, with a row" was never a
+book: the real count is **226 book files, 225 of them openable**, the one
+exception still being the truncated Fullmetal Alchemist v26.
+
+That single fact is what removes `.txt`. Because the probe file *has* a
+database row, no greyed-row logic would catch it — it would render as an
+ordinary, openable row called `koboy-probe-Io`, which is precisely the noise
+this browser exists to remove. If a genuine `.txt` book is ever sideloaded,
+putting the extension back is a one-line change; leaving it in today buys one
+row of garbage and nothing else.
+
+Directories need their own rule, because an extension allowlist does not touch
+them: **hide dotdirs and `*.sdr`**. A `.sdr` sidecar sits in plain sight at the
+card root (`calibrewebdownload2055pdf2055.sdr`), so this is not theoretical.
+
+**Accepted wart:** `screensavers/` and `drawings/` contain no books, so they
+show as folders that turn out to be empty once entered. Knowing that in advance
+needs a recursive count, which is the walk this design avoids. The fix — a
+cached per-folder book count — is deferred, not forgotten, and §3.6 at least
+makes the empty folder say so.
+
+### 3.6 "Empty" and "cannot read" stay distinct
+
+A folder with no showable rows and a folder that cannot be listed are different
+diagnoses to someone holding an e-reader with no terminal. koboy makes the same
+distinction (`romlist` returning `-1` versus `0`) and arrived at it
+independently, which is reason to trust it. Same rule as the greyed no-row
+book: say what is wrong in the row, do not hide it.
+
+### 3.7 Depth
+
+The real card is five levels deep
+(`books/Comics/English/Sandman/Sandman Mystery Theatre/Blackhawk`). Navigation
+state is a path string with no depth assumption anywhere.
+
+## 4. The six decisions
+
+**Launch — a NickelMenu item in the library menu.** It is already installed,
+and it keeps v1's one genuinely risky new thing — the controller subclass —
+unaccompanied by a second archaeology project. Mechanism, which also pays debt
+item 3: NickelMenu `cmd_spawn` touches a path on `/tmp`, and the mod watches it
+with **inotify through a `QSocketNotifier`**. Event-driven, no poll thread, no
+client binary to ship, and no handle on `/mnt/onboard`. Honest cost: v1 depends
+on NickelMenu staying installed. Hooking our own menu item is the part of
+NickelMenu that breaks across firmware, and a real library tab is the right end
+state — both v2.
+
+**Last folder — remembered. Scroll position — not.** With a 27-volume folder
+you re-enter the same place constantly, and last-folder is one string written on
+leaving. Per-folder scroll memory is a keyed map plus persistence, and it is not
+needed: back-from-reader pops to our controller *still alive with its view
+loaded*, so scroll survives within a session for free. That is the settled
+replace-not-stack result paying out. The string is written in a Qt signal
+handler, which `CLAUDE.md` names as a safe `/mnt/onboard` window.
+
+**Sorting — §3.3.**
+
+**Non-book files — hidden, per §3.5**, with the greyed no-row row kept. It costs
+about fifteen lines given one-directory-at-a-time, and a silently missing
+volume 26 is the exact failure `NOTES.md` warns about.
+
+**Reading progress — shown, minimally.** `getDbValues()` already carries it, so
+it is free: a percentage for in-progress books only, a marker for finished,
+nothing for unread. For manga, "which volume am I on" is the most useful thing
+on the screen.
+
+**Collections — no interaction at all, deliberately.** The browser and
+collections are two answers to the same question, and both writing is how the
+library gets into a mess. The one interaction wanted is Recents, which
+`ReadBookActionProxy` already gives for free. This is a non-goal, not an
+omission.
+
+## 5. Rungs
+
+Each stops somewhere a device run can confirm, because a crash at a known rung
+names one call and a crash after six names nothing.
+
+1. **Debt only, no UI.** `Device::getDbName()`; free the proxy; inotify plus
+   `QSocketNotifier` replaces the poll thread. Verify the existing open path
+   still works and Nickel's PID is unchanged.
+2. **An empty screen.** The `AbstractController` subclass, pushed on a
+   NickelMenu tap, back pops out. Oracle: `ndbCurrentView` plus PID unchanged.
+   Negative control: a push with a deliberately wrong vtable slot must fail
+   visibly rather than silently.
+3. **A list widget with hardcoded rows.** Confirmed by screenshot — a view
+   name does not say what is on the panel.
+4. **Real listings.** `QDir::entryList` plus `getById`/`getDbValues`, one
+   directory at a time, sorted per §3.3, labelled per §3.2. This is the rung
+   that owes the `getDbValues()` disassembly and the `getById` timing.
+5. **Tap to open**, wiring in the proven sequence.
+6. **Greyed rows, progress markers, last-folder memory.**
+
+## 6. Keeping the future open
+
+Covers, search, file operations and network are wanted later. What v1 does so
+they do not need a rewrite:
+
+- **Search** wants a flat result list, not a folder listing. So the display
+  rules of §3 are written against *the set of rows being shown*, never against
+  "the current folder". A search result set has no common run, so §3.2 does
+  nothing to it and §3.4 does the work instead — which is the correct behaviour
+  without a special case.
+- **Covers** need `ImageId`, which `getDbValues()` already returns. No new
+  archaeology; the row model gains a field and the row gains a fixed height.
+  The real cost is decode plus e-ink refresh time, which is why it is not v1.
+- **File operations** carry a hazard worth recording now: `unlink`-ing a book
+  leaves an orphan `content` row *and* a stale `Repository` cache entry, so
+  `getById` would go on returning a valid `Volume` for a file that is gone.
+  Any future delete must go through Nickel's own removal path. This is why v1
+  is strictly read-only.
+- **Network** is unspecified and nothing here blocks it.
+
+## 7. Open, and owed
+
+Device questions, batched — a reboot is the unit of iteration:
+
+1. **Time N consecutive `getById` calls.** Drives §2's per-row lookup versus
+   the SQL fallback, and it is the one number v1's data design rests on.
+
+   **It cannot be measured with the installed spike, and believing otherwise
+   would be this project's third instrument mistake.** Driving it through
+   `--stage 2` measures the trigger path, not the lookup: the poll thread has a
+   500 ms floor and syslog timestamps are one-second granular, so both swamp
+   what is probably a sub-millisecond hash lookup. Worse, it would fail
+   *patterned* — every sample landing near the poll interval — which is exactly
+   the signature `CLAUDE.md` says to distrust.
+
+   So it needs the loop and the timing inside the mod, and it lands in rung 4
+   with a negative control: a deliberately slow path whose measured cost must
+   differ, so a fast reading is known not to be the clock's resolution.
+
+2. ~~Extension inventory and largest directory by entry count.~~ **Answered
+   2026-09-03**, and the inventory corrected §3.5 — see there. Entry counts,
+   measured: 27 (Fullmetal Alchemist), 18 (Sandman Mystery Theatre), 14
+   (`Sandman/v9 - The Kindly Ones`), 14 (`Sandman`), 13 twice. Nothing is large
+   enough for paging to be a v1 concern; a scrolling list covers all of it.
+
+   `Sandman` is worth noting: 14 entries made of 11 subfolders and 3 files, so a
+   folder holding both kinds is real here and §3.3's kind-first ordering is
+   doing actual work rather than defending against a hypothetical.
+
+Host-side, before rung 4:
+
+3. `Volume::getDbValues()`'s return convention and every PLT stub it calls.
+4. `sizeof(AbstractController)`, from a concrete controller's own `operator new`.
