@@ -81,10 +81,16 @@ static void test_strip_single_row_untouched(void) {
 // Refuse to strip rather than strip badly: a listing of full names is verbose,
 // a listing of one-character rows is broken.
 //
-// This exercises the POST-LOOP length guard, not the `keep` guard: both rows
-// share the ".cbz" extension, so the post-loop check on the trimmed output
-// alone is enough to refuse. It does not cover the `keep` guard -- see
-// test_strip_refuses_short_remainder_even_when_mixed for that.
+// Both this and test_strip_refuses_short_remainder_even_when_mixed are caught
+// by the `keep` guard in normal execution -- it returns from inside the per-row
+// loop, so the post-loop length check is never even reached. What separates
+// them is MUTATION DETECTION, not which guard fires.
+//
+// Disable the `keep` guard and this case is still refused, because the post-loop
+// check sees a trimmed "A" of one character. The mixed-extension case is NOT,
+// because there the extension is appended first and "1.cbz" is five characters.
+// So this test cannot detect a broken `keep` guard and the mixed one can, which
+// is why both exist.
 static void test_strip_refuses_when_remainder_too_short(void) {
     QStringList n;
     n << "Book A.cbz" << "Book B.cbz";
