@@ -159,8 +159,32 @@ Three properties make this safe rather than clever:
   identical in every row.
 - It **degrades correctly**: a folder of mixed formats has no common run, so
   nothing is stripped.
-- It **strips the extension for free**, as a common suffix, in a folder of one
-  format — and correctly leaves it visible in a folder of several.
+The extension, however, is **not** handled for free, and the original draft of
+this section was wrong to say it was. Validated against the real names on
+2026-09-03: `Fullmetal Alchemist …` strips its extension only because its
+common suffix happens to contain whitespace, whereas a folder of
+`Batman v01.cbz` / `Batman v02.cbz` has the common suffix `.cbz` with no
+whitespace inside it, so the token-boundary rule cannot cut there and the
+extension survives on every row.
+
+So extensions are handled **explicitly, before the common run is computed**:
+split a known extension off each name, compute the common prefix and suffix on
+the stems, and re-append the extension only when the listing contains more than
+one distinct extension — where it is the one thing distinguishing two rows and
+must stay.
+
+Two further rules came out of the same validation and are requirements, not
+polish:
+
+- **Backing the prefix off to a whitespace is not sufficient; it must also back
+  off past an unmatched opening bracket.** The Pokémon folder's names share
+  `… Aventure (Part `, and cutting at the whitespace leaves rows beginning
+  `1) - Rouge …` — which loses the `(Part 1)` that actually distinguishes the
+  sub-series. Backing off to before the `(` yields
+  `(Part 1) - Rouge, Bleu et Jaune T01 …`, which is the wanted result.
+- **Refuse to strip rather than strip badly.** If any row's remainder would come
+  out under two characters, no row is stripped at all. A listing of full names is
+  merely verbose; a listing of one-character rows is broken.
 
 ### 3.3 Ordering
 
