@@ -80,11 +80,33 @@ static void test_strip_single_row_untouched(void) {
 
 // Refuse to strip rather than strip badly: a listing of full names is verbose,
 // a listing of one-character rows is broken.
+//
+// This exercises the POST-LOOP length guard, not the `keep` guard: both rows
+// share the ".cbz" extension, so the post-loop check on the trimmed output
+// alone is enough to refuse. It does not cover the `keep` guard -- see
+// test_strip_refuses_short_remainder_even_when_mixed for that.
 static void test_strip_refuses_when_remainder_too_short(void) {
     QStringList n;
     n << "Book A.cbz" << "Book B.cbz";
     nf_strip_common(&n);
     CHECK_EQ_STR(n.at(0), "Book A.cbz");
+}
+
+// The case that makes the keep-guard non-redundant, and it took a mutation
+// coming back GREEN to find it. With a SAME-extension listing the post-loop
+// length check backstops the keep guard, so mutating the keep guard changes
+// nothing. With MIXED extensions the extension is appended AFTER the length
+// check, so a one-character remainder becomes "1.cbz" -- five characters --
+// and sails straight past the post-loop guard.
+//
+// Measured on the host: with `keep < 2` these stay whole; with `keep < 0` they
+// become [1.cbz] and [2.pdf].
+static void test_strip_refuses_short_remainder_even_when_mixed(void) {
+    QStringList n;
+    n << "Vol 1.cbz" << "Vol 2.pdf";
+    nf_strip_common(&n);
+    CHECK_EQ_STR(n.at(0), "Vol 1.cbz");
+    CHECK_EQ_STR(n.at(1), "Vol 2.pdf");
 }
 
 int main(void) {
@@ -96,5 +118,6 @@ int main(void) {
     test_strip_no_common_run();
     test_strip_single_row_untouched();
     test_strip_refuses_when_remainder_too_short();
+    test_strip_refuses_short_remainder_even_when_mixed();
     NF_TEST_MAIN_END
 }
