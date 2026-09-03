@@ -108,7 +108,10 @@ bool nf_browser_show_volumes(QStringList const& contentIds) {
     // not independently established what this bool controls beyond being
     // passed straight through to whatever was on top before (NOTES.md); a
     // cosmetic flag, not a correctness-affecting one, going by every other
-    // use of push() in its own disassembly.
-    MainWindowController__push(mwc, static_cast<AbstractController*>(controller), true);
+    // use of push() in its own disassembly. `controller` is already
+    // `void*` (nfnickel.h no longer names an AbstractController type at
+    // all -- see its own comment on why -- these opaque call sites just
+    // spell the address as `void*` now), so no cast is needed here.
+    MainWindowController__push(mwc, controller, true);
     return true;
 }

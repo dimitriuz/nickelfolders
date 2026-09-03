@@ -62,19 +62,30 @@ bool nf_open_book(QString const& contentId);
 // with stage=4 and the correct dbName.
 bool nf_open_book_staged(QString const& contentId, QString const& dbName, int stage);
 
-// AbstractController is Nickel's base UI-controller class. Opaque per the
+// MainWindowController is Nickel's window-stack singleton. Opaque per the
 // house rule ("Nickel's classes stay opaque") -- typedef + explicitly
-// written call signatures, never a real C++ class. Kept here (unlike rung
-// 2's original version of this file) purely as the STATIC TYPE
-// MainWindowController::push's second parameter takes: this rung builds no
-// AbstractController-shaped object by hand at all. QuickAccessLibraryController
-// -- the real controller nfbrowser.cc constructs -- has AbstractController
-// as its PRIMARY base at offset 0 (confirmed: NickelGridLibraryControllerBase's
-// own ctor calls AbstractController::AbstractController() with `this` passed
-// straight through, no offset adjustment -- archaeology part 2, P2.2), so a
-// pointer to one IS, bit-for-bit, a valid AbstractController* with no cast
-// arithmetic needed.
-typedef void AbstractController;
+// written call signatures, never a real C++ class.
+//
+// AbstractController USED to be typedef'd void here too, for exactly the
+// same reason -- but nfview.cc's shim controller now needs a REAL class
+// literally NAMED AbstractController, at global scope, so that
+// MainWindowController::push's internal `__dynamic_cast(controller,
+// &_ZTI18AbstractController, &_ZTI7QObject, -2)` cross-cast finds a
+// matching type NAME in our object's own RTTI (Itanium ABI: the src_type
+// lookup is a `type_info::operator==`, which falls back to a byte-for-byte
+// `strcmp` of the mangled name when pointer identity fails across DSOs --
+// see nfview.cc's own header comment for the full derivation, and the
+// review that caught this: a shim class named anything else compiles,
+// links, and pushes, but the cast returns NULL, `topController()` stays
+// NULL, and Nickel never calls QObject::setParent on it either). That real
+// class can only live where it is actually defined (nfview.cc), so this
+// header no longer names a type here at all: every opaque use below that
+// used to say `AbstractController*` now says `void*` -- these call sites
+// (MainWindowController::push, QuickAccessLibraryController__ctor,
+// ArticleListLibraryController__ctor) never dereferenced an
+// AbstractController* as anything but an opaque address anyway, so nothing
+// about the ACTUAL signature changes, only the type NAME this header uses
+// to spell it.
 typedef void MainWindowController;
 
 // MainWindowController::sharedInstance() -- a lazily-constructed singleton
@@ -87,7 +98,7 @@ typedef void MainWindowController;
 // a QObject, with real RTTI Nickel's own compiler generated -- nothing here
 // fabricates that any more.
 extern void  *(*MainWindowController__sharedInstance)(void);
-extern void   (*MainWindowController__push)(MainWindowController *_this, AbstractController *controller, bool animate);
+extern void   (*MainWindowController__push)(MainWindowController *_this, void *controller, bool animate);
 
 // Which controller nf_browser_show_volumes (nfbrowser.cc) actually builds.
 // A device run pushed QuickAccessLibraryController successfully -- full-
@@ -117,7 +128,7 @@ extern void   (*MainWindowController__push)(MainWindowController *_this, Abstrac
 // directly against this binary for this rung (archaeology part 2, P2.2).
 // Proven on hardware (see NF_BROWSER_USE_ARTICLE_LIST above); kept only as
 // the comparison path now, not the one the trigger uses.
-extern void (*QuickAccessLibraryController__ctor)(AbstractController *_this, void const *source /* QSharedPointer<LibraryDataSource<Volume> > const& */);
+extern void (*QuickAccessLibraryController__ctor)(void *_this, void const *source /* QSharedPointer<LibraryDataSource<Volume> > const& */);
 
 // ArticleListLibraryController::ArticleListLibraryController(QSharedPointer
 // <LibraryDataSource<Volume> >) at 0xdcbe70 on 4.38.23684. sizeof == 92,
@@ -137,9 +148,10 @@ extern void (*QuickAccessLibraryController__ctor)(AbstractController *_this, voi
 // constructor itself: it calls no `sharedInstance()`, touches no shared
 // state, only `QObject::QObject` and its own field writes. No title
 // string, no extra QSharedPointer, no singleton read or write. `_this` is
-// typed AbstractController* for the same reason as
-// QuickAccessLibraryController__ctor, above.
-extern void (*ArticleListLibraryController__ctor)(AbstractController *_this, void const *source /* QSharedPointer<LibraryDataSource<Volume> > const& */);
+// `void*` for the same reason as QuickAccessLibraryController__ctor,
+// above -- see this header's own comment on why AbstractController is no
+// longer a type name declared here.
+extern void (*ArticleListLibraryController__ctor)(void *_this, void const *source /* QSharedPointer<LibraryDataSource<Volume> > const& */);
 
 // --- the shim controller's two raw AbstractController symbols -------------
 //
@@ -248,18 +260,40 @@ extern int (*AbstractController__allowedOrientations)(void const *_this);
 // returned in r0.
 extern int (*AbstractController__navSection)(void const *_this);
 
+// _ZTV18AbstractController itself -- 0x163ff70 on 4.38.23684, `nm -D` type
+// D (a DATA symbol, the only one this whole project resolves by name --
+// every other entry, here and in every other dlsym table, is a function).
+// dlsym works identically for data and function symbols, so this resolves
+// the SAME way as the nine function pointers above; what differs is only
+// how nfview.cc's nf_view_layout_check() USES it: reading the LIVE
+// vtable's own slots is what turns "these six symbols individually
+// resolved" into "these six symbols sit at the SLOT this shim's vtable
+// layout assumes" -- a firmware that shifted the slot order (inserted or
+// removed a virtual before size(), say) would still resolve all six
+// symbols individually by name, so the six dlsym entries ALONE cannot
+// catch that; comparing each against the live table's own slot can.
+// Points at the START of the vtable's Itanium ABI header (offset-to-top
+// word) -- NOT the "address point" (the vptr value every
+// AbstractController-shaped object actually stores at +0), which is this
+// address PLUS 8 (two header words) -- nf_view_layout_check() applies
+// that same +8 adjustment the real constructor's own disassembly does
+// (NOTES.md: `adds r3, #8` after loading this exact symbol).
+extern void *AbstractController__vtable;
+
 // True once every AbstractController symbol this shim needs has resolved
-// -- the original two (ctor, dtor1) AND these six. Deliberately ONE gate,
-// not eight independent ones: these six are no longer "nice to have" the
-// way most .optional entries in this project are -- a firmware missing
-// just size(), for instance, would silently fall back to a
-// default-constructed QSize(-1,-1) everywhere Nickel expects a real size,
-// which can lay a view out to nothing -- indistinguishable, on a
-// screenshot, from "the screen never appeared," which is exactly the kind
-// of wrong-place hunting this gate exists to prevent. So nf_browser_show()
-// (nfview.cc) refuses to push AT ALL if any of these eight is missing,
-// rather than pushing a controller with some slots silently reverted to
-// placeholder behaviour.
+// -- the original two (ctor, dtor1), the six forwarded slots, AND the
+// vtable data symbol above (nine total). Deliberately ONE gate, not nine
+// independent ones: none of these is "nice to have" the way most
+// .optional entries in this project are -- a firmware missing just
+// size(), for instance, would silently fall back to a default-constructed
+// QSize(-1,-1) everywhere Nickel expects a real size, which can lay a
+// view out to nothing -- indistinguishable, on a screenshot, from "the
+// screen never appeared," which is exactly the kind of wrong-place
+// hunting this gate exists to prevent. So nf_browser_show() (nfview.cc)
+// refuses to push AT ALL if any of these nine is missing, rather than
+// pushing a controller with some slots silently reverted to placeholder
+// behaviour, or skipping the vtable-slot cross-check that is this file's
+// real runtime layout mitigation (see nf_view_layout_check(), nfview.cc).
 //
 // A THIRD, independent gate from nf_nickel_resolve()/nf_browser_resolve()
 // (book-opening; the borrowed-controller route) -- a firmware that breaks

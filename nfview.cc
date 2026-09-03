@@ -35,19 +35,61 @@
 // at all -- they are relationships between TYPES, not values a function
 // signature can carry.
 //
-// WHAT STAYS OPAQUE: everything else. The eight raw AbstractController
+// WHAT STAYS OPAQUE: everything else. The nine raw AbstractController
 // symbols this file calls (nfnickel.h/.cc: AbstractController__ctor,
 // __dtor1, __size, __viewWillAppear, __viewWillDisappear,
-// __viewWillBeDestroyed, __allowedOrientations, __navSection) are resolved
-// and called exactly like every other libnickel entry point in this
-// project -- an explicit signature, never a redeclared method, NULL-gated,
-// .optional = true in the shared dlsym table. It is ONLY
-// NFAbstractControllerShim/NFController -- a class this file itself
-// declares, not a redeclaration of any real Nickel class -- that bends the
-// rule, and only for the one property that rule cannot express (a type
-// relationship, not a call signature).
+// __viewWillBeDestroyed, __allowedOrientations, __navSection, __vtable)
+// are resolved and called/read exactly like every other libnickel entry
+// point in this project -- an explicit signature, never a redeclared
+// method, NULL-gated, .optional = true in the shared dlsym table. It is
+// ONLY AbstractController/NFController -- classes this file itself
+// declares, not a redeclaration of any real Nickel class's INTERNALS --
+// that bend the rule, and only for the one property that rule cannot
+// express (a type relationship, not a call signature).
 //
-// WHY SIX OF THOSE EIGHT ARE FORWARDED, NOT STUBBED -- read this before
+// CRITICAL: THE SHIM'S PRIMARY BASE MUST BE NAMED EXACTLY
+// `AbstractController`, AT GLOBAL (NOT ANONYMOUS-NAMESPACE) SCOPE -- found
+// in review, and the reason is worth carrying in full because it is easy
+// to "simplify" back to a private, differently-named class without
+// noticing anything broke. MainWindowController::push does not merely
+// null-check its cast to QObject* -- it is a genuine Itanium ABI
+// CROSS-CAST: `__dynamic_cast(controller, &_ZTI18AbstractController,
+// &_ZTI7QObject, -2)` (0xeaacc4-0xeaacde). The src2dst hint of -2 means
+// "no downcast fallback" -- the algorithm MUST find a base in the
+// object's own RTTI hierarchy whose TYPE NAME matches `src_type`
+// (`_ZTI18AbstractController`, Nickel's OWN, already-compiled type_info
+// object) via `type_info::operator==`, which falls back to a byte-for-byte
+// `strcmp` of the mangled NAME STRING when pointer identity fails (as it
+// always will here -- our RTTI and Nickel's live in two different shared
+// libraries, at two different addresses, no matter what the class is
+// named). A class named anything else -- NFAbstractControllerShim, in an
+// earlier draft -- COMPILES, LINKS, and PUSHES onto the window stack
+// (slot 8/`+32` still gets called, the widget still gets built), but the
+// cross-cast returns NULL: `push` appends `{d=0, value=0}` to its window
+// stack, so `topController()` returns NULL and back has nothing to pop --
+// and the SAME failed cast, at a second call site (0xea9174), skips
+// `QObject::setParent(controller, view)`, which is how Nickel actually
+// takes ownership of a pushed controller (see nf_browser_show()'s own
+// ownership comment for what that means for this file). The screen would
+// have appeared, unowned, with a dead back arrow -- a failure mode
+// invisible in a screenshot and easy to blame on something else entirely.
+// The class below is named `AbstractController`, matching Nickel's own
+// name byte-for-byte, at plain global scope (an anonymous namespace would
+// make GCC prefix the mangled name with `*`, per the Itanium ABI's own
+// convention for internal-linkage types, which forces POINTER comparison
+// -- exactly the comparison guaranteed to fail across two separately
+// compiled shared libraries -- so anonymous-namespace wrapping would
+// silently reintroduce this exact bug). `-fvisibility=hidden` (this
+// project's own default, Makefile) keeps this class's own vtable/RTTI/
+// constructor/destructor SYMBOLS out of this .so's dynamic symbol table,
+// so there is no risk of colliding with Nickel's OWN, separately exported
+// `_ZN18AbstractControllerC1Ev` and friends at the DYNAMIC LINKER level --
+// hidden visibility only affects whether another shared library could
+// look this symbol UP by name; it has no bearing on the NAME STRING
+// baked into our own RTTI data, which is the only thing the cross-cast
+// above ever reads.
+//
+// WHY SIX OF THOSE NINE ARE FORWARDED, NOT STUBBED -- read this before
 // "simplifying" size()/viewWillAppear()/viewWillDisappear()/
 // viewWillBeDestroyed()/allowedOrientations()/navSection() back into
 // placeholders. The ENTIRE reason the earlier, abandoned plan copied
@@ -70,38 +112,54 @@
 // refuses to push the controller at all in that case, so the fallback is
 // belt-and-braces, not the expected path.
 //
-// THE THREE MITIGATIONS this task's brief requires, because a bent rule
-// still owes the purpose it was protecting:
-//   1. static_assert(sizeof(NFAbstractControllerShim) == 12, ...) below --
+// THE MITIGATIONS this task's brief requires, because a bent rule still
+// owes the purpose it was protecting -- REVISED IN REVIEW, because the
+// original three overstated what the compile-time check alone proves:
+//   1. static_assert(sizeof(AbstractController) == 12, ...) below --
 //      compile-time proof this shim's OWN layout is what it claims to be.
-//   2. nf_view_layout_check() below -- a RUNTIME proof that the REAL,
-//      resolved AbstractController::AbstractController() -- not this
-//      comment, not the measurement it is based on -- still writes
-//      exactly the 12 bytes this shim depends on, on THIS firmware build,
-//      before the shim is ever pushed onto Nickel's window stack. A
-//      mismatch disarms nf_browser_show(): logs loudly, refuses to push,
-//      rather than trusting a possibly-stale measurement. This is the
-//      "loud failure instead of a silent miscompile" CLAUDE.md's opacity
-//      rule exists to guarantee, reconstructed by other means for the one
-//      case the rule itself cannot cover.
+//      WEAK, and known to be weak: sizeof(vptr + two pointers) is 12 on
+//      this ABI unconditionally, so this can only ever catch a LOCAL
+//      HAND-EDIT (an extra field added to this class) -- it CANNOT catch
+//      a firmware where Nickel's real AbstractController changed size,
+//      because it never reads anything from libnickel.so at all. Kept
+//      because it is free and does catch its one real case, but it is
+//      NOT the layout mitigation -- (2) is.
+//   2. nf_view_layout_check() below -- THE real, load-bearing runtime
+//      mitigation, doing TWO independent things against THIS firmware's
+//      actual, live libnickel.so, neither trusted from a comment: (a)
+//      the real constructor's write pattern, compared EXACTLY against the
+//      real vtable's own address point (not merely "changed from a
+//      poison byte" -- an earlier draft's version of this check was
+//      exactly that vacuous, caught in review); and (b) the real vtable's
+//      own SLOT CONTENTS at [0] and [2..7], compared against the six
+//      forwarded symbols resolved independently by NAME -- the check that
+//      actually validates the SLOT ORDER this shim's hand-written virtual
+//      function order assumes, which (a) and the six individual dlsym
+//      resolutions cannot: a firmware that inserted or removed one
+//      virtual before size() would still resolve every symbol by name
+//      (their addresses would not change), while silently shifting every
+//      slot this shim depends on. A mismatch in either (a) or (b) disarms
+//      nf_browser_show(): logs loudly, refuses to push, rather than
+//      trusting a possibly-stale measurement. See nf_view_layout_check()'s
+//      own comment for the full account of both.
 //   3. This comment.
 //
 // RE-MEASURE ON A FIRMWARE BUMP: sizeof(AbstractController) (NOTES.md's
 // three independent readings -- the constructor's own writes, and two
 // independent derived-controller offsets that agree with them), whether
-// _ZN18AbstractControllerC2Ev / D1Ev / the six forwarded symbols
-// (nfnickel.h has every address) still exist and still do what this file
-// and NOTES.md describe, and the vtable slot order (9 slots: 2 compiler-
-// managed destructors, then size()/viewWillAppear()/viewWillDisappear()/
-// viewWillBeDestroyed()/allowedOrientations()/navSection(), then the one
-// pure virtual AbstractController::ensureViewLoaded (0xad1408) actually
-// calls). nf_view_layout_check() catches a changed CTOR-WRITE PATTERN
-// automatically, every time nf_browser_show() first runs; it cannot catch
-// a changed VTABLE SLOT COUNT/ORDER or a changed CALLING CONVENTION for
-// one of the six forwards (e.g. size() no longer needing a hidden return
-// buffer), which are device/re-disassembly questions a firmware bump
-// would raise (see this task's report for what a device run alone can
-// settle).
+// _ZN18AbstractControllerC2Ev / D1Ev / the six forwarded symbols / the
+// vtable data symbol itself (nfnickel.h has every address) still exist
+// and still do what this file and NOTES.md describe, and whether
+// `_ZTS18AbstractController`/`_ZTI18AbstractController` still exist and
+// still describe a class with QObject reachable as a PUBLIC base (the
+// cross-cast this whole file exists to satisfy). nf_view_layout_check()
+// catches a changed CTOR-WRITE PATTERN and a changed VTABLE SLOT
+// ORDER/CONTENT for the six forwards automatically, every time
+// nf_browser_show() first runs; it cannot catch a changed CALLING
+// CONVENTION for one of the six (e.g. size() no longer needing a hidden
+// return buffer) or a changed RTTI/inheritance shape for the cross-cast
+// itself, which are device/re-disassembly questions a firmware bump would
+// raise (see this task's report for what a device run alone can settle).
 
 #include "nfview.h"
 #include "nfnickel.h"
@@ -119,6 +177,19 @@
 #include <NickelHook.h>
 
 // --- the shim class ---------------------------------------------------
+//
+// Named `AbstractController`, at global scope, ON PURPOSE -- not a style
+// choice. See this file's own "CRITICAL" header comment above for the
+// full derivation: MainWindowController::push performs a genuine Itanium
+// ABI cross-cast whose src_type lookup is a mangled-NAME comparison
+// (`strcmp`-based `type_info::operator==`), so this class's RTTI must
+// carry the exact string "AbstractController" for that cast to succeed.
+// This is NOT a redeclaration of Nickel's real AbstractController class
+// (its actual members, beyond the 12 bytes measured here, are unknown and
+// irrelevant) -- it is a class this file defines from scratch that
+// happens to share Nickel's own class's NAME, because the name itself,
+// not any internal layout beyond what NOTES.md measured, is what the
+// cross-cast reads.
 //
 // Layout, top to bottom, mirrors AbstractController's own measured 12
 // bytes EXACTLY (NOTES.md, "sizeof(AbstractController) == 12 bytes --
@@ -152,10 +223,10 @@
 // guess CLAUDE.md's opacity rule exists to guard against: it is the exact
 // function whose disassembly, inside Nickel's OWN loadView(), is what
 // established this field order and read-order in the first place.
-class NFAbstractControllerShim {
+class AbstractController {
 public:
-    NFAbstractControllerShim() : nf_weak_d(0), nf_weak_widget(0) {}
-    virtual ~NFAbstractControllerShim() {}
+    AbstractController() : nf_weak_d(0), nf_weak_widget(0) {}
+    virtual ~AbstractController() {}
 
     // Slots 2-7 of AbstractController's own vtable (NOTES.md: "+8 size(),
     // +12 viewWillAppear(), +16 viewWillDisappear(), +20
@@ -174,8 +245,8 @@ public:
     // to an IDENTICAL observable value rather than a different one --
     // this is defence in depth: nf_view_resolve() (nfnickel.cc) already
     // refuses to push the controller at all unless every one of these
-    // eight symbols resolved, so the fallback path is not expected to run
-    // in practice.
+    // nine symbols resolved (the ctor, dtor1, these six, and __vtable),
+    // so the fallback path is not expected to run in practice.
     virtual QSize size() {
         QSize s; // QSize()'s own constexpr ctor already yields (-1,-1) --
                   // the SAME sentinel the real implementation writes, so
@@ -225,26 +296,31 @@ protected:
     QWidget                               *nf_weak_widget;
 };
 
-// Mitigation (1): build-time proof this shim's OWN layout matches the
-// measured AbstractController layout. Catches a hand-edit that adds a
-// field to NFAbstractControllerShim, or a QWeakPointer<T> that somehow
-// stops being 8 bytes on some future Qt, at COMPILE time, on every build.
-// Does NOT catch a firmware that changes AbstractController's OWN, real
-// size -- that is what nf_view_layout_check() (below) is for; the two
-// checks are deliberately complementary, not redundant.
-static_assert(sizeof(NFAbstractControllerShim) == 12,
-              "NFAbstractControllerShim must match AbstractController's "
-              "measured 12-byte layout (NOTES.md, Task 7 rung 2, 0xad1334) "
-              "-- re-measure before changing this");
+// Mitigation (1) -- WEAK, and known to be weak (see the header comment's
+// "THE MITIGATIONS" section for the full account of why this alone is not
+// the layout mitigation): build-time proof this shim's OWN layout matches
+// the measured AbstractController layout. Catches a hand-edit that adds a
+// field to this class, or a QWeakPointer<T> that somehow stops being 8
+// bytes on some future Qt, at COMPILE time. Cannot catch, and was never
+// able to catch, a firmware that changes AbstractController's OWN, real
+// size -- sizeof(vptr + two pointers) is 12 on this ABI unconditionally,
+// so this assertion is checking THIS FILE against ITSELF, not against
+// libnickel.so at all. nf_view_layout_check() (below) is the real,
+// firmware-facing mitigation.
+static_assert(sizeof(AbstractController) == 12,
+              "AbstractController (this file's own shim class) must match "
+              "the REAL AbstractController's measured 12-byte layout "
+              "(NOTES.md, Task 7 rung 2, 0xad1334) -- re-measure before "
+              "changing this");
 
 // Nickel's own layout convention for a controller of this shape
 // (NOTES.md / this task's brief: "AbstractController at offset 0, QObject
 // at +12, with a secondary vtable group carrying _ZThn12_ QObject
 // thunks") -- mirrored here as ordinary C++ multiple inheritance, so the
 // COMPILER builds the equivalent thunks itself; nothing here reaches for
-// offset arithmetic to find QObject's subobject. AbstractControllerShim is
+// offset arithmetic to find QObject's subobject. AbstractController is
 // listed FIRST so it is the primary base: a pointer to an NFController IS,
-// bit for bit, a valid pointer to its AbstractControllerShim subobject --
+// bit for bit, a valid pointer to its AbstractController subobject --
 // the same "no cast arithmetic needed" property nfnickel.h already
 // documents for QuickAccessLibraryController's real base.
 //
@@ -255,11 +331,22 @@ static_assert(sizeof(NFAbstractControllerShim) == 12,
 // that is ordinary C++ RTTI, generated for any polymorphic type, and needs
 // nothing from QObject's metaobject/signal-slot machinery, which nothing
 // here uses.
-class NFController : public NFAbstractControllerShim, public QObject {
+class NFController : public AbstractController, public QObject {
 public:
-    NFController() : NFAbstractControllerShim(), QObject(0) {}
+    NFController() : AbstractController(), QObject(0) {}
 
     ~NFController() {
+        // WHEN does this run? Not from anything in this file -- see
+        // nf_browser_show()'s own "OWNERSHIP" comment for the full
+        // account. Short version: once Critical 1's fix (this class being
+        // named exactly `AbstractController`) makes MainWindowController::
+        // push's internal cross-cast succeed, Nickel's own
+        // QObject::setParent call makes this object a real child in Qt's
+        // parent/child tree, and Qt's own `delete` of that parent tree,
+        // whenever it happens, is what invokes this destructor -- through
+        // this object's REAL vtable, which is why it correctly reaches
+        // HERE rather than some default QObject teardown.
+        //
         // Disassembled for this task (0xad1358) -- and this is NOT a
         // no-op, unlike the ctor: D1Ev reads this[+4] (our nf_weak_d),
         // atomically decrements its FIRST word (an ldrex/strex CAS loop --
@@ -344,16 +431,47 @@ public:
     }
 };
 
-// --- mitigation (2): the runtime layout check -----------------------------
+// --- mitigation (2): the runtime layout check -- THE real one ------------
 //
-// Proves, at runtime, against THIS firmware's actual
-// AbstractController::AbstractController() -- not the measurement above --
-// that it still writes exactly the 12 bytes this shim's layout depends on,
-// before the shim is ever pushed onto Nickel's real window stack. Run
-// LAZILY (on nf_browser_show()'s first call, not at nf_init()), matching
-// nf_nickel_resolve()/nf_browser_resolve()'s own pattern of being cheap,
-// side-effect-free gates nf_init only LOGS the status of -- the deeper
-// write-pattern exercise below is reserved for the one feature it guards.
+// Two independent, non-vacuous checks, both against THIS firmware's
+// actual, live libnickel.so -- not trusted from the measurements and
+// comments elsewhere in this file. Run LAZILY (on nf_browser_show()'s
+// first call, not at nf_init()), matching nf_nickel_resolve()/
+// nf_browser_resolve()'s own pattern of being cheap, side-effect-free
+// gates nf_init only LOGS the status of.
+//
+// (a) THE CONSTRUCTOR'S WRITE PATTERN, EXACTLY -- not merely "wrote
+//     something". An earlier draft of this function accepted ANY write
+//     to this[+0] as proof the vptr was set ("words[0] !=
+//     0xCDCDCDCD"), which is near-vacuous: a constructor that wrote
+//     garbage, or the WRONG vtable's address, would pass identically to
+//     one that wrote the right one. Caught in review. Fixed by comparing
+//     against the REAL vtable's own address point (realSlots itself,
+//     see below) -- the EXACT value the real constructor's own
+//     disassembly writes into this[+0] (NOTES.md) -- so this is now a
+//     genuine equality check, not a "did anything happen" one.
+// (b) THE VTABLE'S OWN SLOT CONTENTS, independently of (a): the six
+//     symbols this file forwards to (AbstractController__size and
+//     friends) were each resolved by NAME (nh_dlsym, nfnickel.cc). That
+//     proves each symbol EXISTS somewhere in libnickel.so -- it does NOT
+//     prove any of them sits at the VTABLE SLOT this shim's own
+//     hand-written virtual function ORDER (and therefore Nickel's own
+//     calling convention for it -- e.g. ensureViewLoaded's `ldr
+//     r3,[r3,#32]` for slot 8) assumes it does. A firmware that inserted
+//     or removed one virtual function anywhere before size(), for
+//     instance, would still resolve all six symbols individually by
+//     name -- their addresses would not change -- while silently
+//     shifting every SLOT this shim's layout depends on, and neither (a)
+//     nor the six dlsym resolutions alone could tell the difference.
+//     THIS is the check that can: it reads the LIVE, already-relocated
+//     `_ZTV18AbstractController` table (AbstractController__vtable,
+//     resolved by nfnickel.cc -- a genuine exported DATA symbol, `nm -D`
+//     type D, at 0x163ff70 on 4.38.23684) and compares each slot's
+//     CONTENT against the same six resolved-by-name pointers --
+//     cross-validating two independent ways of finding "the address of
+//     AbstractController::size()" (etc.) that have no reason to agree
+//     with each other unless the slot this shim assumes really is the
+//     slot Nickel's own live vtable puts it at.
 static bool nf_view_layout_checked = false;
 static bool nf_view_layout_ok      = false;
 
@@ -362,17 +480,37 @@ static bool nf_view_layout_check() {
         return nf_view_layout_ok;
     nf_view_layout_checked = true;
 
+    // nf_view_resolve() (nfnickel.cc) already requires all NINE symbols
+    // this function touches -- the ctor, dtor1, the six forwards, and
+    // __vtable -- so every pointer used below this point is guaranteed
+    // non-NULL; no further per-call NULL-gating is needed inside this
+    // function specifically (contrast the shim class's OWN methods,
+    // which NULL-gate independently because they can be reached even if
+    // this check were somehow bypassed).
     if (!nf_view_resolve()) {
-        nh_log("view: AbstractController ctor/dtor symbols did not resolve, refusing the layout check");
+        nh_log("view: an AbstractController symbol did not resolve, refusing the layout check");
         return false;
     }
 
+    // _ZTV18AbstractController resolves to the START of the vtable's
+    // Itanium ABI header (offset-to-top word), NOT the "address point"
+    // every AbstractController-shaped object actually stores at this[+0]
+    // -- the header is TWO words (offset-to-top, RTTI pointer) before the
+    // address point. +8 mirrors the SAME adjustment the real
+    // constructor's own disassembly makes (`adds r3, #8` after loading
+    // this exact symbol's GOT-relocated address, NOTES.md) -- not a
+    // separately guessed offset. realSlots[0] is D1, realSlots[1] is D0
+    // (unchecked below -- this file never resolves D0Ev, see nfnickel.h),
+    // realSlots[2..7] are the six forwarded slots, realSlots[8] is the
+    // pure virtual nf_load_view's real counterpart occupies.
+    void * const *realSlots = reinterpret_cast<void* const*>(
+        reinterpret_cast<char const*>(AbstractController__vtable) + 8);
+
     // 64 bytes: the SAME over-allocation margin CLAUDE.md asks for every
-    // Nickel constructor call (nf_open_book_staged's volbuf, this file's
-    // own controller allocation below) -- the real ctor is measured to
-    // write only 12 bytes, but this being throwaway scratch memory rather
-    // than a live, pushed object is exactly why the margin costs nothing
-    // here either.
+    // Nickel constructor call (nf_open_book_staged's volbuf) -- the real
+    // ctor is measured to write only 12 bytes, but this being throwaway
+    // scratch memory rather than a live, pushed object is exactly why the
+    // margin costs nothing here either.
     unsigned char scratch[64] __attribute__((aligned(8)));
     // Poison, not zero: the ctor's own measured writes are this[+4]=0 and
     // this[+8]=0 (NOTES.md), which is INDISTINGUISHABLE from "never wrote
@@ -384,8 +522,11 @@ static bool nf_view_layout_check() {
 
     AbstractController__ctor(scratch);
 
-    unsigned int *words = reinterpret_cast<unsigned int*>(scratch);
-    bool vptrWritten     = words[0] != 0xCDCDCDCDu; // this[+0]: some non-poison vptr
+    // (a), exact -- see this function's own header comment for what the
+    // earlier, near-vacuous version of this specific check missed.
+    void * const *scratchPtrs = reinterpret_cast<void* const*>(scratch);
+    bool vptrCorrect     = scratchPtrs[0] == reinterpret_cast<void const*>(realSlots);
+    unsigned int const *words = reinterpret_cast<unsigned int const*>(scratch);
     bool plus4Zero       = words[1] == 0u;          // this[+4]: measured zero
     bool plus8Zero       = words[2] == 0u;          // this[+8]: measured zero
     bool plus12Untouched = words[3] == 0xCDCDCDCDu; // this[+12]: must NOT be written --
@@ -398,19 +539,37 @@ static bool nf_view_layout_check() {
     // scratch memory the ctor just initialised, so a firmware where D1Ev
     // itself is broken is caught here too, rather than the first time a
     // real, pushed controller is destroyed.
-    if (AbstractController__dtor1)
-        AbstractController__dtor1(scratch);
+    AbstractController__dtor1(scratch);
 
-    if (!vptrWritten || !plus4Zero || !plus8Zero || !plus12Untouched) {
-        nh_log("view: AbstractController's real ctor wrote scratch[0..15] = "
-               "%08x %08x %08x %08x, not the measured vptr/0/0/untouched "
-               "pattern -- the 12-byte layout assumption is STALE on this "
-               "firmware, refusing to build the shim controller",
-               words[0], words[1], words[2], words[3]);
+    // (b), the check that actually validates the SLOT ORDER -- see this
+    // function's own header comment for the full argument. Slot [0] (D1)
+    // is included as a free bonus beyond what was specifically asked for,
+    // since it costs nothing once realSlots is resolved; slot [1] (D0) is
+    // NOT checked, because this file never resolves D0Ev at all (there is
+    // nothing to cross-validate it against); slot [8] can only be checked
+    // for non-nullness -- it is `__cxa_pure_virtual`, an external
+    // libstdc++ symbol this file has no reason to resolve just to compare
+    // against itself.
+    bool slotsMatch =
+        realSlots[0] == reinterpret_cast<void*>(AbstractController__dtor1) &&
+        realSlots[2] == reinterpret_cast<void*>(AbstractController__size) &&
+        realSlots[3] == reinterpret_cast<void*>(AbstractController__viewWillAppear) &&
+        realSlots[4] == reinterpret_cast<void*>(AbstractController__viewWillDisappear) &&
+        realSlots[5] == reinterpret_cast<void*>(AbstractController__viewWillBeDestroyed) &&
+        realSlots[6] == reinterpret_cast<void*>(AbstractController__allowedOrientations) &&
+        realSlots[7] == reinterpret_cast<void*>(AbstractController__navSection) &&
+        realSlots[8] != 0;
+
+    if (!vptrCorrect || !plus4Zero || !plus8Zero || !plus12Untouched || !slotsMatch) {
+        nh_log("view: AbstractController layout check FAILED -- vptrCorrect=%d plus4Zero=%d "
+               "plus8Zero=%d plus12Untouched=%d slotsMatch=%d -- the layout or vtable-slot "
+               "assumption is STALE on this firmware, refusing to build the shim controller",
+               vptrCorrect, plus4Zero, plus8Zero, plus12Untouched, slotsMatch);
         return false;
     }
 
-    nh_log("view: AbstractController layout check passed (12 bytes: vptr, 0, 0, untouched+12)");
+    nh_log("view: AbstractController layout check passed (12-byte ctor write pattern, "
+           "exact vptr, AND all six forwarded vtable slots confirmed)");
     nf_view_layout_ok = true;
     return true;
 }
@@ -443,30 +602,70 @@ bool nf_browser_show(void) {
     void *mem = ::operator new(512);
     memset(mem, 0, 512);
 
-    // The pattern this task's brief describes: call the REAL, resolved
-    // AbstractController ctor on the raw memory FIRST, so Nickel's own
-    // initialisation genuinely runs (measured -- and, moments ago,
-    // RE-verified on this boot by nf_view_layout_check() above -- to write
-    // exactly this[+0]=Nickel's OWN transient vptr, this[+4]=0, this[+8]=0)
-    // -- THEN placement-new the real C++ object on top, which immediately
-    // overwrites this[+0] with OUR OWN vtable pointer as an ordinary side
-    // effect of construction (the compiler's own constructor prologue sets
-    // the vptr for the class currently under construction, before running
-    // any user-written body). This is exactly "the two vtable writes"
-    // NOTES.md documents as standard for every one of Nickel's own
-    // controllers -- base ctor sets the base vtable, derived ctor resets
-    // it -- the mechanism is identical; only who performs the second write
-    // differs (the C++ compiler here, Nickel's own derived-controller code
-    // there).
-    AbstractController__ctor(mem);
+    // AbstractController__ctor is NOT called here, UNLIKE an earlier
+    // draft of this function -- that draft's comment claimed calling it
+    // meant "Nickel's own initialisation genuinely runs", which was
+    // false, caught in review (this project has now hit that exact class
+    // of mistake -- a comment asserting something the code does not do --
+    // three times; see the review that flagged it for the tally). The
+    // call would be INERT here: the placement-new immediately below
+    // overwrites this[0]/[4]/[8] as an ordinary part of NFController's
+    // own construction regardless -- the compiler sets the vptr;
+    // AbstractController's own member-initialiser list zeroes nf_weak_d/
+    // nf_weak_widget to the same zero the real ctor would have written --
+    // and the real ctor is MEASURED (NOTES.md) to do NOTHING beyond
+    // writing those same three words. So calling it here first would
+    // write values placement-new immediately discards a moment later,
+    // achieving nothing observable. It IS still called, separately,
+    // inside nf_view_layout_check() above -- but that is a DIAGNOSTIC use
+    // against THROWAWAY scratch memory (does the real ctor still write
+    // what this shim assumes, on THIS firmware?), not an initialisation
+    // one, and the two purposes should not be conflated the way the
+    // earlier comment did.
     NFController *ctrl = new (mem) NFController();
 
     nh_log("view: pushing the shim controller");
-    // ctrl's AbstractControllerShim base is its FIRST base (no virtual
+    // ctrl's AbstractController base is its FIRST base (no virtual
     // inheritance anywhere in this hierarchy), so this address equals
-    // `ctrl` itself -- no cast arithmetic, the same "no cast arithmetic
-    // needed" property nfnickel.h already documents for
-    // QuickAccessLibraryController's real base.
-    MainWindowController__push(mwc, static_cast<AbstractController*>(static_cast<void*>(ctrl)), true);
+    // `ctrl` itself -- no cast arithmetic would technically be required.
+    // The two-step cast (through AbstractController* explicitly, THEN to
+    // void*) is kept anyway to spell out WHICH subobject is meant, rather
+    // than relying on that coincidence of layout -- the same "no cast
+    // arithmetic needed" property nfnickel.h already documents for
+    // QuickAccessLibraryController's real base, made explicit instead of
+    // implicit now that AbstractController is a real, nameable type in
+    // this file.
+    void *controllerBase = static_cast<void*>(static_cast<AbstractController*>(ctrl));
+
+    // OWNERSHIP -- read this before "fixing" what looks like a leak.
+    // `mem` is never freed by this function, and `ctrl` is never
+    // `delete`d anywhere in this file. Before Critical 1 (this class
+    // being named exactly `AbstractController`, at global scope -- see
+    // this file's own header comment for the full derivation),
+    // MainWindowController::push's internal cross-cast to QObject*
+    // FAILED, which skips `QObject::setParent(controller, view)` --
+    // Nickel's own mechanism for taking ownership of a pushed controller
+    // -- so this object genuinely WAS a permanent leak (512 bytes plus
+    // its refcount header, per call). WITH Critical 1's fix, the
+    // cross-cast succeeds, `setParent` runs, and this object becomes a
+    // real child in Qt's own parent/child tree: Qt deletes a child
+    // whenever ITS parent is destroyed, and that `delete` reaches THIS
+    // object through its REAL vtable, correctly running `~NFController()`
+    // (which correctly tears down nf_weak_d/nf_weak_widget and calls the
+    // resolved AbstractController__dtor1 -- see that destructor's own
+    // comment) and then `operator delete` on the SAME address
+    // `::operator new(512)` returned above (a deleting destructor always
+    // recovers the complete object's own start address before
+    // deallocating, regardless of which base subobject pointer was used
+    // to reach it -- so the 512-vs-sizeof(NFController) mismatch above is
+    // not a problem here either).
+    //
+    // So: this object is NOT a leak once Critical 1 is in effect (i.e.
+    // right now, in this build) -- and NOTHING in this file should ever
+    // call `delete ctrl` (or `delete controllerBase`) directly. Doing so
+    // would race, or outright double-free, against Qt's own
+    // parent-driven deletion, which is now the ONLY thing responsible for
+    // this object's lifetime once `push` hands it off below.
+    MainWindowController__push(mwc, controllerBase, true);
     return true;
 }

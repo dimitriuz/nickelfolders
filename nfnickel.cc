@@ -69,14 +69,14 @@ static QString const *(*Device__getDbName)(Device const *_this);
 // ArticleListLibraryController the one actually used, with
 // QuickAccessLibraryController kept resolved only for comparison.
 void  *(*MainWindowController__sharedInstance)(void);
-void   (*MainWindowController__push)(MainWindowController *_this, AbstractController *controller, bool animate);
-void   (*QuickAccessLibraryController__ctor)(AbstractController *_this, void const *source);
-void   (*ArticleListLibraryController__ctor)(AbstractController *_this, void const *source);
+void   (*MainWindowController__push)(MainWindowController *_this, void *controller, bool animate);
+void   (*QuickAccessLibraryController__ctor)(void *_this, void const *source);
+void   (*ArticleListLibraryController__ctor)(void *_this, void const *source);
 
-// The shim controller's eight raw AbstractController symbols -- see
+// The shim controller's nine raw AbstractController symbols -- see
 // nfnickel.h's own comment on each for what they are and why they are
 // still resolved by name rather than assumed. NOT static, same reason as
-// the four above: nfview.cc calls all eight directly.
+// the four above: nfview.cc calls all nine directly.
 void   (*AbstractController__ctor)(void *_this);
 void   (*AbstractController__dtor1)(void *_this);
 void   (*AbstractController__size)(void *sretQSize, void const *_this);
@@ -85,6 +85,14 @@ void   (*AbstractController__viewWillDisappear)(void *_this);
 void   (*AbstractController__viewWillBeDestroyed)(void *_this);
 int    (*AbstractController__allowedOrientations)(void const *_this);
 int    (*AbstractController__navSection)(void const *_this);
+// _ZTV18AbstractController itself -- a DATA symbol (`nm -D` type D), not a
+// function pointer, unlike every other entry in this table. See
+// nfnickel.h's own comment for why nf_view_layout_check() (nfview.cc)
+// needs it: reading the LIVE vtable's own slots is what turns "these six
+// symbols resolved" into "these six symbols are at the SLOT this shim
+// assumes," the non-vacuous check a firmware with a shifted vtable
+// (a virtual inserted or removed before size()) needs to be caught by.
+void   *AbstractController__vtable;
 
 // Nickel's classes stay opaque, same discipline as Volume/ReadBookActionProxy
 // above: these are the four classes the rung 2 data-source chain constructs,
@@ -163,6 +171,7 @@ struct nh_dlsym NFNickelDlsym[] = {
     {.name = "_ZN18AbstractController19viewWillBeDestroyedEv", .out = nh_symoutptr(AbstractController__viewWillBeDestroyed), .desc = "AbstractController::viewWillBeDestroyed", .optional = true},
     {.name = "_ZNK18AbstractController19allowedOrientationsEv", .out = nh_symoutptr(AbstractController__allowedOrientations), .desc = "AbstractController::allowedOrientations", .optional = true},
     {.name = "_ZNK18AbstractController10navSectionEv",       .out = nh_symoutptr(AbstractController__navSection),  .desc = "AbstractController::navSection",         .optional = true},
+    {.name = "_ZTV18AbstractController",                     .out = nh_symoutptr(AbstractController__vtable),      .desc = "AbstractController's own vtable (data symbol)", .optional = true},
     {.name = "_ZN7QVectorI6VolumeE6appendERKS0_",             .out = nh_symoutptr(QVectorVolume__append),           .desc = "QVector<Volume>::append",                .optional = true},
     {.name = "_ZN7QVectorI6VolumeED1Ev",                      .out = nh_symoutptr(QVectorVolume__dtor),             .desc = "QVector<Volume>::~QVector",              .optional = true},
     {.name = "_ZN20InMemoryDataProviderI6VolumeEC1ERK7QVectorIS0_E", .out = nh_symoutptr(InMemoryDataProvider__ctor), .desc = "InMemoryDataProvider<Volume>::InMemoryDataProvider", .optional = true},
@@ -209,17 +218,19 @@ bool nf_browser_resolve(void) {
 
 // A fourth independent gate, for the shim controller (nfview.cc) only --
 // see nfnickel.h's comment on AbstractController__ctor/__dtor1/the six
-// forwarded slots for why this stays disjoint from the other three
-// (nf_nickel_resolve, nf_browser_resolve) and why ALL EIGHT symbols gate
-// together rather than degrading slot-by-slot: the six forwarded slots are
-// not optional-to-behaviour the way most .optional entries in this project
-// are (nfnickel.h's own comment has the full argument -- size() falling
-// back to a placeholder can lay the view out to nothing). This checks only
-// that the SYMBOLS resolved; it does not run the deeper runtime
-// write-pattern check (nf_view_layout_check, nfview.cc) -- that needs to
-// call through the ctor specifically, which this function deliberately
-// does not do, matching nf_nickel_resolve/nf_browser_resolve's own pattern
-// of being a cheap, side-effect-free predicate nf_init can log at boot.
+// forwarded slots/__vtable for why this stays disjoint from the other
+// three (nf_nickel_resolve, nf_browser_resolve) and why ALL NINE symbols
+// gate together rather than degrading slot-by-slot: the six forwarded
+// slots are not optional-to-behaviour the way most .optional entries in
+// this project are (nfnickel.h's own comment has the full argument --
+// size() falling back to a placeholder can lay the view out to nothing),
+// and __vtable is what makes the real, non-vacuous runtime check possible
+// at all. This checks only that the SYMBOLS resolved; it does not run the
+// deeper runtime write-pattern/vtable-slot check (nf_view_layout_check,
+// nfview.cc) -- that needs to call through the ctor and read through
+// __vtable, which this function deliberately does not do, matching
+// nf_nickel_resolve/nf_browser_resolve's own pattern of being a cheap,
+// side-effect-free predicate nf_init can log at boot.
 bool nf_view_resolve(void) {
     return AbstractController__ctor && AbstractController__dtor1 &&
            AbstractController__size &&
@@ -227,7 +238,8 @@ bool nf_view_resolve(void) {
            AbstractController__viewWillDisappear &&
            AbstractController__viewWillBeDestroyed &&
            AbstractController__allowedOrientations &&
-           AbstractController__navSection;
+           AbstractController__navSection &&
+           AbstractController__vtable;
 }
 
 // dbName is a Repository cache-partition key. Device::calcDbName compares the
