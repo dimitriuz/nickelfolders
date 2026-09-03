@@ -73,6 +73,13 @@ void   (*MainWindowController__push)(MainWindowController *_this, AbstractContro
 void   (*QuickAccessLibraryController__ctor)(AbstractController *_this, void const *source);
 void   (*ArticleListLibraryController__ctor)(AbstractController *_this, void const *source);
 
+// The shim controller's two raw AbstractController symbols -- see
+// nfnickel.h's own comment on each for what they are and why they are
+// still resolved by name rather than assumed. NOT static, same reason as
+// the four above: nfview.cc calls both directly.
+void   (*AbstractController__ctor)(void *_this);
+void   (*AbstractController__dtor1)(void *_this);
+
 // Nickel's classes stay opaque, same discipline as Volume/ReadBookActionProxy
 // above: these are the four classes the rung 2 data-source chain constructs,
 // each typedef'd void and reached only through an explicitly written call
@@ -142,6 +149,8 @@ struct nh_dlsym NFNickelDlsym[] = {
     {.name = "_ZN20MainWindowController4pushEP18AbstractControllerb", .out = nh_symoutptr(MainWindowController__push), .desc = "MainWindowController::push",           .optional = true},
     {.name = "_ZN28QuickAccessLibraryControllerC1E14QSharedPointerI17LibraryDataSourceI6VolumeEE", .out = nh_symoutptr(QuickAccessLibraryController__ctor), .desc = "QuickAccessLibraryController::QuickAccessLibraryController", .optional = true},
     {.name = "_ZN28ArticleListLibraryControllerC1E14QSharedPointerI17LibraryDataSourceI6VolumeEE", .out = nh_symoutptr(ArticleListLibraryController__ctor), .desc = "ArticleListLibraryController::ArticleListLibraryController", .optional = true},
+    {.name = "_ZN18AbstractControllerC2Ev",                  .out = nh_symoutptr(AbstractController__ctor),        .desc = "AbstractController::AbstractController (base object ctor)", .optional = true},
+    {.name = "_ZN18AbstractControllerD1Ev",                  .out = nh_symoutptr(AbstractController__dtor1),       .desc = "AbstractController::~AbstractController (complete object dtor)", .optional = true},
     {.name = "_ZN7QVectorI6VolumeE6appendERKS0_",             .out = nh_symoutptr(QVectorVolume__append),           .desc = "QVector<Volume>::append",                .optional = true},
     {.name = "_ZN7QVectorI6VolumeED1Ev",                      .out = nh_symoutptr(QVectorVolume__dtor),             .desc = "QVector<Volume>::~QVector",              .optional = true},
     {.name = "_ZN20InMemoryDataProviderI6VolumeEC1ERK7QVectorIS0_E", .out = nh_symoutptr(InMemoryDataProvider__ctor), .desc = "InMemoryDataProvider<Volume>::InMemoryDataProvider", .optional = true},
@@ -184,6 +193,18 @@ bool nf_browser_resolve(void) {
 #else
     return QuickAccessLibraryController__ctor != NULL;
 #endif
+}
+
+// A fourth independent gate, for the shim controller (nfview.cc) only --
+// see nfnickel.h's comment on AbstractController__ctor/__dtor1 for why this
+// stays disjoint from the other three (nf_nickel_resolve, nf_browser_resolve).
+// This checks only that the SYMBOLS resolved; it does not run the deeper
+// runtime write-pattern check (nf_view_layout_check, nfview.cc) -- that
+// needs to call through these pointers, which this function deliberately
+// does not do, matching nf_nickel_resolve/nf_browser_resolve's own pattern
+// of being a cheap, side-effect-free predicate nf_init can log at boot.
+bool nf_view_resolve(void) {
+    return AbstractController__ctor && AbstractController__dtor1;
 }
 
 // dbName is a Repository cache-partition key. Device::calcDbName compares the

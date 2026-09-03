@@ -141,6 +141,63 @@ extern void (*QuickAccessLibraryController__ctor)(AbstractController *_this, voi
 // QuickAccessLibraryController__ctor, above.
 extern void (*ArticleListLibraryController__ctor)(AbstractController *_this, void const *source /* QSharedPointer<LibraryDataSource<Volume> > const& */);
 
+// --- the shim controller's two raw AbstractController symbols -------------
+//
+// nfview.cc builds our OWN controller and view -- a SANCTIONED, narrow
+// exception to "Nickel's classes stay opaque" (see nfview.cc's own header
+// comment for the full argument and the three mitigations it carries). The
+// two symbols below are still resolved and called the project's usual way
+// -- an opaque, explicitly-written call signature, never a redeclared
+// method -- it is only nfview.cc's shim CLASS that is real C++, not these.
+//
+// AbstractController::AbstractController(), the "base object constructor"
+// (C2Ev) variant -- what Nickel's OWN derived-controller code calls when
+// building an AbstractController AS A BASE SUBOBJECT (NOTES.md: `blx
+// 6a3708 -> _ZN18AbstractControllerC2Ev`, PasswordController/
+// HelpDialogController). C1Ev aliases the IDENTICAL address (0xad1334 on
+// 4.38.23684, confirmed nm -D --defined-only), so either name resolves the
+// same function; C2Ev is used because it is what real Nickel code calls for
+// this exact purpose. Measured to call nothing and write exactly 3 words --
+// this[+0]=vptr, this[+4]=0, this[+8]=0 (NOTES.md, "sizeof(AbstractController)
+// == 12 bytes") -- but resolved and called anyway, never assumed a no-op:
+// nf_view_layout_check() (nfview.cc) verifies those exact writes at RUNTIME,
+// against THIS firmware build, every time nf_browser_show() is first called,
+// rather than trusting this comment to still be true.
+extern void (*AbstractController__ctor)(void *_this);
+
+// AbstractController::~AbstractController(), the COMPLETE OBJECT destructor
+// (D1Ev, 0xad1358 on 4.38.23684) -- deliberately NOT the deleting destructor
+// (D0Ev, 0xad1398), which additionally calls operator delete on `this` and
+// would double-free memory nfview.cc's shim manages itself (one
+// ::operator new(...) block backing the WHOLE shim object, not just its
+// AbstractController-shaped base).
+//
+// Unlike the ctor above, this IS NOT a no-op -- disassembled for this task,
+// exactly per "resolve the real destructors by name too -- do not rely on
+// the zero slots" the earlier, abandoned hand-copied-vtable plan found
+// (NOTES.md, "The paragraph above was wrong, and the mistake is left in on
+// purpose"). D1Ev reads this[+4] (nfview.cc's nf_weak_d), atomically
+// decrements its first word (an ldrex/strex CAS loop -- the weakref
+// QBasicAtomicInt), and if that reaches zero, calls `operator delete` on it
+// (`blx 672404`, resolved with tools/plt.sh to `_ZdlPv`) -- EXACTLY
+// QWeakPointer<T>::~QWeakPointer()'s own documented logic
+// (qsharedpointer_impl.h: "if (d && !d->weakref.deref()) delete d"). So
+// this symbol is not merely defensive insurance -- it is the ONLY correct
+// way to tear down the this[+4]/this[+8] pair nf_load_view() (nfview.cc)
+// builds, and nfview.cc's own destructor calls it exactly once, never
+// duplicating the decrement/delete by hand when this resolved (doing both
+// would double-decrement, and potentially double-free, the same weakref).
+extern void (*AbstractController__dtor1)(void *_this);
+
+// True once both symbols above resolved. A THIRD, independent gate --
+// nf_nickel_resolve() and nf_browser_resolve() each already guard a
+// disjoint failure domain (book-opening; the borrowed-controller route),
+// and this one guards only the shim controller, so a firmware that breaks
+// just one of these three features does not silently disable the other
+// two. See nf_browser_resolve()'s own comment for why this independence is
+// deliberate, not merely convenient.
+bool nf_view_resolve(void);
+
 // QSharedPointer<T>'s complete runtime layout, for every T, per Qt 5.2's
 // public qsharedpointer_impl.h: a value pointer, then an
 // ExternalRefCountData*. Two pointers, 8 bytes -- nothing here depends on

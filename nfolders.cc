@@ -1,23 +1,32 @@
-// NickelFolders -- rungs 1 and 2.
+// NickelFolders -- rungs 1 and 2, plus the first milestone of our own
+// controller and view.
 //
 // Rung 1's whole job was answering whether an injected mod can hand an
 // arbitrary ContentID to Nickel's stock reader and have the book open the
 // way it does when you tap it in the library -- answered, see NOTES.md and
 // README.md. Rung 2's job is Nickel's OWN list controller
-// (QuickAccessLibraryController, nfbrowser.cc) on Nickel's own window stack,
+// (ArticleListLibraryController, nfbrowser.cc) on Nickel's own window stack,
 // showing books we chose -- Nickel draws every row, and a tap on one opens
 // it through the same ReadBookActionProxy path rung 1 already proved; this
-// mod hooks nothing.
+// mod hooks nothing. Both are proven on hardware but the borrowed controller
+// cannot show folders, our own label-shortening, or a greyed "not in the
+// library" row (it renders every row from a Volume's own metadata) -- so a
+// new milestone (nfview.cc) builds a deliberately trivial screen of our
+// OWN, on our OWN compiler-generated controller class, to prove that shim on
+// hardware before anything real rides on it.
 //
 // The libnickel call sequences live in nfnickel.cc (book-opening, and the
-// data-source chain rung 2's screen needs) and nfbrowser.cc (constructing
-// and pushing the controller), along with the inotify watch machinery. This
-// file is left with the two trigger protocols and the NickelHook glue.
+// data-source chain rung 2's screen needs), nfbrowser.cc (constructing and
+// pushing the BORROWED controller), and nfview.cc (the shim controller and
+// its own trivial view), along with the inotify watch machinery
+// (nfnickel.cc). This file is left with the three trigger protocols and the
+// NickelHook glue.
 //
 // Drive it from a shell, over ssh, with Nickel up:
 //
 //     echo 'file:///mnt/onboard/books/it/Some Book.epub' > /tmp/nfolders-open
 //     touch /tmp/nfolders-show
+//     touch /tmp/nfolders-native
 //     logread | grep -i nickelfolders
 //
 // The open-trigger file is up to three lines: the ContentID, then getById's
@@ -34,9 +43,16 @@
 // authored by hand. Non-empty content is one ContentID per line (same bare-
 // path-gets-file://-prepended convenience as the open-trigger), for testing
 // an arbitrary set of books without rebuilding.
+//
+// The native-view-trigger's content is ignored entirely -- `touch
+// /tmp/nfolders-native` is the whole protocol -- because nf_browser_show()
+// (nfview.cc) takes no arguments: this milestone's screen is a fixed,
+// hardcoded scaffold on purpose (see nfview.cc's own header comment), not
+// yet something a trigger file could parameterise.
 
 #include "nfbrowser.h"
 #include "nfnickel.h"
+#include "nfview.h"
 
 #include <QString>
 #include <QStringList>
@@ -50,6 +66,7 @@
 
 #define NF_TRIGGER      "/tmp/nfolders-open"
 #define NF_TRIGGER_SHOW "/tmp/nfolders-show"
+#define NF_TRIGGER_VIEW "/tmp/nfolders-native"
 
 // nf_on_trigger runs on the GUI thread already: nf_watch_init's callback is
 // invoked from the QSocketNotifier's activated() signal, which the Qt event
@@ -179,6 +196,29 @@ static void nf_on_trigger_show() {
     nf_browser_show_volumes(ids);
 }
 
+// Runs on the GUI thread, same reasoning as nf_on_trigger/nf_on_trigger_show:
+// nf_init (below) calls nf_watch_init from the GUI thread, and every
+// callback it registers fires from the QSocketNotifier's activated() signal
+// on that same thread. `touch`'d with no content -- unlike the other two
+// triggers, this one takes no ContentIDs or arguments at all: the milestone
+// it drives (nf_browser_show, nfview.cc) is deliberately a fixed, hardcoded
+// screen, not something a trigger file's content could parameterise yet.
+static void nf_on_trigger_view() {
+    // Same "the file exists and is fully written by the time this runs"
+    // reasoning as the other two triggers -- IN_CLOSE_WRITE/IN_MOVED_TO
+    // only fires after that. Content, if any, is ignored and the file is
+    // still consumed (unlinked), so a stray `echo ... > ` into this
+    // trigger does not leave a stale file silently re-triggering nothing
+    // on the next boot.
+    int fd = open(NF_TRIGGER_VIEW, O_RDONLY);
+    if (fd >= 0)
+        close(fd);
+    unlink(NF_TRIGGER_VIEW);
+
+    nh_log("trigger: showing the shim controller's native view");
+    nf_browser_show();
+}
+
 static int nf_init() {
     // Every NFNickelDlsym entry is optional (nfnickel.cc), so a miss here is
     // a real, reachable outcome now -- not hypothetical -- and this is the
@@ -191,14 +231,23 @@ static int nf_init() {
         nh_log("init: a libnickel symbol did not resolve; book-opening is inert until this is fixed");
     if (!nf_browser_resolve())
         nh_log("init: a libnickel symbol did not resolve; the browser screen is inert until this is fixed");
+    // A third, independent gate (nfnickel.h/.cc), for the shim controller
+    // (nfview.cc) only -- logged here the same way as the two above, but
+    // this is ONLY the symbol-resolution check: the deeper runtime
+    // write-pattern proof (nf_view_layout_check, nfview.cc) runs lazily,
+    // the first time nf_browser_show() is actually called, not here.
+    if (!nf_view_resolve())
+        nh_log("init: a libnickel symbol did not resolve; the shim controller is inert until this is fixed");
 
-    // Both trigger files live directly in /tmp, so the second nf_watch_init
-    // call below reuses the first's inotify fd/notifier rather than creating
-    // a second one -- see nf_watch_init's own comment (nfnickel.h) for why
-    // that is not a real limitation here. Non-fatal on failure, for both:
+    // All three trigger files live directly in /tmp, so the second and
+    // third nf_watch_init calls below reuse the first's inotify
+    // fd/notifier rather than creating one each -- see nf_watch_init's own
+    // comment (nfnickel.h) for why that is not a real limitation here, and
+    // NF_WATCH_MAX_ENTRIES (nfnickel.cc) for the fixed cap this stays
+    // under (3 of 4 slots used). Non-fatal on failure, for all three:
     // failing init here would trip NickelHook's shared failsafe and could
     // take other mods' installs down with it (CLAUDE.md), which is a wildly
-    // disproportionate response to either trigger not being wired up.
+    // disproportionate response to a trigger not being wired up.
     //
     // A non-zero return does not mean the watch wasn't built -- it may have
     // been, but is already known dead (nf_watch_init logged specifically why,
@@ -212,10 +261,16 @@ static int nf_init() {
     if (!showReady)
         nh_log("init: show-trigger watch is not usable; the browser screen is inert (see 'watch:' lines above for why)");
 
+    bool viewReady = nf_watch_init(NF_TRIGGER_VIEW, &nf_on_trigger_view) == 0;
+    if (!viewReady)
+        nh_log("init: native-view-trigger watch is not usable; the shim controller is inert (see 'watch:' lines above for why)");
+
     if (openReady)
         nh_log("init: ready, echo a ContentID into %s", NF_TRIGGER);
     if (showReady)
         nh_log("init: ready, touch %s to show the browser screen", NF_TRIGGER_SHOW);
+    if (viewReady)
+        nh_log("init: ready, touch %s to show the shim controller's native view", NF_TRIGGER_VIEW);
     return 0;
 }
 
