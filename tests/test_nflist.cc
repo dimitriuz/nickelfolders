@@ -133,6 +133,26 @@ static void test_folders_and_files_are_labelled_separately(void) {
     CHECK_EQ_STR(out.at(2).label, "02");
 }
 
+// The collision guard, with a fixture that genuinely reaches it. Stripping
+// these leaves "zz" for BOTH rows: with no space before the bracket the prefix
+// backs off to the earlier whitespace, so the remainder keeps "zz(a"/"zz(b",
+// and the per-row truncation at the unclosed "(" collapses both to "zz" -- two
+// characters, so the post-loop length guard does not catch it either.
+//
+// Measured on the host against nf_strip_common directly:
+//     ["Vol zz(a", "Vol zz(b"] -> [zz] [zz]
+//
+// Unique filenames must stay distinguishable, so the listing keeps raw names.
+static void test_colliding_labels_fall_back_to_raw_names(void) {
+    QVector<nf_entry> e;
+    e << ent("Vol zz(a.cbz", false) << ent("Vol zz(b.cbz", false);
+    QVector<nf_row> out;
+    nf_build_listing(e, fake_meta, NULL, &out);
+    CHECK(out.size() == 2);
+    CHECK_EQ_STR(out.at(0).label, "Vol zz(a.cbz");
+    CHECK_EQ_STR(out.at(1).label, "Vol zz(b.cbz");
+}
+
 int main(void) {
     test_junk_is_dropped_before_anything_else();
     test_metadata_is_fetched_for_every_row();
@@ -141,5 +161,6 @@ int main(void) {
     test_labels_are_derived_after_filtering();
     test_labels_match_their_rows_after_sorting();
     test_folders_and_files_are_labelled_separately();
+    test_colliding_labels_fall_back_to_raw_names();
     NF_TEST_MAIN_END
 }

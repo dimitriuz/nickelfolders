@@ -207,8 +207,12 @@ does not arise there.
 What v1 still needs is a **guard**, not a fix for a case it cannot hit: the
 per-row bracket truncation and `trimmed()` inside `nf_strip_common` are *not*
 common to every row and could in principle make two labels collide by
-accident. If any two labels in a listing collide, the whole listing falls back
-to raw names rather than showing an ambiguous pair.
+accident. If any two labels **within one kind** collide, that kind's rows keep
+their raw names. The check and the fallback are per kind, because §3.2's
+stripping is: folders and files are labelled as separate sets, so a collision
+among folder labels leaves the file labels stripped and vice versa. Degrading
+rows that are perfectly distinguishable, because two others clashed, would be
+a worse answer than the collision it was avoiding.
 
 Showing the folder on the row **only for the rows that collide** is the right
 fix for the case `FOLLOWUPS.md` #31 actually describes — a *pooled* result set
