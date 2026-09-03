@@ -1134,3 +1134,144 @@ controller: that brings the count to 1, not 0. If this had started at 1
 instead of 2, that final decrement WOULD reach zero and fire the deleter on
 a controller Nickel still considers live. `nfnickel.cc`'s own comment on
 `nf_build_volume_source` carries this in full.
+
+## Task 7, rung 2, device results: a screen on Nickel's window stack
+
+Verified on hardware 2026-09-03, firmware 4.38.23684, Kobo Libra 2, Nickel PID
+**221 stable throughout** — no crash, no restart, at any point below. This is
+the first rung to put a screen of the mod's own choosing on Nickel's window
+stack rather than only opening a book Nickel already knew about.
+
+**What was built.** A screen of ours on Nickel's own window stack, listing
+books we chose, that opens the tapped book in the stock reader and returns to
+our list on back — with **zero** fabricated vtables, zero fabricated RTTI,
+zero unnamed member writes and no tap hook, because the screen borrows
+Nickel's own `ArticleListLibraryController` rather than building one. Every
+one of those four was a hard requirement the earlier hand-built
+`AbstractController` plan (superseded above) could not avoid.
+
+**The chain**: `VolumeManager::getById` (rung 1, unchanged) → `QVector<Volume>`
+→ `InMemoryDataProvider<Volume>` (sizeof 16, `movs r0,#16` at `0x1081112` in
+`ShelfListBuilder::refresh()`) → `LinearLibraryDataSource<Volume>` (sizeof 12,
+`movs r0,#12` at `0xf498b8`) → `ArticleListLibraryController` (sizeof 92,
+`movs r0,#92` at `0xdc8d16`, inside `ArticleLibraryBuilder::newController`) →
+`MainWindowController::push`.
+
+### Device results
+
+- `ndbCurrentView` reports **`DragonLibraryView`** — the same view name
+  Nickel's own library list uses, and the same baseline rung 1's back-gesture
+  measurement used. Our screen presents as a genuine library page, not a
+  distinguishable mod screen.
+- The screen renders as a native library page: back arrow top-left, full
+  status bar (time, brightness, wifi, bluetooth, battery, sync, search),
+  sort/filter chevron, per-row overflow menus, Nickel's own nav footer,
+  covers, titles, authors, format and size — visually indistinguishable from
+  a native Kobo library page.
+- Tapping a book's **title** opens it in the stock reader, through Nickel's
+  own `setupButton` → `ActionProxyMixin::readBookProxy` →
+  `connectTouchLabel` → `ReadBookActionProxy::onSelected` path — the exact
+  path rung 1 already proved, exercised here with zero hooking from this mod.
+- **Back from the reader returns to our list** — the spec's core loop
+  (`browse → tap → read → back → same folder`), confirmed by the owner. This
+  was the one question the whole architecture rested on.
+- Reading progress is free: a volume tapped earlier subsequently showed
+  "1% Read" — Nickel's own bookkeeping, not this mod's, exactly as rung 1's
+  Recents/bookmark-restore findings predicted it would be.
+- Zero `hindenburg|segfault|SIGSEGV` lines, unfiltered. PID never changed.
+
+**What this route does NOT give, measured rather than feared.** Rows render
+straight from the `Volume`'s own metadata, so this mod's own label-shortening
+work (`nf_strip_common`, spec section 3.2) is **unreachable** through this
+controller: a row reads `Fullmetal Alchemist v01 (2005) (Digital)
+(LostNerevarine-Empire)` in full, wrapped over two lines — exactly the noise
+that code exists to strip, confirmed twice, on two different controllers
+(`QuickAccessLibraryController` and `ArticleListLibraryController`), so it is
+a property of "borrow Nickel's own row renderer," not of one specific
+controller choice. And these controllers list `Volume`s, not filesystem
+entries, so **folders are not solved by this route at all** — the tree from
+"Other findings, for the browser that comes next," above, still needs its own
+answer.
+
+### A rejected candidate worth recording, so nobody re-treads it: `QuickAccessLibraryController`
+
+The first attempt at this rung used `QuickAccessLibraryController`
+(sizeof 72, `movs r0,#72` at `0xf499a4`, same `QuickAccessMenuView`
+constructor the `LinearLibraryDataSource<Volume>` size came from) instead of
+`ArticleListLibraryController`. It **works** — pushed cleanly, rendered
+full-screen with real covers/titles/authors/format/size, reading progress was
+free, and a tap opened the book with no hook from this mod, exactly as the
+data-source chain above predicts. But `ndbCurrentView` read
+`QuickAccessLibraryView`, and the screenshot showed why that name matters:
+**no header and no back arrow at all**. `QuickAccessLibraryView` is the home
+page's own quick-access *widget*, normally popped up inside
+`QuickAccessMenuView`, not a page — it carries no navigation chrome of its
+own. The Libra 2 has no hardware back button, so there was **no way out of
+that screen except the nav bar**, which breaks the spec's core loop outright
+rather than cosmetically. This was found by one screenshot and one owner tap,
+not by building three more rungs on top of it first.
+
+The fix was a one-line controller swap to `ArticleListLibraryController` —
+the plan's own named hedge for exactly this failure class, described in
+advance as unambiguously full-screen. It brought the header and back arrow
+with it, per "Device results" above, at no other cost: same data-source chain
+underneath, sizeof independently re-measured rather than trusted from the
+first pass (see "Method lesson" below for why re-measuring rather than
+trusting was the right call here specifically).
+
+`QuickAccessLibraryController` is **kept**, resolved and buildable, behind a
+compile-time selector (`NF_BROWSER_USE_ARTICLE_LIST`, `nfnickel.h`) — not the
+default, kept purely as a proven comparison path, since both settings build
+clean and the comparison is what caught the missing chrome in the first
+place.
+
+**Also rejected**: `NotebookGridController`, from the same archaeology pass.
+It supplies real folder navigation (`folderItemTapped(QString, QString)` as a
+genuine Qt signal) *and* books in one screen, which looked like it might
+solve both halves of the browser at once. But its `moveToPath` mutates the
+**process-wide `NotebookGridBuilder` singleton** — the same object instance
+Nickel's own "My Notebooks" view reads from — so navigating our screen would
+re-root the owner's own notebooks view. That is user-visible damage to a
+daily driver, disqualifying on its own regardless of how well the rest of it
+fits. (It also has no signal for a *book* tap — `contentSelected` is an empty
+virtual, not a signal — so it would not have closed the tap-hook gap either;
+the singleton mutation alone is sufficient reason not to pursue it further.)
+
+### Method lesson: neither the presence nor the absence of a call in a disassembly is trustworthy on its own
+
+Two failure modes, both hit during this rung's archaeology, and they are
+opposite shapes of the same trap.
+
+**`tools/plt.sh` structurally cannot show a genuine direct `bl` to a local
+address.** It works by taking a stub address, computing where the stub's own
+three instructions land, and matching that against the **relocation table**
+— which only exists for calls Nickel's linker routed through the PLT/GOT. A
+real, ordinary `bl 0x<address>` straight to a function's own code, with no
+PLT indirection at all, produces no relocation for `plt.sh` to match against,
+so it reports `<no PLT stub found>` — the identical message it gives for a
+address that is not a call at all. The tool cannot tell "this is a direct
+call I don't handle" from "this was never a call." Nothing in this project
+so far has depended on resolving one of these (every cross-function call
+found here, weak symbols included, has gone through the PLT — checked, not
+assumed, when it mattered for `QuickAccessLibraryController`'s own known
+caller), but the blind spot is structural, not empirical, and the next
+firmware or the next function may not be as accommodating.
+
+**Conversely, three separate `bl` instructions objdump printed inside this
+firmware's own function bodies were not calls at all** — they were
+**literal-pool bytes** that happened to disassemble as a plausible-looking
+`bl`. Two more of the same shape turned up later in the same archaeology
+pass, for five total. Confirmed each time the same way: read the
+*surrounding* words rather than trusting the one that looked like an
+instruction — neighbouring bytes decoded as `<UNDEFINED>`, as small GOT
+offsets, or as ordinary filler (`movs r1, r0` and similar), and the
+function's real epilogue (`ldmia.w sp!, {...}, pc` or equivalent) was found
+well before the address in question, which a genuine reachable instruction
+inside the function body cannot be.
+
+**The rule, stated flatly**: an apparent `bl` near the end of a function's
+disassembled range is a constant until the surrounding bytes prove otherwise,
+and `plt.sh` returning nothing proves neither "not a call" nor "is a call
+this tool cannot see" — check which, every time, the same discipline the
+`readelf -r` truncation trap (above) already demands for the opposite
+direction of this same problem.
