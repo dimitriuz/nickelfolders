@@ -144,8 +144,16 @@ see `DEVICE.local.md`.
   Itanium ABI mangles static and non-static members **identically**, so the
   symbol name cannot tell you there is no `this`. Reading `r1` as `this`
   compiles, links, resolves, and **crashed Nickel on the first device run**.
-- **`dbName` is a `Repository` cache-partition key, and empty is correct** for
-  local content. Measured, not assumed.
+- **`dbName` is a `Repository` cache-partition key. Empty is correct for
+  internal storage — and ONLY for internal storage.**
+  `Device::calcDbName()` compares the device's path against the literal
+  `/mnt/onboard/.kobo` and returns empty on a match, deriving a name via
+  `QDir::cleanPath` otherwise. So **do not hardcode `""`**: call
+  `Device::getCurrentDevice()` then `Device::getDbName()`, which returns a
+  `QString const&` to an already-cached string (three instructions, nothing to
+  free). A hardcoded empty string works on the reference device and silently
+  finds nothing on a model with an SD card. `NOTES.md` has the derivation and
+  the one part still unverified.
 - **`ReadBookActionProxy` is the right entry point, not `ReadingController`.**
   It is the object behind the library's own Read button, so Nickel's
   bookkeeping — reading session, bookmark restore, analytics,
