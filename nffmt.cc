@@ -235,29 +235,89 @@ void nf_strip_common(QStringList *names) {
 // card is 27 entries, where an insertion sort is not worth optimising -- and it
 // is STABLE, which is what keeps the order reproducible when two names tie.
 //
-// Spec section 6.1 keeps grouping and ordering separate stages so that a future
-// descending toggle reverses WITHIN each kind and never floats files above
-// folders. Do not collapse the isDir test into the comparator.
-static bool nf_entry_before(nf_entry const& a, nf_entry const& b) {
-    if (a.isDir != b.isDir)
-        return a.isDir;
-    return nf_natural_compare(a.name, b.name) < 0;
+// Plain subtraction on two qint64s can overflow (a size or an epoch-
+// millisecond difference both fit in 63 bits individually, but their
+// difference is not guaranteed to), so this compares rather than subtracts.
+static int nf_compare_i64(qint64 a, qint64 b) {
+    if (a < b) return -1;
+    if (a > b) return 1;
+    return 0;
 }
 
-void nf_sort_entries(QVector<nf_entry> *entries) {
+// Spec section 6.1 keeps grouping and ordering separate stages so that a future
+// descending toggle reverses WITHIN each kind and never floats files above
+// folders. Do not collapse the isDir test into the comparator, and do not let
+// `descending` see it either -- folders sort before files in BOTH directions;
+// only the order WITHIN a kind flips. This is the exact trap 6.2 names
+// "reverse the list" for: reversing the WHOLE sorted vector would put every
+// file ahead of every folder whenever `descending` is set.
+//
+// A tie on `key` (two files sharing a size, or a modification second -- both
+// measurably possible on this card, not just theoretical) falls back to name
+// rather than being left to insertion-sort stability alone, so the order a
+// size/date sort produces is as reproducible as the name sort's always was.
+//
+// Folders get the SAME key applied as files, including size/mtime -- not
+// specially exempted or forced to a name-only order. A folder's mtime bumps
+// whenever anything inside it changes and its stat()'d size is a filesystem
+// block size, not a sum of its contents, so neither is a particularly
+// meaningful number for a folder on its own terms -- but nf_sort_entries
+// stays the ONE place ordering happens (this file's own header comment, and
+// the task this added it for), which means no second, folder-only code path
+// to keep in sync with this one, and "recently touched" is still a
+// defensible reading of a folder's own mtime for a reader who tapped
+// "sort: date".
+static bool nf_entry_before(nf_entry const& a, nf_entry const& b,
+                             nf_sort_key key, bool descending) {
+    if (a.isDir != b.isDir)
+        return a.isDir;
+
+    int cmp;
+    switch (key) {
+        case NF_SORT_SIZE: cmp = nf_compare_i64(a.size, b.size);   break;
+        case NF_SORT_DATE: cmp = nf_compare_i64(a.mtime, b.mtime); break;
+        case NF_SORT_NAME:
+        default:            cmp = nf_natural_compare(a.name, b.name); break;
+    }
+    if (cmp == 0)
+        cmp = nf_natural_compare(a.name, b.name);
+
+    return descending ? (cmp > 0) : (cmp < 0);
+}
+
+void nf_sort_entries(QVector<nf_entry> *entries, nf_sort_key key, bool descending) {
     for (int i = 1; i < entries->size(); i++) {
-        nf_entry key = entries->at(i);
+        nf_entry cur = entries->at(i);
         int j = i - 1;
-        while (j >= 0 && nf_entry_before(key, entries->at(j))) {
+        while (j >= 0 && nf_entry_before(cur, entries->at(j), key, descending)) {
             (*entries)[j + 1] = entries->at(j);
             j--;
         }
-        (*entries)[j + 1] = key;
+        (*entries)[j + 1] = cur;
     }
 }
 
 bool nf_is_book_name(QString const& name) {
     return !nf_book_extension(name).isEmpty();
+}
+
+// Reuses nf_book_extension rather than re-deriving anything from `name`
+// itself -- the LONGEST-FIRST match that already tells ".kepub.epub" apart
+// from a plain ".epub" (NF_EXTS' own comment) is exactly what NF_FILTER_EPUB
+// needs to treat both as one format rather than two.
+bool nf_matches_filter(QString const& name, nf_filter_kind filter) {
+    if (filter == NF_FILTER_ALL)
+        return true;
+    QString ext = nf_book_extension(name);
+    switch (filter) {
+        case NF_FILTER_CBZ:  return ext.compare(QStringLiteral(".cbz"), Qt::CaseInsensitive) == 0;
+        case NF_FILTER_CBR:  return ext.compare(QStringLiteral(".cbr"), Qt::CaseInsensitive) == 0;
+        case NF_FILTER_PDF:  return ext.compare(QStringLiteral(".pdf"), Qt::CaseInsensitive) == 0;
+        case NF_FILTER_EPUB: return ext.compare(QStringLiteral(".epub"), Qt::CaseInsensitive) == 0
+                                  || ext.compare(QStringLiteral(".kepub.epub"), Qt::CaseInsensitive) == 0;
+        case NF_FILTER_ALL:
+        default:              return true;
+    }
 }
 
 bool nf_is_hidden_dir(QString const& name) {

@@ -162,6 +162,140 @@ static void test_colliding_labels_fall_back_to_raw_names(void) {
     CHECK_EQ_STR(out.at(1).label, "Vol zz(b.cbz");
 }
 
+// The filter stage, section 6.1/6.3. Folders survive regardless of `filter`
+// -- see nf_build_listing's own comment (nflist.cc) for why -- while files
+// that do not match are removed same as junk, just one stage later.
+static void test_filter_removes_non_matching_files_but_keeps_folders(void) {
+    QVector<nf_entry> e;
+    e << ent("Comics", true)
+      << ent("Volume 1.cbz", false)
+      << ent("Report.pdf", false)
+      << ent("Notes.epub", false);
+    QVector<nf_row> out;
+    nf_build_listing(e, fake_meta, NULL, &out, NF_FILTER_PDF);
+    CHECK(out.size() == 2); // the folder, and Report.pdf
+    bool sawFolder = false, sawPdf = false;
+    for (int i = 0; i < out.size(); i++) {
+        if (out.at(i).isDir) {
+            sawFolder = true;
+            CHECK_EQ_STR(out.at(i).name, "Comics");
+        } else {
+            sawPdf = true;
+            CHECK_EQ_STR(out.at(i).name, "Report.pdf");
+        }
+    }
+    CHECK(sawFolder);
+    CHECK(sawPdf);
+}
+
+// Filtering to NF_FILTER_ALL is a no-op -- same row set as no filter at all.
+static void test_filter_all_is_a_no_op(void) {
+    QVector<nf_entry> e;
+    e << ent("Volume 1.cbz", false) << ent("Report.pdf", false);
+    QVector<nf_row> unfiltered, allFiltered;
+    nf_build_listing(e, fake_meta, NULL, &unfiltered);
+    nf_build_listing(e, fake_meta, NULL, &allFiltered, NF_FILTER_ALL);
+    CHECK(unfiltered.size() == allFiltered.size());
+    CHECK(unfiltered.size() == 2);
+}
+
+// Labels are recomputed after the FILTER stage, same load-bearing ordering
+// test_labels_are_derived_after_filtering (above) pins for the junk-hiding
+// stage, and the task brief calls out as the reason a filter needs its own
+// version of that test: a common run computed on the PRE-filter set of three
+// names is not the same common run as on the two PDFs that actually survive.
+static void test_labels_recomputed_after_filter(void) {
+    QVector<nf_entry> e;
+    // All three share "Book - " as a prefix, but ONLY the two PDFs also share
+    // the trailing " (PDF).pdf" -- Notes.epub does not, so if labels were
+    // derived from the PRE-filter set of three, the common SUFFIX would be
+    // empty (Notes.epub does not end in " (PDF).pdf") and only the prefix
+    // "Book - " would strip. Derived AFTER filtering the epub out, the
+    // remaining two PDFs share both the prefix AND the suffix, so the
+    // stripped label is shorter -- a directly observable difference between
+    // the two orderings, not just "does it happen to match either way".
+    e << ent("Book - Alpha (PDF).pdf", false)
+      << ent("Book - Beta (PDF).pdf", false)
+      << ent("Book - Gamma.epub", false);
+    QVector<nf_row> out;
+    nf_build_listing(e, fake_meta, NULL, &out, NF_FILTER_PDF);
+    CHECK(out.size() == 2);
+    for (int i = 0; i < out.size(); i++) {
+        // Had labelling run on the pre-filter set of three, the shared
+        // suffix would be "" (Gamma.epub breaks it) and "(PDF)" would
+        // survive in the label. Derived after filtering, the suffix
+        // " (PDF).pdf" is common to the two PDF survivors and is stripped.
+        CHECK(!out.at(i).label.contains(QStringLiteral("(PDF)")));
+    }
+    CHECK(out.at(0).label.contains(QStringLiteral("Alpha")));
+    CHECK(out.at(1).label.contains(QStringLiteral("Beta")));
+}
+
+// The third empty state, section 6.3/3.6. A folder that HAD books before the
+// filter ran, all of which the filter then removed, must be flagged distinct
+// from a folder that never had anything -- see nf_build_listing's own
+// derivation of `filteredToNothing` (nflist.cc) for why this is checked
+// before the filter runs rather than after.
+static void test_filtered_to_nothing_is_distinguishable_from_empty(void) {
+    // Case 1: a manga folder, all .cbz, filtered to PDF -- everything here
+    // WAS a book, and the filter is why none of it shows.
+    QVector<nf_entry> manga;
+    manga << ent("Volume 1.cbz", false) << ent("Volume 2.cbz", false);
+    QVector<nf_row> out1;
+    bool filteredToNothing1 = false;
+    nf_build_listing(manga, fake_meta, NULL, &out1,
+                     NF_FILTER_PDF, NF_SORT_NAME, false, &filteredToNothing1);
+    CHECK(out1.isEmpty());
+    CHECK(filteredToNothing1);
+
+    // Case 2: a genuinely empty directory (nothing survives hide-junk) --
+    // the SAME filter must not claim credit for an emptiness it had nothing
+    // to do with.
+    QVector<nf_entry> empty;
+    QVector<nf_row> out2;
+    bool filteredToNothing2 = true; // deliberately pre-set to the WRONG value
+    nf_build_listing(empty, fake_meta, NULL, &out2,
+                     NF_FILTER_PDF, NF_SORT_NAME, false, &filteredToNothing2);
+    CHECK(out2.isEmpty());
+    CHECK(!filteredToNothing2);
+
+    // Case 3: an all-junk directory (hide-junk removes everything, same as
+    // case 2 from the filter's point of view) -- also not "filtered to
+    // nothing", for the same reason as case 2.
+    QVector<nf_entry> allJunk;
+    allJunk << ent("metadata.calibre", false) << ent(".kobo", true);
+    QVector<nf_row> out3;
+    bool filteredToNothing3 = true;
+    nf_build_listing(allJunk, fake_meta, NULL, &out3,
+                     NF_FILTER_PDF, NF_SORT_NAME, false, &filteredToNothing3);
+    CHECK(out3.isEmpty());
+    CHECK(!filteredToNothing3);
+
+    // Case 4: a folder holding both a folder and files, filtered so only the
+    // files drop out -- there is still something to show (the folder), so
+    // this must NOT read as "filtered to nothing" even though every FILE
+    // was removed.
+    QVector<nf_entry> mixed;
+    mixed << ent("Extras", true) << ent("Volume 1.cbz", false);
+    QVector<nf_row> out4;
+    bool filteredToNothing4 = true;
+    nf_build_listing(mixed, fake_meta, NULL, &out4,
+                     NF_FILTER_PDF, NF_SORT_NAME, false, &filteredToNothing4);
+    CHECK(out4.size() == 1);
+    CHECK(!filteredToNothing4);
+
+    // Case 5 (negative control): NF_FILTER_ALL never removes a match, so
+    // even a folder full of real books must never report filteredToNothing
+    // -- a passing case-1 check is only meaningful because this one does
+    // NOT also come back true.
+    QVector<nf_row> out5;
+    bool filteredToNothing5 = true;
+    nf_build_listing(manga, fake_meta, NULL, &out5,
+                     NF_FILTER_ALL, NF_SORT_NAME, false, &filteredToNothing5);
+    CHECK(out5.size() == 2);
+    CHECK(!filteredToNothing5);
+}
+
 int main(void) {
     test_junk_is_dropped_before_anything_else();
     test_metadata_is_fetched_for_every_row();
@@ -171,5 +305,9 @@ int main(void) {
     test_labels_match_their_rows_after_sorting();
     test_folders_and_files_are_labelled_separately();
     test_colliding_labels_fall_back_to_raw_names();
+    test_filter_removes_non_matching_files_but_keeps_folders();
+    test_filter_all_is_a_no_op();
+    test_labels_recomputed_after_filter();
+    test_filtered_to_nothing_is_distinguishable_from_empty();
     NF_TEST_MAIN_END
 }

@@ -146,10 +146,12 @@ static void test_strip_refuses_when_remainder_has_no_letter_even_mixed(void) {
     CHECK(n == before);
 }
 
-static nf_entry ent(char const *name, bool isDir) {
+static nf_entry ent(char const *name, bool isDir, qint64 size = 0, qint64 mtime = 0) {
     nf_entry e;
     e.name  = QString::fromUtf8(name);
     e.isDir = isDir;
+    e.size  = size;
+    e.mtime = mtime;
     return e;
 }
 
@@ -176,6 +178,97 @@ static void test_sort_uses_natural_order_within_kind(void) {
     CHECK_EQ_STR(e.at(1).name, "v2 - The Doll's House");
     CHECK_EQ_STR(e.at(2).name, "v9 - The Kindly Ones");
     CHECK_EQ_STR(e.at(3).name, "v10 - The Wake");
+}
+
+// NF_SORT_NAME, descending -- the direction toggle's simplest case, no
+// folders involved so there is nothing for it to float incorrectly.
+static void test_sort_name_descending(void) {
+    QVector<nf_entry> e;
+    e << ent("alpha.cbz", false) << ent("beta.cbz", false) << ent("gamma.cbz", false);
+    nf_sort_entries(&e, NF_SORT_NAME, /*descending=*/true);
+    CHECK_EQ_STR(e.at(0).name, "gamma.cbz");
+    CHECK_EQ_STR(e.at(1).name, "beta.cbz");
+    CHECK_EQ_STR(e.at(2).name, "alpha.cbz");
+}
+
+static void test_sort_by_size_ascending(void) {
+    QVector<nf_entry> e;
+    e << ent("big.cbz", false, 3000) << ent("small.cbz", false, 100)
+      << ent("medium.cbz", false, 1500);
+    nf_sort_entries(&e, NF_SORT_SIZE, false);
+    CHECK_EQ_STR(e.at(0).name, "small.cbz");
+    CHECK_EQ_STR(e.at(1).name, "medium.cbz");
+    CHECK_EQ_STR(e.at(2).name, "big.cbz");
+}
+
+static void test_sort_by_size_descending(void) {
+    QVector<nf_entry> e;
+    e << ent("big.cbz", false, 3000) << ent("small.cbz", false, 100)
+      << ent("medium.cbz", false, 1500);
+    nf_sort_entries(&e, NF_SORT_SIZE, true);
+    CHECK_EQ_STR(e.at(0).name, "big.cbz");
+    CHECK_EQ_STR(e.at(1).name, "medium.cbz");
+    CHECK_EQ_STR(e.at(2).name, "small.cbz");
+}
+
+static void test_sort_by_date_ascending(void) {
+    QVector<nf_entry> e;
+    e << ent("newest.cbz", false, 0, 3000) << ent("oldest.cbz", false, 0, 100)
+      << ent("middle.cbz", false, 0, 1500);
+    nf_sort_entries(&e, NF_SORT_DATE, false);
+    CHECK_EQ_STR(e.at(0).name, "oldest.cbz");
+    CHECK_EQ_STR(e.at(1).name, "middle.cbz");
+    CHECK_EQ_STR(e.at(2).name, "newest.cbz");
+}
+
+static void test_sort_by_date_descending(void) {
+    QVector<nf_entry> e;
+    e << ent("newest.cbz", false, 0, 3000) << ent("oldest.cbz", false, 0, 100)
+      << ent("middle.cbz", false, 0, 1500);
+    nf_sort_entries(&e, NF_SORT_DATE, true);
+    CHECK_EQ_STR(e.at(0).name, "newest.cbz");
+    CHECK_EQ_STR(e.at(1).name, "middle.cbz");
+    CHECK_EQ_STR(e.at(2).name, "oldest.cbz");
+}
+
+// THE 6.2 TRAP. "Reverse the list" -- the obvious, wrong implementation of a
+// descending toggle -- would put every file ahead of every folder here,
+// because "zzz-folder" sorts alphabetically after every file below it and a
+// whole-list reversal cannot tell kind from key. The right behaviour keeps
+// BOTH folders ahead of BOTH files, in EITHER direction; only the order
+// within each kind may flip.
+static void test_sort_descending_does_not_float_files_above_folders(void) {
+    QVector<nf_entry> e;
+    e << ent("aaa-file.cbz", false) << ent("zzz-file.cbz", false)
+      << ent("aaa-folder", true) << ent("zzz-folder", true);
+    nf_sort_entries(&e, NF_SORT_NAME, /*descending=*/true);
+    CHECK(e.at(0).isDir);
+    CHECK(e.at(1).isDir);
+    CHECK(!e.at(2).isDir);
+    CHECK(!e.at(3).isDir);
+    // and within each kind, genuinely reversed
+    CHECK_EQ_STR(e.at(0).name, "zzz-folder");
+    CHECK_EQ_STR(e.at(1).name, "aaa-folder");
+    CHECK_EQ_STR(e.at(2).name, "zzz-file.cbz");
+    CHECK_EQ_STR(e.at(3).name, "aaa-file.cbz");
+}
+
+// Same trap, this time with the size key, so a size-sort's descending toggle
+// is checked independently of the name-sort case above.
+static void test_sort_by_size_descending_does_not_float_files_above_folders(void) {
+    QVector<nf_entry> e;
+    // A folder is deliberately given a larger `size` than either file --
+    // stat()'d folder sizes are not content sizes (nf_entry_before's own
+    // comment), but this fixture does not need that to be realistic, only to
+    // prove the folder stays first even when its own key value would put it
+    // last under a naive whole-list sort.
+    e << ent("small.cbz", false, 100) << ent("big.cbz", false, 3000)
+      << ent("huge-folder", true, 999999);
+    nf_sort_entries(&e, NF_SORT_SIZE, /*descending=*/true);
+    CHECK(e.at(0).isDir);
+    CHECK_EQ_STR(e.at(0).name, "huge-folder");
+    CHECK_EQ_STR(e.at(1).name, "big.cbz");
+    CHECK_EQ_STR(e.at(2).name, "small.cbz");
 }
 
 // Determinism, which is what makes a listing reproducible across runs.
@@ -236,6 +329,29 @@ static void test_allowlist_excludes_txt_deliberately(void) {
     CHECK(!nf_is_book_name("koboy-probe-Io.txt"));
 }
 
+static void test_filter_all_admits_everything(void) {
+    CHECK(nf_matches_filter("Volume 1.cbz", NF_FILTER_ALL));
+    CHECK(nf_matches_filter("Volume 1.pdf", NF_FILTER_ALL));
+    CHECK(nf_matches_filter("not a book at all", NF_FILTER_ALL));
+}
+
+static void test_filter_by_extension(void) {
+    CHECK(nf_matches_filter("Volume 1.cbz", NF_FILTER_CBZ));
+    CHECK(!nf_matches_filter("Volume 1.pdf", NF_FILTER_CBZ));
+
+    CHECK(nf_matches_filter("Sandman 50.cbr", NF_FILTER_CBR));
+    CHECK(!nf_matches_filter("Sandman 50.cbz", NF_FILTER_CBR));
+
+    CHECK(nf_matches_filter("Booklet.pdf", NF_FILTER_PDF));
+    CHECK(!nf_matches_filter("Booklet.epub", NF_FILTER_PDF));
+
+    // NF_FILTER_EPUB matches BOTH plain and Kobo epub -- the same
+    // one-format treatment nf_book_extension already gives them.
+    CHECK(nf_matches_filter("Some Book.epub", NF_FILTER_EPUB));
+    CHECK(nf_matches_filter("Some Book.kepub.epub", NF_FILTER_EPUB));
+    CHECK(!nf_matches_filter("Some Book.pdf", NF_FILTER_EPUB));
+}
+
 static void test_hidden_dirs(void) {
     CHECK(nf_is_hidden_dir(".kobo"));
     CHECK(nf_is_hidden_dir(".adds"));
@@ -262,9 +378,18 @@ int main(void) {
     test_sort_folders_before_files();
     test_sort_uses_natural_order_within_kind();
     test_sort_is_deterministic();
+    test_sort_name_descending();
+    test_sort_by_size_ascending();
+    test_sort_by_size_descending();
+    test_sort_by_date_ascending();
+    test_sort_by_date_descending();
+    test_sort_descending_does_not_float_files_above_folders();
+    test_sort_by_size_descending_does_not_float_files_above_folders();
     test_allowlist_admits_the_measured_formats();
     test_allowlist_rejects_the_measured_junk();
     test_allowlist_excludes_txt_deliberately();
+    test_filter_all_admits_everything();
+    test_filter_by_extension();
     test_hidden_dirs();
     NF_TEST_MAIN_END
 }
