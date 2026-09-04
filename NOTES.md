@@ -2421,21 +2421,58 @@ Two lessons, both cheap:
   setting, and it is the same discipline as the MEASURED/FALLBACK marker on
   the row-width line.
 
-### Elision has to reserve the SUFFIXES too
+### Elision: the right-edge clipping, and a WRONG cause recorded first
 
-Also measured from the same screenshots. With icons rendering, rows still
+Measured from the same screenshots. With icons rendering, rows still
 clipped at the right edge: `... - 2016.pd`, `... - 2023.pc` (cut mid
 extension), and `(40%` with its `%)` gone.
 
-The name is elided to the available width, and THEN the row appends `/`,
-`  [not in library]`, `  [finished]` or `  (N%)`. So a name that exactly
-fills the width pushes its own suffix off the panel — and the suffix is what
-the row MEANS. A row with no suffix clipped slightly too, so the base
-reserve for the `<img>` box plus its `&nbsp;` separator was also short of
-what those actually occupy.
+**The first explanation written here was wrong, and is corrected below**
+rather than quietly replaced, because getting a cause wrong in this file is
+exactly what the botched back-gesture baseline and the `viewLoaded()`
+"returns this+8" error are recorded for.
 
-Worth stating as a rule, since this is the second ordering bug of the same
-family in this file (the first being the letter guard that ran after the
-extension was appended, and so passed vacuously): **when a string is
+What was claimed: that the name is elided to the available width and the
+suffixes (`/`, `  [not in library]`, `  [finished]`, `  (N%)`) are appended
+AFTERWARDS, so a full-width name pushes its own suffix off the panel.
+
+Why that was wrong: at the time of writing, the suffix was **already** built
+in two forms and **already** subtracted before `elidedText` ran. Reordering
+anything would have been a no-op. The story was plausible, matched the
+symptom, matched a bug this very file had already had once (the letter guard
+that ran after the extension was appended), and was not checked against the
+code before being committed. A cause that merely fits the symptom is a
+hypothesis, not a finding.
+
+The actual defect was that the width terms were **measured in units the row
+does not render in**:
+
+- The separators were charged as a plain space `U+0020` but render as
+  `&nbsp;`, i.e. `U+00A0`, which this font does not measure identically.
+- The row width came from the dialog with the chrome inset **estimated**
+  rather than measured. It is now taken off the previous navigation's own
+  content widget.
+- The `TouchLabel`'s own text inset was **never subtracted at all** — now
+  read, mirroring what `QLabelPrivate::documentRect` does.
+- `FontSizeAdjustingLabel` (which `TouchLabel` derives from) may resize the
+  font on `setText`, so the metrics used to elide can be measured against a
+  font that is no longer the one drawing the text. This one is not knowable
+  by arithmetic at all.
+
+So the LESSON first written here survives intact, and is if anything better
+supported by the real cause than by the invented one: **when a string is
 assembled in stages and measured in one of them, measure the stage that is
-actually rendered.**
+actually rendered.** The mistake was assuming which stage was mismeasured
+instead of checking.
+
+Because the font-resize term cannot be computed, the row loop now ends with
+a **measured pass**: `QLabel::sizeHint()` on the assembled rich-text label,
+re-eliding the name by however much it overflows, one retry, with a ceiling
+at `rowWidth/4` so an implausible hint stands down instead of eliding every
+row to the 60 px floor. It logs either way, which makes the ABSENCE of that
+log line the evidence that the named terms add up on their own — a negative
+result that is only readable because it is logged.
+
+Worth watching on the first device run: `sizeHint()` on a Nickel widget,
+12 times per navigation, is the only part of this that reaches into Nickel's
+own layout machinery. Check the PID and `logread`.
