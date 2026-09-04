@@ -215,13 +215,33 @@ def main():
     verb = sys.argv[1]
 
     if verb == "ssh":
-        # No exit-code enforcement here on purpose: this verb is a raw
+        # A REMOTE non-zero exit stays non-fatal on purpose: this verb is a raw
         # remote-command runner (`pidof nickel` legitimately returns
-        # non-zero when nickel isn't running), so making a non-zero remote
-        # exit fatal would be a new behavior, not a bug fix, and would break
-        # callers that run a command specifically to see it fail.
-        text, _ = do_ssh(sys.argv[2])
+        # non-zero when nickel isn't running), so making that fatal would be a
+        # new behavior, not a bug fix, and would break callers that run a
+        # command specifically to see it fail.
+        #
+        # ssh's OWN failure to connect is a different thing entirely and IS
+        # fatal, because the command never ran at all. Measured 2026-09-04
+        # against an offline device: this verb printed
+        # "ssh: connect to host ... No route to host" and still exited 0, so a
+        # caller could not tell an unreachable device from a device answering
+        # with nothing -- the same trap CLAUDE.md records for push/pull/reboot,
+        # which `ssh` was simply never included in. That is the worst shape for
+        # this particular verb, since every MEASUREMENT in this project is read
+        # out of its stdout.
+        #
+        # 255 is ssh's own reserved code for connection failure, which is what
+        # separates the two cases: a remote command's own status comes back as
+        # itself (1, 2, 127...), and only ssh reports 255. A remote command
+        # that genuinely exits 255 is misreported here, and that is the
+        # deliberate trade -- it is vanishingly rare next to an offline device,
+        # and the error text is printed so it is never silent.
+        text, code = do_ssh(sys.argv[2])
         print(text)
+        if code == 255:
+            sys.exit("ssh could not reach the device (exit 255): %s"
+                     % text.strip())
     elif verb == "push":
         # `scp` writes the destination with O_TRUNC: same inode, truncated
         # and rewritten in place. Nickel keeps libnfolders.so memory-mapped

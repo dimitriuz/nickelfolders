@@ -2118,3 +2118,111 @@ happen **before** our own markup is appended, not after. That is the same
 ordering mistake the `nf_strip_common` letter guard already made once, where
 the guard ran after the extension was appended and therefore passed
 vacuously.
+
+### The date sort keys need ZERO sret calls — addendum, 2026-09-04
+
+The first pass at this concluded `Content::getDateLastRead()` (sret, `this`
+displaced to `r1`, returns `QDateTime` by value, caller destroys) was the
+route for "recently read", and derived the discipline for calling it safely.
+That derivation stands and is recorded above as the fallback. It is also
+**unnecessary**: a follow-up sweep found a route to both keys with no
+hidden-return-buffer call anywhere, which removes the whole ABI risk class
+from this feature.
+
+What made it possible is that **Nickel never converts these dates to
+timestamps.** `RecentKey<Volume>::key` is `max(___DateLastRead,
+___SyncTime)` compared with `strcasecmp`, and `getDateAddedSortKey` returns
+a `QByteArray const*` — Nickel sorts ISO-8601 **byte strings**. So our
+listing pipeline can too, and a `QDateTime` is never needed.
+
+- **Recently added**: `_ZNK6Volume19getDateAddedSortKeyERK6Device` —
+  non-static, `r0` = `this`, `r1` = `Device const&`, **no sret**, returns
+  `QByteArray const*`. Nickel's own date-added key, and `Device*` is already
+  resolved in `nfnickel.cc` for `nf_db_name`.
+- **Recently read**: read `Volume::d() + 40` directly. **No new symbol at
+  all** — `Volume__d_const` is already resolved and already called for
+  `___PercentRead` at `d()+140`.
+
+`___DateLastRead` at `Content::d() + 40` was established the same way
+`ATTRIBUTE_DATE_ADDED` was established at `+88`: `getDbValues` builds
+`QVariant::QVariant(QByteArray const&)` from `add.w r1, r3, #40` and inserts
+it under GOT slot `0x16cbe1c`, whose relocation is `R_ARM_GLOB_DAT
+ATTRIBUTE_DATE_LAST_READ`. **Five independent sightings** of that offset —
+the relocation, `setDateLastRead`'s write, `getDateLastRead`'s read,
+`isNew()`'s `qstrcmp`, and `RecentKey::key`'s read — against **three** for
+the `+140` percentRead read this project already ships.
+
+`RecentKey<Volume>::key` indexes the attribute block directly
+(`ldr r0,[r6,#40]`, `ldr.w r3,[r8,#60]`) and calls no getters, so there is
+no accessor hiding inside it. Nickel hardcodes `+40` because **nothing else
+exists**: a four-way sweep (name grep, all 61 `_ZNK7Content*` const members,
+a shape sweep for the `d()`-then-`adds r0,#N` accessor family, and an
+instruction-level sweep of `+40`/`+60`) found no raw last-read accessor on
+`Content` at all. Only `Author` has the `lastRead`/`lastReadRaw` pair. The
+complete set of exported readers of `___DateLastRead` is `getDateLastRead`
+(sret), `getDbValues` (sret, rejected earlier), `RecentKey`/`Recent2Key`,
+`isNew()` (bool only), or `d()+40` by hand. There is no sixth.
+
+The accessor-family shape sweep is worth keeping for its own sake: 17 real
+hits at `d()+4,12,16,20,24,28,36,48,52,56,76,80,88,92,96,100,104`, with
+**`+40` and `+60` conspicuously absent** — which is the positive evidence
+that the absence of a last-read accessor is real rather than a missed grep.
+Two entries the first regex produced were **false positives and were
+corrected**: `Content::isValid` and `Content::isSideLoaded` return `bool`
+(the latter tail-calls `Content::isSideLoadedId(QByteArray const&)`), they
+are not `d()+0`/`d()+4` accessors.
+
+**The trap that would have made the device check vacuous.** Both of
+Nickel's date sorts fall back to `___SyncTime` for **sideloaded** content,
+and everything this browser lists is sideloaded. So for any never-opened
+sideloaded book the two keys **coincide exactly**. A control folder of
+never-opened books would show "recently added" and "recently read" in
+identical order and prove nothing whatsoever. The control folder must
+contain **at least one book that has actually been opened**.
+
+Related, from the same reading: `RecentKey`'s no-date path returns
+`ZERO_DB_DATE_ARRAY` (GOT-resolved), whose string is
+`0000-00-00T00:00:00.000`. So a missing date is never NULL and never an
+empty string — it is a sentinel that sorts before every real date, which is
+also a partial answer to the earlier open question about the on-disk format.
+
+Still open, and only the device can answer: **whether `content.DateAdded` is
+populated for sideloaded rows on this card.** If it is not, a sort built on
+it hands every row the same key and, under a stable sort, silently
+reproduces name order — no error, no log line. Hence the standing control:
+in a folder where name order and date order genuinely differ, the new sort
+MUST produce a different order from `NF_SORT_NAME` and MUST reverse under
+`descending`. Output identical to name order is a FAILURE, not a
+coincidence.
+
+### `tools/kobo.py ssh` exited 0 on an unreachable device — fixed 2026-09-04
+
+Found while trying to push to a device that had gone offline. `kobo.py ssh`
+printed `ssh: connect to host ... No route to host` and **exited 0**.
+
+This is the same trap CLAUDE.md already records for `push`, `pull` and
+`reboot` — `ssh` was simply never included in that fix. It is the worst verb
+to have it in, because every MEASUREMENT in this project is read out of
+`kobo.py ssh`'s stdout, so an unreachable device is indistinguishable from a
+device that answered with nothing.
+
+The verb deliberately does **not** enforce the remote command's exit status,
+and that is correct: `pidof nickel` returns non-zero when Nickel is not
+running, and callers rely on running a command specifically to see it fail.
+What separates the two cases is that **255 is ssh's own reserved code for a
+connection failure**, so only that is now fatal. A remote command that
+genuinely exits 255 is misreported, which is the deliberate trade — rare
+next to an offline device, and never silent.
+
+Verified against the real offline condition: the verb now exits 1 with
+`ssh could not reach the device (exit 255): ...`. The complementary case — a
+reachable device whose remote command exits non-zero staying non-fatal — is
+**untested**, pending the device coming back.
+
+One more instrument lesson from the same session, and it is a repeat: the
+first attempt to read this exit code piped the command through `tail -2`,
+so `$?` reported *tail's* status and printed a reassuring `push exit: 0`
+over a push that had just failed. CLAUDE.md's device-workflow section
+already says not to wrap these verbs in a pipe, for exactly this reason.
+Reading it and then doing it anyway is apparently easy; the working habit is
+to redirect to a file and check `$?` on the bare command.

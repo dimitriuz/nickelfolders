@@ -188,6 +188,15 @@ see `DEVICE.local.md`.
   PREVIOUS boot — indistinguishable from a boot loop unless you know to
   expect it. `wait` now also reads `/proc/uptime` and requires it below a
   threshold before declaring victory.
+- **`kobo.py ssh` now fails loudly when SSH ITSELF cannot connect** (exit
+  255), while still letting a remote command's own non-zero status through
+  as before — `pidof nickel` legitimately exits non-zero, and callers run
+  commands specifically to see them fail. Measured 2026-09-04 against an
+  offline device: the verb printed `No route to host` and **exited 0**, which
+  is the worst possible shape here because every *measurement* in this
+  project is read out of this verb's stdout, so an unreachable device looked
+  exactly like a device answering with nothing. `ssh` had simply never been
+  included in the push/pull/reboot fix below.
 - **`push`, `pull` and `reboot` now fail loudly on a failed ssh/scp**, instead
   of the old behavior (still exit 0, whatever `ssh`/`scp` printed to stdout
   notwithstanding). Two real sessions were burned by this before the fix: a
