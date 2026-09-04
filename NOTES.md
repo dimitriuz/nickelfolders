@@ -2614,3 +2614,124 @@ Negative control satisfied by construction: name-ascending starts `v01`,
 name-descending starts `v27`, and neither puts `v10` first. So the observed
 order cannot be name order in disguise, which was the specific failure mode
 this check was designed to exclude.
+
+## Task 15: cover thumbnails — the path, and the two routes rejected
+
+Device facts measured first, before any archaeology:
+
+- Covers live at
+  `/mnt/onboard/.kobo-images/<n>/<m>/<ImageId> - <VARIANT>.parsed` and are
+  **plain JPEG** despite the extension (`ff d8 ff e0 ... JFIF`), so Qt loads
+  them directly.
+- 22,621 cover files on this card, of which **22,437 are for sideloaded
+  books** — so this works for exactly the content this browser lists.
+- Variants actually generated: `N3_LIBRARY_GRID` (7544), `N3_LIBRARY_FULL`
+  (7544), `N3_FULL` (7533). **`N3_LIBRARY_LIST` exists as a string inside
+  libnickel and ZERO files are generated on this firmware** — the
+  list-shaped variant, which is the one a row would most want, is not there.
+  A string in the binary is not a file on the disk.
+- **Coverage is partial and that is normal**: the Fullmetal Alchemist folder
+  holds 27 volumes and **16** covers. Nickel renders a cover only once a
+  book has been seen in its own library views. So "no cover" is an ordinary
+  case to fall back from, not an error to report — the same shape as the
+  "file on disk with no library row" rule this project already follows.
+
+### `Content::getImageIdRaw()` — the route taken
+
+`_ZNK7Content13getImageIdRawEv`, non-static, `this` in r0, **no sret**,
+returns `QByteArray const*`, reading `ATTRIBUTE_IMAGE_ID` at
+**`Content::d() + 36`** — four independent sightings, and the GOT base was
+validated by reproducing the already-known `ATTRIBUTE_DATE_LAST_READ` at
+`+40`. Eight halfwords, byte-identical in shape to the `dateAdded()` call
+Task 14 already ships.
+
+The `Raw` naming convention **is** trustworthy for this particular pair, and
+this was checked rather than assumed, because Task 12 recorded that it is
+NOT trustworthy in general on this class: `getImageId()` is sret with `this`
+displaced to r1, `getImageIdRaw()` is neither.
+
+### The bucket hash is the Qt 4 ELF hash, NOT Qt 5's `qHash`
+
+This is the finding most likely to have been got wrong by reasoning instead
+of reading. We run inside Qt, so `qHash` is right there and free — and it
+produces a **different number**, which would have put every row's cover in
+the wrong directory, found nothing, and looked exactly like "covers do not
+work on this device".
+
+`IOUtil::bucketById`, over **UTF-16 code units** (not bytes):
+
+```
+h = 0
+for each code unit c:
+    h = c + (h << 4)
+    h ^= (h & 0xf0000000) >> 23
+    h &= 0x0fffffff
+n = h & 0xff
+m = (h >> 8) & 0xff
+```
+
+Mangling, measured from `Image::cleanId`: exactly four characters map to
+`_` — `/`, `:`, `.`, and space. Parentheses, hyphens and commas survive.
+
+Verified against a real path on this card: the ContentID for Fullmetal v25
+mangles as expected and hashes to **90/174**, matching the file that is
+actually on disk, and three near-miss manglings produce different buckets.
+The path format itself was proven three independent ways
+(`fileNameForType`'s `+11` length arithmetic, the `___FAKETYPE___` literal,
+and a migration's `%1/%2/%3 - %4.parsed`).
+
+**The negative control that matters here is non-ASCII**: hashing BYTES
+instead of UTF-16 CODE UNITS gives identical answers for every ASCII-only
+name, so an ASCII-only test suite cannot tell the two apart and would pass
+with the wrong implementation. This card's Cyrillic-named PDFs under
+`books/` are the device-side control.
+
+### `VolumeManager::imagePathsForVolume` — rejected, and worth recording why
+
+`_ZN13VolumeManager19imagePathsForVolumeERK6DeviceRK6Volumeb`. The obvious
+choice: Nickel's own path builder, which would do the mangling AND the
+bucket hash for us. Fully derived and then rejected on four counts, none of
+which could have been guessed from the outside:
+
+- **Static, no `this`** — sret in r0, `Device` in r1, `Volume` in r2, `bool`
+  in r3 (the bool proven by `cmp r3,#0; bne` and by the absence of any
+  stack-argument load). The same trap `VolumeManager::getById` set, on the
+  same class.
+- **The branch we would need is dead code in this firmware.** `bool=false`
+  is what appends the six `N3_*` names; the function's only caller is
+  `removeImagesByVolume`, which passes `true`. Calling it the way we want
+  would be exercising a path nothing in Nickel exercises.
+- It returns **13 paths of which at most 3 exist** — there is no `stat`
+  anywhere in its seven resolved PLT stubs — and the index is not stable
+  (entries 1/2 and 4/5 duplicate).
+- Every call constructs 13 `Image`s, each going
+  `IOUtil::getImageDataDir` → `getDataDir` → **`QDir::cd` on
+  `/mnt/onboard`**, and the not-found branch does `ScopedFSWrite` +
+  `QDir::mkpath` — **a write to `/mnt/onboard` from a render loop**. That
+  alone disqualifies it under this project's own rule about handles on the
+  user's card.
+
+`Image::getFileName(Device const&, Volume const&, QString const&)` (static,
+sret, one absolute path per call) was found as a cheaper variant of the same
+idea and is recorded as the fallback if the pure route ever fails.
+
+`ImageCache::getImage` was also rejected: sret with `this` in r1, returns a
+`QImage` our renderer cannot use anyway (a `QLabel`'s rich text needs a
+PATH — no public `QTextDocument`, and `rcc` is barred by the file-scope
+static-initialiser rule), and it needs an `Image` whose size has **no
+`operator new` call site anywhere in the firmware**, so it is unmeasurable
+under this project's sizing rule.
+
+### Still open
+
+Whether `Content::ImageId` is the mangled ContentID for **every** sideloaded
+row, or only for rows that already have a cover. The argument that it must
+be is an inference from a verbatim `memcpy` and from `cleanId` being absent
+from the read chain (it is only called at import) — not a measurement. The
+entire pure route rests on it, and **one log line settles it**, so the
+implementation logs the first row's raw ImageId next to its ContentID.
+
+Zero plain `bl` forms appeared in any function read for this task, so the
+literal-pool trap never arose here. Stated because it was checked, not
+skipped — six such words have already been mistaken for calls in this
+firmware.
