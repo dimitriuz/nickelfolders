@@ -2357,3 +2357,85 @@ precisely the part that distinguishes the rows, which is the trap worth
 naming here. The label-collision guard does not catch this either: it
 compares label STRINGS, which differ; it is visual clipping that made them
 the same.
+
+### Qt 5.2.1 will not resolve `<img src="file:///...">`; a bare path works
+
+Measured on hardware 2026-09-04, firmware 4.38.23684. This one cost a full
+push-and-restart cycle plus a misread screenshot, and it is the clearest
+vindication so far of keeping the host and device Qt versions deliberately
+skewed.
+
+The mod draws its own icons and writes them to `/tmp/nfolders-icons/*.png`
+(see above for why `/tmp`). Referencing them from a `TouchLabel`'s rich text:
+
+| form | device Qt 5.2.1 | host Qt 5.15 |
+|---|---|---|
+| `<img src="file:///tmp/nfolders-icons/folder.png">` | **placeholder box** | renders |
+| `<img src="/tmp/nfolders-icons/folder.png">`        | **renders**          | renders |
+
+So a bare absolute path with no scheme is the form that works on both, and
+the `file://` URL works only on the newer Qt. Every row drew Qt's own
+broken-image placeholder — a faint page with a folded corner, which is
+itself worth recognising, because it looks enough like a plausible
+"document" icon that the first report of it was "all files and folders have
+the same 'paper blank' icon" rather than "the images are not loading".
+
+**The files were never the problem, and the instrumentation is what proved
+it**: all five PNGs logged `wrote and loaded back 40x40` with distinct file
+sizes, and the fabricated control path logged null. That read-back check
+uses `QImage(path)` directly, while rich text goes through
+`QTextDocument::loadResource` — the two can disagree, and here they did.
+Without the read-back the obvious conclusion would have been "the drawing
+or the writing failed", and the search would have started in the wrong
+place entirely.
+
+The code had argued for the explicit scheme on the grounds that the
+alternative depends on the document's base URL staying empty, "a QLabel
+internal we do not own". That reasoning is sound and was wrong on 5.2.1;
+it is kept in the comment as a corrected claim rather than deleted, because
+it is the instinct a future reader will have too.
+
+#### The dev affordance that made the answer cheap
+
+Guessing the right form would have cost a rebuild AND a Nickel restart each,
+and a restart costs the owner a physical tap. So the form was made
+selectable at runtime from `/tmp/nfolders-imgsrc`, read on every listing
+build. Three forms became testable by writing one digit over ssh.
+
+**It did not work first time, for a reason worth recording**: a re-trigger
+(`touch /tmp/nfolders-native`) RE-PUSHES the existing dialog without
+rebuilding its rows — deliberate, since it recovers a dialog Nickel's own
+navigation left alive but off-screen. So the flag was set, the browser
+re-triggered, and the screenshot showed rows built with the OLD form while
+the log line honestly reported `form 0`. The log is what caught it; without
+the per-build form line the screenshot would have been read as "the plain
+path does not work either" and the real answer discarded.
+
+Two lessons, both cheap:
+
+- **A runtime selector needs a way to force the code path to re-run.** A
+  flag nothing re-reads is a flag that does nothing. A re-trigger now
+  rebuilds the current listing rather than only re-pushing.
+- **Log which variant produced the artifact you are about to judge.** The
+  form number in the log is the only thing that tied a screenshot to a
+  setting, and it is the same discipline as the MEASURED/FALLBACK marker on
+  the row-width line.
+
+### Elision has to reserve the SUFFIXES too
+
+Also measured from the same screenshots. With icons rendering, rows still
+clipped at the right edge: `... - 2016.pd`, `... - 2023.pc` (cut mid
+extension), and `(40%` with its `%)` gone.
+
+The name is elided to the available width, and THEN the row appends `/`,
+`  [not in library]`, `  [finished]` or `  (N%)`. So a name that exactly
+fills the width pushes its own suffix off the panel — and the suffix is what
+the row MEANS. A row with no suffix clipped slightly too, so the base
+reserve for the `<img>` box plus its `&nbsp;` separator was also short of
+what those actually occupy.
+
+Worth stating as a rule, since this is the second ordering bug of the same
+family in this file (the first being the letter guard that ran after the
+extension was appended, and so passed vacuously): **when a string is
+assembled in stages and measured in one of them, measure the stage that is
+actually rendered.**
