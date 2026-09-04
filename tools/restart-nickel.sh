@@ -301,16 +301,94 @@ trap 'log "signal TERM"; finish; exit 143' TERM
 # helper binaries can be running alongside it on some firmware/device
 # combinations, and a stale one of those left running is exactly the kind
 # of thing that makes a "restart" not actually be one.
+#
+# koboy.sh stops here: it warns and "continues anyway" if Nickel outlives
+# the wait. Measured on THIS device, twice, that is not actually safe --
+# Nickel catches SIGTERM (it is a Qt app with its own shutdown path:
+# session save, bookmark flush, DB close) and can still be mid-shutdown
+# when koboy.sh's identical wait gives up. Both runs here logged exactly
+# that ("still alive after 10s, continuing anyway") and it happened to
+# resolve to one Nickel both times -- but "happened to" is not a safety
+# property, and starting a second nickel on top of a first that is still
+# holding the framebuffer, the input devices and a write handle on
+# /mnt/onboard is a strictly worse state than this script refusing to
+# proceed. So: escalate instead of hoping, in two more steps below.
 log "stopping Nickel"
-killall -q -TERM nickel hindenburg sickel fickel strickel fontickel \
-                 adobehost foxitpdf iink
+NICKEL_KILLNAMES="nickel hindenburg sickel fickel strickel fontickel adobehost foxitpdf iink"
+killall -q -TERM $NICKEL_KILLNAMES
+
+# 10s / 40 * 250ms, UNCHANGED from koboy.sh's own budget: that figure is
+# sized for a real, catchable-signal shutdown to run to completion (the Qt
+# event loop processing the signal, flushing state, tearing down its own
+# windows), and koboy.sh's own measurements are the only precedent this
+# project has for how long that legitimately takes. There is no basis here
+# for shortening it -- doing so would just turn "graceful shutdown that is
+# slightly slow today" into "escalates to SIGKILL more often for no gain."
 i=0
 while pkill -0 nickel 2>/dev/null; do
-    [ "$i" -ge 40 ] && { log "WARNING nickel still alive after 10s, continuing anyway"; break; }
+    [ "$i" -ge 40 ] && break
     usleep 250000 2>/dev/null || sleep 1
     i=$((i + 1))
 done
-log "Nickel stopped after $((i * 250))ms"
+
+if ! pkill -0 nickel 2>/dev/null; then
+    log "Nickel stopped after SIGTERM, $((i * 250))ms"
+else
+    # SIGTERM did not finish the job inside its budget. SIGKILL cannot be
+    # caught, blocked or ignored -- the kernel delivers it unconditionally
+    # -- so unlike the wait above, this second wait is not accommodating a
+    # shutdown ROUTINE, only the kernel's own teardown of the process (and,
+    # rarely, a process stuck in an uninterruptible D-state on flash I/O
+    # that even SIGKILL cannot interrupt until the I/O completes). 8 * 250ms
+    # = 2s is generous for that and far short of the 10s above on purpose:
+    # if Nickel is still there after being SIGKILLed, waiting longer buys
+    # nothing, because a process that ignores an uncatchable signal past a
+    # couple of seconds is not going to disappear on its own.
+    log "WARNING nickel still alive after SIGTERM+${i}*250ms, escalating to SIGKILL"
+    killall -q -KILL $NICKEL_KILLNAMES
+    j=0
+    while pkill -0 nickel 2>/dev/null; do
+        [ "$j" -ge 8 ] && break
+        usleep 250000 2>/dev/null || sleep 1
+        j=$((j + 1))
+    done
+
+    if ! pkill -0 nickel 2>/dev/null; then
+        log "Nickel stopped after SIGKILL, $((j * 250))ms"
+    else
+        # Still here. This is the one outcome this script refuses to paper
+        # over: Nickel is ALIVE (not stopped, not "probably fine") and this
+        # script has no third escalation to offer. Starting a new
+        # hindenburg/nickel now would be the exact two-Nickels-at-once state
+        # the whole escalation above exists to avoid, so this path does NOT
+        # fall through to the trap's normal relaunch.
+        #
+        # That is deliberately safe rather than deliberately unhelpful: the
+        # dangerous outcome of a dev script is a dead panel with nothing
+        # backing it, and this is not that -- Nickel is still running, so
+        # there is still a UI, just not a freshly-loaded one. Exiting here
+        # leaves the device in the same usable state it was in before this
+        # script was ever run.
+        #
+        # `restored=1` before exiting is what keeps the EXIT trap (below)
+        # from undoing that safety: `finish` calls `restore`, and `restore`
+        # is guarded to run at most once (see its own idempotency comment,
+        # above) -- setting the guard here makes that call a deliberate
+        # no-op instead of touching it. The trap's OTHER job, `rm -rf
+        # "$LOCK"`, is untouched and still runs, so a later, cleanly-run
+        # attempt is not left blocked by this one. Every path that DID
+        # successfully kill Nickel (both branches above) leaves `restored`
+        # unset, so for those the trap's relaunch behaves exactly as it did
+        # before this change.
+        log "FATAL nickel survived SIGTERM and SIGKILL after $((i * 250))ms + $((j * 250))ms."
+        log "      Nickel is still running, so the panel still has a UI. Refusing"
+        log "      to start a second one on top of it. NOT relaunching."
+        restored=1
+        echo "restart-nickel.sh: nickel survived SIGKILL -- refusing to start a second one. See $LOG." >&2
+        log "=== restart-nickel.sh aborting, rc=1 (old nickel left running, untouched)"
+        exit 1
+    fi
+fi
 
 # Nothing else to do in the main body: restore() (above) is what brings
 # Nickel back, and it runs from the EXIT trap when this script reaches its
