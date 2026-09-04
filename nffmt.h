@@ -228,4 +228,52 @@ enum nf_icon_kind {
 // same as nf_matches_filter does.
 nf_icon_kind nf_icon_kind_for(QString const& name, bool isDir);
 
+// --- the two-form label pieces ------------------------------------------
+//
+// Every fragment nfview.cc appends to a row label exists in TWO forms: the
+// RICH-TEXT markup that actually gets rendered, and a plain-text twin whose
+// only job is to be measured (QFontMetrics measures plain text, and rich
+// text collapses runs of ordinary whitespace, so neither form can do the
+// other's job). The twin is what pays for the fragment out of the row's
+// width budget BEFORE the name is elided into what is left -- the suffixes
+// are what a row MEANS, so they must never be the part that falls off the
+// right edge.
+//
+// Both forms are built HERE, in one function per fragment, for the reason
+// this project keeps repeating: a pair written out twice is a pair that
+// gets edited on one side. Being pure, they are also the one part of the
+// elision work a host test can run, and the invariant the tests actually
+// pin is the one that matters to the measurement -- substituting `&nbsp;`
+// in the markup form must yield the plain form EXACTLY.
+//
+// That invariant is not hypothetical. Device-measured 2026-09-04: rows
+// clipped at the right edge (".pd" for ".pdf", "(40%" for "(40%)") with the
+// suffix already paid for, and the twins were spelling their separators
+// with ASCII spaces (U+0020) while the markup spelled the same separators
+// `&nbsp;` (U+00A0) -- so every measurement was short by the difference
+// between those two characters, per separator, and nothing could see it
+// while both forms were built inline in the row loop.
+inline QChar nf_nbsp(void) { return QChar(0x00a0); }
+
+// The DEGRADED icon fallback: what a row shows when its PNG could not be
+// written or would not load back (nfview.cc draws and verifies those). All
+// five badges are five characters wide, so the labels after them line up.
+// The markup form is DERIVED from the plain one by substitution rather than
+// written out a second time.
+void nf_icon_badge(nf_icon_kind kind, QString *markup, QString *plain);
+
+// The trailing suffix for one row: the folder marker, the "not in library"
+// reason, or the reading-progress marker. Exactly one of them, in that
+// priority order, or nothing -- see nffmt.cc for what each one means and
+// why the order is what it is. Either output pointer may be NULL.
+void nf_row_suffix(nf_row const& row, QString *markup, QString *plain);
+
+// What is left of a row's width for the NAME, once the leading icon and the
+// trailing suffix have both been paid for. Floored (never below
+// NF_NAME_MIN_PX) because QFontMetrics::elidedText at or below the
+// ellipsis' own width returns the ellipsis alone: a row degrades to "a stub
+// plus its suffix", never to "no name at all".
+#define NF_NAME_MIN_PX 60
+int nf_name_budget_px(int rowWidth, int iconWidth, int suffixWidth);
+
 #endif

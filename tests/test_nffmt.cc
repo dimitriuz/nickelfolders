@@ -572,6 +572,187 @@ static void test_icon_kind_zero_value_is_unknown_not_folder(void) {
     CHECK(NF_ICON_FOLDER != 0);
 }
 
+// --- the two-form label pieces ------------------------------------------
+//
+// THE INVARIANT these tests exist for, and the measurement behind it: on
+// 2026-09-04 the device clipped its rows at the right edge (".pd" for ".pdf",
+// "(40%" for "(40%)") even though the suffix was already being measured and
+// paid for before the name was elided. The twins were spelling their
+// separators with ASCII spaces while the rendered markup spelled the same
+// separators `&nbsp;` -- two different characters, two different advances --
+// so every measurement was short by the difference, per separator. Words
+// matching is not enough: the measured form has to be, character for
+// character, what the markup RENDERS as.
+//
+// The device's own QFontMetrics is not reachable from here, so what is
+// testable is exactly that equality, which is the part that was wrong.
+
+// `&nbsp;` is the only entity these fragments carry (nffmt.cc says why no
+// other one can appear), so substituting it is a complete de-markup here.
+static QString nf_test_rendered(QString const& markup) {
+    return QString(markup).replace(QStringLiteral("&nbsp;"), QString(nf_nbsp()));
+}
+
+static nf_row nf_test_row(bool isDir, bool hasRow, bool finished, int percentRead) {
+    nf_row r;
+    r.isDir       = isDir;
+    r.hasRow      = hasRow;
+    r.finished    = finished;
+    r.percentRead = percentRead;
+    return r;
+}
+
+static void test_suffix_twin_is_what_the_markup_renders_as(void) {
+    nf_row const rows[] = {
+        nf_test_row(true,  false, false, -1),  // a folder
+        nf_test_row(false, false, false, -1),  // no library row
+        nf_test_row(false, true,  true,   0),  // finished
+        nf_test_row(false, true,  false, 40),  // the measured "(40%)" row
+        nf_test_row(false, true,  false,  0),  // unread: no suffix at all
+    };
+    for (int i = 0; i < (int)(sizeof rows / sizeof rows[0]); i++) {
+        QString markup, plain;
+        nf_row_suffix(rows[i], &markup, &plain);
+        CHECK(nf_test_rendered(markup) == plain);
+        // The twin must not still be carrying entity SOURCE text either --
+        // that would measure "&nbsp;" as six characters instead of one.
+        CHECK(!plain.contains(QLatin1Char('&')));
+    }
+}
+
+// The equality above is satisfied BY CONSTRUCTION (nffmt.cc derives the
+// markup from the plain form by substitution), so on its own it cannot see
+// the bug that started this: it passes just as happily when BOTH forms spell
+// the separator with ASCII spaces. Reintroducing that is what this test
+// catches -- the separator has to be the non-breaking character on both
+// sides, because an ordinary space is a collapsible run and a wrap
+// opportunity in rich text, i.e. rendered at a width the plain twin did not
+// measure. (Checked as a negative control: with the separator reverted to
+// ASCII spaces, this test fails and the one above does not.)
+static void test_suffix_separator_is_non_breaking(void) {
+    QString const sepMarkup = QStringLiteral("&nbsp;&nbsp;");
+    QString const sepPlain(2, nf_nbsp());
+
+    nf_row const rows[] = {
+        nf_test_row(false, false, false, -1),  // no library row
+        nf_test_row(false, true,  true,   0),  // finished
+        nf_test_row(false, true,  false, 40),  // the measured "(40%)" row
+    };
+    for (int i = 0; i < (int)(sizeof rows / sizeof rows[0]); i++) {
+        QString markup, plain;
+        nf_row_suffix(rows[i], &markup, &plain);
+        CHECK(markup.startsWith(sepMarkup));
+        CHECK(plain.startsWith(sepPlain));
+        // Nothing but the separator run may be non-breaking: the spaces
+        // INSIDE "[not in library]" are ordinary words, and a single space
+        // between words is not a collapsible run.
+        CHECK(!plain.mid(sepPlain.length()).contains(nf_nbsp()));
+    }
+
+    // A folder's "/" has no separator at all -- it terminates the name it
+    // belongs to rather than standing apart from it.
+    QString plain;
+    nf_row_suffix(nf_test_row(true, false, false, -1), NULL, &plain);
+    CHECK(!plain.startsWith(sepPlain));
+}
+
+static void test_icon_badge_twin_is_what_the_markup_renders_as(void) {
+    nf_icon_kind const kinds[] = {
+        NF_ICON_UNKNOWN, NF_ICON_FOLDER, NF_ICON_BOOK, NF_ICON_COMIC, NF_ICON_PDF,
+    };
+    for (int i = 0; i < (int)(sizeof kinds / sizeof kinds[0]); i++) {
+        QString markup, plain;
+        nf_icon_badge(kinds[i], &markup, &plain);
+        CHECK(nf_test_rendered(markup) == plain);
+        CHECK(!plain.contains(QLatin1Char('&')));
+        // Five characters of badge plus one separator, all five kinds, so the
+        // labels after them line up -- "[ ? ]" included, whose inner spaces
+        // are non-breaking for exactly that reason.
+        CHECK(plain.length() == 6);
+        CHECK(!plain.contains(QLatin1Char(' ')));
+    }
+}
+
+// The suffixes are what a row MEANS, so which one a row gets is worth pinning
+// separately from how it is spelled -- this is the same priority order the row
+// loop used to carry inline (nfview.cc), moved, not changed.
+static void test_suffix_priority(void) {
+    QString plain;
+
+    // A folder: the trailing "/", and NO separator in front of it.
+    nf_row_suffix(nf_test_row(true, false, false, -1), NULL, &plain);
+    CHECK_EQ_STR(plain, "/");
+
+    // isDir wins even over a percentage that should never be there for one.
+    nf_row_suffix(nf_test_row(true, true, true, 40), NULL, &plain);
+    CHECK_EQ_STR(plain, "/");
+
+    // A file with no library row says so, in the label TEXT.
+    nf_row_suffix(nf_test_row(false, false, false, -1), NULL, &plain);
+    CHECK(plain.endsWith(QStringLiteral("[not in library]")));
+
+    // ... and that reason outranks any progress the row happens to carry: a
+    // row with no library row has no trustworthy progress to report.
+    nf_row_suffix(nf_test_row(false, false, true, 40), NULL, &plain);
+    CHECK(plain.endsWith(QStringLiteral("[not in library]")));
+
+    // "Finished" outranks a stale percentage from an abandoned re-read.
+    nf_row_suffix(nf_test_row(false, true, true, 12), NULL, &plain);
+    CHECK(plain.endsWith(QStringLiteral("[finished]")));
+
+    nf_row_suffix(nf_test_row(false, true, false, 40), NULL, &plain);
+    CHECK(plain.endsWith(QStringLiteral("(40%)")));
+}
+
+// 0% and -1 both mean "nothing to show" (nffmt.cc has Nickel's own [1,99]
+// clamp as the reason), and an unread book gets no suffix at all.
+static void test_suffix_hides_zero_and_unknown_progress(void) {
+    QString markup, plain;
+
+    nf_row_suffix(nf_test_row(false, true, false, 0), &markup, &plain);
+    CHECK(plain.isEmpty());
+    CHECK(markup.isEmpty());
+
+    nf_row_suffix(nf_test_row(false, true, false, -1), &markup, &plain);
+    CHECK(plain.isEmpty());
+    CHECK(markup.isEmpty());
+}
+
+// Either output may be NULL -- the row loop asks for both, nf_icon_width_px
+// asks for the plain form only, and nf_icon_markup for the markup only.
+static void test_two_form_builders_accept_a_null_output(void) {
+    nf_row_suffix(nf_test_row(false, false, false, -1), NULL, NULL);
+    nf_icon_badge(NF_ICON_PDF, NULL, NULL);
+
+    QString one;
+    nf_row_suffix(nf_test_row(false, true, false, 40), &one, NULL);
+    CHECK(one.endsWith(QStringLiteral("(40%)")));
+    nf_icon_badge(NF_ICON_PDF, NULL, &one);
+    CHECK(one.startsWith(QStringLiteral("[PDF]")));
+}
+
+// The suffix is subtracted BEFORE the name is elided -- that is the whole
+// point of the budget -- so a longer suffix must leave a shorter name, never
+// push itself off the edge.
+static void test_name_budget_pays_for_the_icon_and_the_suffix_first(void) {
+    CHECK(nf_name_budget_px(1000, 0, 0)   == 1000);
+    CHECK(nf_name_budget_px(1000, 45, 0)  == 955);
+    CHECK(nf_name_budget_px(1000, 45, 120) == 835);
+    // Strictly decreasing in the suffix width, which is the property the
+    // clipped "(40%" row needed and did not get.
+    CHECK(nf_name_budget_px(1000, 45, 120) < nf_name_budget_px(1000, 45, 60));
+}
+
+// A pathological row degrades to "a stub plus its suffix", never to "no name
+// at all" (an elide width at or below the ellipsis' own returns the ellipsis
+// alone) and never to a negative width.
+static void test_name_budget_floors_instead_of_going_negative(void) {
+    CHECK(nf_name_budget_px(200, 300, 300) == NF_NAME_MIN_PX);
+    CHECK(nf_name_budget_px(0, 0, 0)       == NF_NAME_MIN_PX);
+    CHECK(nf_name_budget_px(-1000, 0, 0)   == NF_NAME_MIN_PX);
+    CHECK(NF_NAME_MIN_PX > 0);
+}
+
 int main(void) {
     test_unpadded_volume_dirs();
     test_strip_fullmetal();
@@ -614,5 +795,13 @@ int main(void) {
     test_icon_kind_is_case_insensitive();
     test_icon_kind_agrees_with_the_allowlist();
     test_icon_kind_zero_value_is_unknown_not_folder();
+    test_suffix_twin_is_what_the_markup_renders_as();
+    test_suffix_separator_is_non_breaking();
+    test_icon_badge_twin_is_what_the_markup_renders_as();
+    test_suffix_priority();
+    test_suffix_hides_zero_and_unknown_progress();
+    test_two_form_builders_accept_a_null_output();
+    test_name_budget_pays_for_the_icon_and_the_suffix_first();
+    test_name_budget_floors_instead_of_going_negative();
     NF_TEST_MAIN_END
 }

@@ -46,7 +46,6 @@
 #include <QBrush>
 #include <QDateTime>
 #include <QDir>
-#include <QFile>
 #include <QFileInfo>
 #include <QFileInfoList>
 #include <QFont>
@@ -61,6 +60,7 @@
 #include <QPointF>
 #include <QPushButton>
 #include <QRectF>
+#include <QSize>
 #include <QString>
 #include <QVBoxLayout>
 #include <QVector>
@@ -188,6 +188,29 @@
 // tears the dialog down -- a later nf_browser_show then builds a fresh
 // one rather than re-pushing a dead pointer.
 static void *nf_browser_active_dialog = NULL;
+
+// The content widget nf_browser_go most recently handed to
+// N3Dialog::setContent -- i.e. the one currently ON SCREEN inside the
+// dialog's own chrome. Same file-scope POD discipline as the dialog pointer
+// above, and it exists for exactly one reason: it is the only way to MEASURE
+// the width N3Dialog actually gives its content, which is the dialog's width
+// LESS Nickel's own chrome inset. That inset is not readable from any API
+// this mod has -- nf_row_width_px used to say so and over-estimate by it,
+// which is one of the two terms that left rows clipping at the right edge on
+// the 2026-09-04 device run.
+//
+// It works because of the navigation model (nfview.h): the content widget is
+// replaced, never the dialog. By the time a navigation builds row N+1, the
+// widget from navigation N has been laid out inside the real dialog on the
+// real panel, and its width() is that measurement. Only ever READ for its
+// width, never dereferenced as anything else.
+//
+// Cleared by the widget's own destroyed() signal, and the clear is guarded on
+// the pointer still BEING this widget: setContent deleteLater()s the previous
+// content, so an OLD widget's destroyed() fires after its successor has
+// already been recorded here, and an unguarded clear would wipe the live
+// pointer instead of the dead one.
+static void *nf_browser_active_content = NULL;
 
 // The one directory nf_browser_go (below) most recently rebuilt content
 // for -- i.e. what BACK steps up from. Set at the top of every call to
@@ -872,55 +895,46 @@ static void nf_icons_generate(void) {
            ok, NF_ICON_FILE_COUNT, NF_ICON_PX, NF_ICON_STROKE_PX, NF_ICON_DIR);
 }
 
-// The DEGRADED fallback: what a row shows when its PNG could not be written
-// or would not load back. These are the badges .pdf and unknown used before
-// this file drew its own icons, extended to the other three kinds so that
-// every kind has an answer -- a folder row losing its icon must not lose its
-// marker (it also still carries the trailing "/", which is the real one).
-//
-// Built in TWO forms in one place, so the pair can never drift: rich text
-// collapses runs of whitespace, so the markup form needs entities, while
-// QFontMetrics measures plain text, so the measured form needs real spaces.
-// The markup form is DERIVED from the plain one by substitution rather than
-// written out a second time -- "[ ? ]" is the only badge where the two differ
-// at all, and it is exactly the kind of pair that gets edited on one side.
-// All five are five characters wide, so the labels after them line up.
-static void nf_icon_badge(nf_icon_kind kind, QString *markup, QString *plain) {
-    char const *text = NULL;
-    switch (kind) {
-        case NF_ICON_FOLDER:  text = "[DIR]"; break;
-        case NF_ICON_BOOK:    text = "[EPB]"; break;
-        case NF_ICON_COMIC:   text = "[CMC]"; break;
-        case NF_ICON_PDF:     text = "[PDF]"; break;
-        case NF_ICON_UNKNOWN:
-        default:              text = "[ ? ]"; break;
-    }
-    QString t = QString::fromLatin1(text);
-    if (plain)
-        *plain = t + QLatin1Char(' ');
-    if (markup)
-        *markup = QString(t).replace(QLatin1Char(' '), QStringLiteral("&nbsp;"))
-                + QStringLiteral("&nbsp;");
-}
+// The DEGRADED text-badge fallback -- what a row shows when its PNG could not
+// be written or would not load back -- MOVED to nffmt.cc (nf_icon_badge),
+// with its two-form contract and the reason both forms are built together.
+// It is a pure function of a kind, so it belongs on the host-testable side of
+// the boundary, and the invariant Fix 2 leans on (the measured form is
+// character-for-character what the rendered form renders as) now has tests.
 
 // The leading markup for one row, separator included, so the row loop never
 // has to know which kinds render as an image and which as text.
-// Forward-declared: the definition sits with the elision helpers below,
-// next to the other dev-only affordance, but nf_icon_markup needs it here.
-static int nf_img_src_form(void);
-
 static QString nf_icon_markup(nf_icon_kind kind) {
     nf_icons_generate();
 
     nf_icon_file const *e = nf_icon_entry(kind);
     if (e && e->ok) {
-        // "file://" + an absolute path, NOT the bare path. Both can work:
-        // QTextDocument::loadResource has a last-resort branch that stamps a
-        // file scheme onto a scheme-less relative URL when the document's own
-        // base URL is empty. But that branch depends on the document's base
-        // URL staying empty, which is a QLabel internal we do not own, and
-        // an explicit scheme needs none of it -- QUrl::toLocalFile() answers
-        // directly. There is no reason to route this through a fallback.
+        // A BARE ABSOLUTE PATH -- no scheme. DEVICE-MEASURED 2026-09-04 on
+        // firmware 4.38.23684 (Qt 5.2.1): this form renders all five icons,
+        // and `file:///tmp/...` renders NONE of them -- every row drew Qt's
+        // own broken-image placeholder (a faint page with a folded corner)
+        // instead. Verified by screenshot, with the two forms selected at
+        // runtime and the build logging which one it used, so the images
+        // cannot be misattributed.
+        //
+        // The PNGs were never the problem, which is the other half of the
+        // measurement: all five wrote and loaded back at 40x40 with distinct
+        // file sizes, and the never-written control path reported null. Only
+        // the reference form was wrong.
+        //
+        // THE REASONING THIS REPLACES, kept because the next reader will
+        // have exactly the same instinct: this used to emit "file://" + the
+        // path, arguing that QTextDocument::loadResource's scheme-less
+        // branch depends on the document's base URL staying empty, which is
+        // "a QLabel internal we do not own", where an explicit scheme needs
+        // none of it. That was reasonable and it was WRONG on 5.2.1 -- the
+        // explicit-scheme path is the one that fails there. Do not "fix"
+        // this bare path back into a URL; it is the measured form, and the
+        // QLabel internal it leans on is measured working on the firmware
+        // this mod runs against. (It was verified on HOST Qt 5.15, where
+        // file:// does work -- which is exactly the 5.15-versus-5.2.1 skew
+        // the Makefile's two build paths are kept apart to expose, showing
+        // up here as a runtime difference rather than a build failure.)
         //
         // WIDTH AND HEIGHT are the dimensions read back off the FILE
         // (nf_icons_generate), so the <img> box is a number this code
@@ -928,59 +942,18 @@ static QString nf_icon_markup(nf_icon_kind kind) {
         // nf_icon_width_px charges the elision below, which is the only way
         // those two can agree.
         //
-        // &nbsp; rather than a plain space for the separator, here and in the
-        // badges above: this string is rich text by the time QLabel sees it,
-        // and HTML collapses runs of whitespace.
-        // DEV-ONLY, and the reason it exists is worth stating: the form
-        // above was verified on HOST Qt 5.15 and does NOT render on the
-        // device's Qt 5.2.1, where every row drew Qt's own broken-image
-        // placeholder instead. The files themselves are fine -- all five
-        // wrote and read back at 40x40 with distinct sizes, and the control
-        // path reported null -- so the fault is purely in how QTextDocument
-        // resolves an <img src> on 5.2.1, which is exactly the version skew
-        // the Makefile's two build paths are kept apart to expose.
-        //
-        // Rather than spend a rebuild AND a Nickel restart per guess at the
-        // right form, the form is selected at RUNTIME from
-        // /tmp/nfolders-imgsrc, re-read on every listing build. So a form can
-        // be tried by writing one digit over ssh and re-triggering the
-        // browser -- no rebuild, no restart, no taps from the owner. /tmp is
-        // tmpfs, so this is not a handle on /mnt/onboard (CLAUDE.md).
-        //
-        // Once one form is known good on 5.2.1 this selector should collapse
-        // to that form plus a comment recording which won and why. Leaving a
-        // dev-only branch in shipped code is not the intent.
-        QString path = QString::fromLatin1(e->path);
-        QString src;
-        switch (nf_img_src_form()) {
-            case 1:  src = path; break;                                  // plain absolute path
-            case 2:  src = QStringLiteral("file:") + path; break;         // single-slash scheme
-            case 0:
-            default: src = QStringLiteral("file://") + path; break;       // as shipped, fails on 5.2.1
-        }
+        // &nbsp; rather than a plain space for the separator, here and in
+        // nf_icon_badge's fallback: this string is rich text by the time
+        // QLabel sees it, and HTML collapses runs of whitespace. It is also
+        // why nf_icon_width_px charges a U+00A0 and not a U+0020 -- the two
+        // are different characters with different widths.
         return QStringLiteral("<img src=\"%1\" width=\"%2\" height=\"%3\">&nbsp;")
-                   .arg(src).arg(e->w).arg(e->h);
+                   .arg(QString::fromLatin1(e->path)).arg(e->w).arg(e->h);
     }
 
     QString badge;
     nf_icon_badge(kind, &badge, NULL);
     return badge;
-}
-
-// DEV-ONLY: which <img src> form nf_icon_html emits, read fresh from
-// /tmp/nfolders-imgsrc on every call so a form can be tested with a
-// re-trigger rather than a rebuild-and-restart. Absent, unreadable or
-// out-of-range means form 0, i.e. exactly the behaviour that shipped.
-// See nf_icon_html for the measurement that made this necessary.
-static int nf_img_src_form(void) {
-    QFile f(QStringLiteral("/tmp/nfolders-imgsrc"));
-    if (!f.open(QIODevice::ReadOnly))
-        return 0;
-    QByteArray raw = f.readAll().trimmed();
-    f.close();
-    bool ok = false;
-    int  v  = raw.toInt(&ok);
-    return (ok && v >= 0 && v <= 2) ? v : 0;
 }
 
 // --- row label elision -------------------------------------------------
@@ -1012,6 +985,26 @@ static int nf_img_src_form(void) {
 // it, "..." otherwise (QTextEngine's elidedText) -- so there is nothing to
 // choose here and no glyph to risk on this panel; whichever it uses is one the
 // font already has.
+//
+// ELIDING TO THE RIGHT NUMBER is the harder half, and the 2026-09-04 device
+// run is why it is now done in two passes rather than one. Rows still clipped
+// at the right edge -- "... - 2016.pd", "(40%" without its "%)" -- with the
+// suffix ALREADY measured and reserved before the name was elided. So the
+// order was not the bug (it was already right); the WIDTHS were, and this file
+// could not tell which of them off-device:
+//
+//   - the separators were measured as ASCII spaces and rendered as U+00A0,
+//   - the row width was the dialog's, with Nickel's own chrome inset only
+//     estimated (nf_row_width_px's old comment admitted the over-estimate),
+//   - the TouchLabel's own inset was not subtracted at all,
+//   - and FontSizeAdjustingLabel may change its point size when the text is
+//     set, i.e. after the QFontMetrics used to measure it was read.
+//
+// The first three are now measured terms (see the budget in the row loop).
+// The fourth cannot be, so the row loop ends with a pass that measures the
+// ASSEMBLED widget (QLabel::sizeHint) and re-elides if it overflows -- which
+// covers all four and anything else of the same shape, and logs the shortfall
+// instead of hiding it.
 
 // The panel's own visible width, MEASURED and already recorded in CLAUDE.md:
 // the framebuffer is padded to 1280x1792 against a visible panel of 1264x1680,
@@ -1035,51 +1028,121 @@ static int nf_img_src_form(void) {
 // Width in px available to ONE row, icon and suffix not yet deducted (the row
 // loop does both, per row, because both vary per row).
 //
-// Two paths, and *measured tells the caller which one it got so the log line
-// can say so: a silently wrong width would either elide text that fits or fail
-// to elide text that does not, and on a screenshot both of those look like
-// "the elision is broken" with no way to tell them apart.
+// THREE sources, best first, and *source tells the caller which one it got so
+// the log line can say so: a silently wrong width would either elide text that
+// fits or fail to elide text that does not, and on a screenshot both of those
+// look like "the elision is broken" with no way to tell them apart.
 //
-// The dialog, not the content widget, is what gets read: `content` is built
-// fresh on every navigation and handed to setContent at the very END of
-// nf_browser_go, so at row-build time it has never been laid out and its
-// width() is always the Qt default -- it can never be the measured path. The
-// dialog IS laid out on every navigation after the first.
+//   "CONTENT"  the width the PREVIOUS navigation's content widget was
+//              actually given inside the dialog -- see
+//              nf_browser_active_content. This is the only one of the three
+//              that has Nickel's own N3Dialog chrome inset already taken out
+//              of it, because it is a widget that really was laid out inside
+//              that chrome. Unavailable on the very first listing (there is
+//              no previous content yet), which is why the other two remain.
+//   "DIALOG"   N3Dialog::width(), device-measured at 1264 on 4.38.23684. An
+//              OVER-estimate by however wide the chrome inset is -- which is
+//              one of the two terms that left rows clipping on the
+//              2026-09-04 run, and precisely what the CONTENT source above
+//              was added to stop guessing at.
+//   "FALLBACK" the panel constant. The FIRST listing specifically needs it:
+//              nf_browser_go builds the root screen BEFORE nf_browser_show
+//              calls pushView (see the call order there), so on that one
+//              pass the dialog genuinely has not been sized to the screen
+//              yet and its width() is Qt's 640x480 default.
 //
-// What this still cannot subtract is N3Dialog's own content-area inset, which
-// is Nickel's chrome and not readable from here; the layout margins below are
-// ours and are queried rather than guessed. So this is an OVER-estimate by
-// however wide that inset is, which shows up as a little residual clipping
-// rather than as over-eager elision -- deliberately that way round, and one
-// for the screenshot to settle rather than for this file to pad by a guess.
-//
-// The measured path can also over-report for a second reason worth naming:
-// if Nickel sizes its own top-level widgets to the PADDED framebuffer (1280)
-// rather than to the visible panel (1264), width() hands back 16 px that are
-// not on the glass. That is exactly why the log line below prints the raw
-// width() as well as the number actually used -- the two together say which
-// of the two the firmware thinks the screen is, which is a device measurement
-// nobody has taken yet, not something to pre-compensate for here.
-static int nf_row_width_px(N3Dialog *dialog, QLayout *layout, bool *measured, int *rawDialogWidth) {
-    int w = reinterpret_cast<QWidget*>(dialog)->width();
-    *rawDialogWidth = w;
-    *measured = (w >= NF_WIDTH_PLAUSIBLE_MIN_PX);
-    if (!*measured)
+// Both measured sources are CLAMPED to the visible panel width, and the clamp
+// is a measurement rather than a pad: the framebuffer is 1280 wide against
+// 1264 visible px (CLAUDE.md), so any widget sized to the padded buffer would
+// hand back 16 px that are not on the glass. N3Dialog::width() reads 1264 on
+// this firmware, so the clamp is a no-op here and a floor under a firmware
+// that sizes its top-level widgets differently.
+static int nf_row_width_px(N3Dialog *dialog, QLayout *layout,
+                           char const **source, int *rawDialogWidth) {
+    int contentW = 0;
+    if (nf_browser_active_content)
+        contentW = reinterpret_cast<QWidget*>(nf_browser_active_content)->width();
+    int dialogW = reinterpret_cast<QWidget*>(dialog)->width();
+    *rawDialogWidth = dialogW;
+
+    int w;
+    if (contentW >= NF_WIDTH_PLAUSIBLE_MIN_PX) {
+        *source = "CONTENT, measured off the widget the dialog last laid out";
+        w = contentW;
+    } else if (dialogW >= NF_WIDTH_PLAUSIBLE_MIN_PX) {
+        *source = "DIALOG, measured but not less N3Dialog's own chrome inset";
+        w = dialogW;
+    } else {
+        *source = "FALLBACK, nothing is laid out yet";
+        w = NF_PANEL_VISIBLE_WIDTH_PX;
+    }
+    if (w > NF_PANEL_VISIBLE_WIDTH_PX)
         w = NF_PANEL_VISIBLE_WIDTH_PX;
 
+    // OUR OWN layout margins, queried rather than guessed -- 34+34 on this
+    // firmware's default QVBoxLayout, i.e. the 1264 -> 1196 step in the log
+    // line below.
     QMargins m = layout->contentsMargins();
     w -= m.left() + m.right();
 
     // A deliberate floor, not dead code: QFontMetrics::elidedText with a
     // width at or below the ellipsis' own width returns the ellipsis alone (or
     // nothing), i.e. a screen of rows reading "..." and no names at all. No
-    // path above can currently produce a number that low -- both branches
-    // start from at least 800 -- but this is the one place where a bad width
+    // path above can currently produce a number that low -- every branch
+    // starts from at least 800 -- but this is the one place where a bad width
     // erases the entire listing rather than degrading it, so the floor is
     // cheap insurance worth keeping.
     if (w < 200)
         w = 200;
     return w;
+}
+
+// The px a TouchLabel spends on ITSELF before any of our text is drawn, and
+// the second of the two terms the 2026-09-04 device run showed missing: the
+// row width above is the width of the WIDGET, not of the text area inside it,
+// and eliding against the former over-runs the latter by exactly this much.
+//
+// Every term is a property read off the widget Nickel's own TouchLabel
+// constructor just finished initialising -- none of it is guessed, and none of
+// it needs the widget to have been laid out yet (contentsMargins/margin/
+// indent/alignment are all set-values, not geometry). It mirrors, term for
+// term, what QLabelPrivate::documentRect() itself subtracts before handing the
+// remainder to QTextDocument::setTextWidth, which is the number that actually
+// decides where rich text gets cut:
+//
+//   contentsMargins()   QFrame folds its own frameWidth into these
+//                       (QFramePrivate::updateFrameWidth calls
+//                       setContentsMargins), so reading frameWidth() as a
+//                       separate term would double-count it.
+//   margin()            QLabel::margin, applied on both sides.
+//   indent()            QLabel::indent, applied on the aligned side(s) only.
+//                       A NEGATIVE indent means "default", which QLabel then
+//                       computes as fm.width('x')/2 - margin, and only when
+//                       the label has a frame -- both conditions reproduced
+//                       here rather than assumed away, because a styled
+//                       TouchLabel may well have a frame.
+//
+// Expected to be 0 on a plain QLabel with no frame and no stylesheet, which
+// is why it is LOGGED: a zero here says the clipping came from somewhere else,
+// and that is a measurement rather than a silence.
+static int nf_row_label_inset_px(QLabel *label, QFontMetrics const &fm) {
+    QMargins cm = label->contentsMargins();
+    int inset = cm.left() + cm.right();
+
+    int margin = label->margin();
+    inset += 2 * margin;
+
+    int indent = label->indent();
+    if (indent < 0 && label->frameWidth())
+        indent = fm.width(QLatin1Char('x')) / 2 - margin;
+    if (indent > 0) {
+        Qt::Alignment a = label->alignment();
+        if (a & Qt::AlignLeft)
+            inset += indent;
+        if (a & Qt::AlignRight)
+            inset += indent;
+    }
+    return inset;
 }
 
 // The px this row's LEADING icon markup costs, so the name can be elided to
@@ -1095,15 +1158,24 @@ static int nf_row_width_px(N3Dialog *dialog, QLayout *layout, bool *measured, in
 // borrowed folder arrow was 15x26, so at height=40 it rendered ~23 px wide
 // and this function charged 40, over-reserving ~17 px on every folder row.
 //
-// The two-form badge (nf_icon_badge) is measured EXACTLY, in this row's own
-// font, because it is text -- which is also why the plain form exists at all.
+// The two-form badge (nf_icon_badge, nffmt.cc) is measured EXACTLY, in this
+// row's own font, because it is text -- which is also why the plain form
+// exists at all.
 static int nf_icon_width_px(nf_icon_kind kind, QFontMetrics const &fm) {
     nf_icons_generate();
 
     nf_icon_file const *e = nf_icon_entry(kind);
     if (e && e->ok)
-        // Plus nf_icon_markup's own trailing &nbsp; separator.
-        return e->w + fm.width(QLatin1Char(' '));
+        // Plus nf_icon_markup's own trailing separator, measured as the
+        // NON-BREAKING SPACE the markup really emits (`&nbsp;`, U+00A0) and
+        // not as the ASCII space this line used to charge. Two different
+        // characters with two different advances in the same font: charging
+        // the wrong one is a small, per-row, always-in-the-same-direction
+        // shortfall, and it is the kind of error that adds to exactly the
+        // one-or-two-characters-of-clipping seen on 2026-09-04. The row's
+        // suffixes have the same fix on their own side (nf_row_suffix,
+        // nffmt.cc, spells its separators with nf_nbsp() for this reason).
+        return e->w + fm.width(nf_nbsp());
 
     QString badge;
     nf_icon_badge(kind, NULL, &badge);
@@ -1181,22 +1253,16 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
     // ever record the fallback and never the real measurement. One line per
     // navigation is still one line, not one per row, and the transition from
     // fallback to measured is visible in the log rather than invisible.
-    bool widthMeasured   = false;
-    int  rawDialogWidth  = 0;
-    int  rowWidth        = nf_row_width_px(dialog, layout, &widthMeasured, &rawDialogWidth);
-    QMargins layoutMargins = layout->contentsMargins();
-    nh_log("browser: row width %d px -- %s (N3Dialog::width() read back %d, our layout margins %d+%d, panel fallback %d)",
-           rowWidth,
-           widthMeasured ? "MEASURED from the dialog"
-                         : "FALLBACK, the dialog is not laid out yet",
-           rawDialogWidth, layoutMargins.left(), layoutMargins.right(),
+    char const *widthSource = "unset";
+    int  rawDialogWidth     = 0;
+    int  rowWidth           = nf_row_width_px(dialog, layout, &widthSource, &rawDialogWidth);
+    QMargins layoutMargins  = layout->contentsMargins();
+    nh_log("browser: row width %d px -- %s (N3Dialog::width() read back %d, last content widget %d, our layout margins %d+%d, panel clamp %d)",
+           rowWidth, widthSource, rawDialogWidth,
+           nf_browser_active_content
+               ? reinterpret_cast<QWidget*>(nf_browser_active_content)->width() : -1,
+           layoutMargins.left(), layoutMargins.right(),
            NF_PANEL_VISIBLE_WIDTH_PX);
-
-    // DEV-ONLY, paired with nf_img_src_form: says which <img src> form these
-    // rows were built with, so a screenshot can never be misattributed to the
-    // wrong form while the selector is being narrowed down.
-    nh_log("browser: <img src> form %d (0=file://, 1=plain path, 2=file:) -- /tmp/nfolders-imgsrc",
-           nf_img_src_form());
 
     // Row 0: a GUARANTEED exit, independent of N3Dialog's own backTapped()
     // signal (wired once, in nf_browser_show, to this exact same
@@ -1440,6 +1506,10 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
         layout->addWidget(emptyMsg);
     }
 
+    // One log line per listing for the width-correction pass at the end of
+    // the loop, not one per row -- see there.
+    bool loggedOverflow = false;
+
     for (int i = startIdx; i < endIdx; i++) {
         nf_row const &r = rows.at(i);
 
@@ -1457,83 +1527,22 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
         // running off the right edge of the panel (see the row-label elision
         // block above for why the middle and not the right).
         //
-        // The suffix, built in TWO forms before either one is used: the
-        // markup that actually gets appended, and a plain-text twin whose
-        // only job is to be MEASURED (nf_row_width_px's own comment, and the
-        // elision below). The twin exists because the suffixes are what the
-        // row MEANS -- "[not in library]" on Fullmetal Alchemist v26 is the
-        // whole point of that row -- so they must never be what elision
-        // spends its budget on: the name is elided to what is left AFTER the
-        // suffix is paid for, so the suffix survives by construction rather
+        // The suffix is built by nf_row_suffix (nffmt.cc), in TWO forms
+        // before either one is used: the markup that actually gets appended,
+        // and a plain-text twin whose only job is to be MEASURED. The twin
+        // exists because the suffixes are what the row MEANS -- "[not in
+        // library]" on Fullmetal Alchemist v26 is the whole point of that row
+        // -- so they must never be what elision spends its budget on: the
+        // suffix is measured and paid for FIRST, and the name is elided into
+        // whatever is left, so the suffix survives by construction rather
         // than by hoping the name was short enough.
         //
-        // The separator is the literal markup "&nbsp;&nbsp;" in the appended
-        // form and two plain spaces in the measured one: rich text collapses
-        // runs of whitespace (which is why the markup form cannot just use
-        // spaces), and QFontMetrics measures plain text (which is why the
-        // measured form cannot just use the entities).
+        // Both forms, and the reason they are the same characters rather than
+        // merely the same words, are in nffmt.cc -- that is also where the
+        // 2026-09-04 measurement that moved them there is recorded.
         QString suffixMarkup;
         QString suffixPlain;
-        if (r.isDir) {
-            // A folder gets a trailing "/" as well as the folder icon. KEPT
-            // rather than replaced by the icon, even though the two now say
-            // the same thing: the icon depends on a PNG this file drew,
-            // wrote to /tmp and loaded back -- that is the whole reason
-            // nf_icons_generate verifies rather than assumes -- and if any
-            // step of that failed, this one plain ASCII character is the
-            // only folder/file marker left that does not depend on it (the
-            // "[DIR]" badge nf_icon_badge falls back to depends on nothing
-            // either, but both together is the point: a folder row must
-            // never be mistakable for a file row, which is the defect this
-            // whole icon feature exists to end).
-            // Same reasoning as the [not in library] text below: the
-            // text carries the meaning and the picture is the addition, never
-            // the other way round. A folder never carries a progress marker
-            // either -- there is no Volume for one, so r.percentRead/
-            // r.finished are always -1/false for it (nf_build_listing,
-            // nflist.cc: metadata is never fetched for a directory row).
-            suffixMarkup = QStringLiteral("/");
-            suffixPlain  = QStringLiteral("/");
-        } else if (!r.hasRow) {
-            // A file with NO library row gets its reason spelled out in the
-            // label TEXT itself, not left to colour/style alone: this panel
-            // gives four grey levels, and "slightly lighter" reads as "the
-            // same", not "different" (CLAUDE.md's task brief). The reference
-            // card's own example is exactly one row -- Fullmetal Alchemist
-            // v26, a truncated file Nickel's own import rejected (NOTES.md)
-            // -- and it must render as clearly wrong, not silently vanish and
-            // leave a reader wondering where volume 26 went. Which is also
-            // why it must not be elided away: see the suffix budget above.
-            suffixMarkup = QStringLiteral("&nbsp;&nbsp;[not in library]");
-            suffixPlain  = QStringLiteral("  [not in library]");
-        } else if (r.finished) {
-            // A file WITH a library row gets a progress marker: spec's own
-            // wording is a percentage for in-progress books, a marker for
-            // finished, and NOTHING for unread. "Finished" takes priority
-            // over any number sitting in percentRead -- a re-read that
-            // stopped partway through leaves a lower value there, and the
-            // word is the more informative answer regardless of what that
-            // number is.
-            //
-            // r.finished itself is DERIVED (nf_build_listing, nflist.cc) from
-            // r.readState, whose primary source is Content::getReadStatus()
-            // -- measured 0 = not started, 1 = in progress, 2 = finished
-            // (NOTES.md) -- with Content::isFinished() demoted to the
-            // cross-check it always was, because a bool cannot carry three
-            // states and the read-state filters need all three
-            // (nf_volume_exists, nfnickel.cc, has the full account).
-            suffixMarkup = QStringLiteral("&nbsp;&nbsp;[finished]");
-            suffixPlain  = QStringLiteral("  [finished]");
-        } else if (r.percentRead > 0) {
-            // 0% and -1 (unknown, including a firmware that moved the +140
-            // offset -- nf_volume_exists's own guard) both render as nothing,
-            // deliberately: Nickel's own BookWidget::getPercentReadString
-            // clamps display to [1,99] for the same reason an untouched
-            // book's own stored percentage is 0, not a real progress value
-            // (NOTES.md).
-            suffixMarkup = QStringLiteral("&nbsp;&nbsp;(%1%)").arg(r.percentRead);
-            suffixPlain  = QStringLiteral("  (%1%)").arg(r.percentRead);
-        }
+        nf_row_suffix(r, &suffixMarkup, &suffixPlain);
 
         QLabel *rowLabel = reinterpret_cast<QLabel*>(row);
 
@@ -1555,16 +1564,46 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
         // that gap matters at all on this panel.
         QFontMetrics fm(rowLabel->font());
 
-        // The name's own budget: the row, less the leading icon, less the
-        // suffix that must survive. Floored for the same reason
-        // nf_row_width_px floors its own result -- elidedText at or below the
-        // ellipsis' width yields the ellipsis alone, which would erase the
-        // name entirely. 60 px is roughly a few characters at this panel's
-        // row font, so the floor degrades a pathological row to "a stub plus
-        // its suffix" rather than to "no name at all".
-        int nameWidth = rowWidth - nf_icon_width_px(kind, fm) - fm.width(suffixPlain);
-        if (nameWidth < 60)
-            nameWidth = 60;
+        // THE NAME'S BUDGET, and every term subtracted from it, in order:
+        //
+        //   rowWidth      the width of the row WIDGET (nf_row_width_px):
+        //                 the content area the dialog laid out, or the
+        //                 dialog, or the 1264 px panel constant -- less our
+        //                 own QVBoxLayout's queried 34+34 margins.
+        //   labelInset    what the TouchLabel spends on itself before any of
+        //                 our text is drawn (nf_row_label_inset_px): its
+        //                 contents margins, its QLabel margin, its indent.
+        //                 Read once per row rather than hoisted, because it
+        //                 depends on the widget and on fm, and a row is not
+        //                 required to be styled like its neighbours.
+        //   icon          the <img> box, at the width READ BACK off the PNG
+        //                 this file wrote, plus the U+00A0 separator that
+        //                 follows it, measured in this row's own font
+        //                 (nf_icon_width_px).
+        //   suffixPlain   the twin of the suffix that will really be
+        //                 appended, measured in this row's own font --
+        //                 character for character what gets rendered
+        //                 (nf_row_suffix, nffmt.cc).
+        //
+        // The floor and the reason for it are in nf_name_budget_px (nffmt.cc)
+        // -- pure, so both are host-tested.
+        int labelInset  = nf_row_label_inset_px(rowLabel, fm);
+        int textWidth   = rowWidth - labelInset; // the label's own text area
+        int iconWidth   = nf_icon_width_px(kind, fm);
+        int suffixWidth = fm.width(suffixPlain);
+        int nameWidth   = nf_name_budget_px(textWidth, iconWidth, suffixWidth);
+
+        // ONE line per navigation, not per row: every term above except the
+        // suffix is the same on every row of a listing, and the first row's
+        // arithmetic is what says whether a clipped screenshot means a wrong
+        // width or a broken elision. Logged for the FIRST item row of the
+        // page (i == startIdx), where the alternative -- logging every row --
+        // would be 12 lines a navigation and, at nh_log's silent 256-byte
+        // truncation, would push the lines that matter out of view.
+        if (i == startIdx)
+            nh_log("browser: name budget %d px = row %d - label inset %d - icon %d - suffix %d ('%s')",
+                   nameWidth, rowWidth, labelInset, iconWidth, suffixWidth,
+                   qPrintable(suffixPlain));
 
         // ELIDED FIRST, THEN ESCAPED, THEN the markup joins it, and every
         // step of that order is load-bearing:
@@ -1620,6 +1659,72 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
             reinterpret_cast<QWidget*>(row)->setStyleSheet(QStringLiteral("font-style: italic; color: gray;"));
         }
 
+        // THE SECOND PASS, AND THE ONLY ONE THAT MEASURES WHAT WILL ACTUALLY
+        // BE DRAWN. Everything above is a budget assembled out of terms this
+        // file can name -- the row width, the label's own inset, the <img>
+        // box, the suffix twin. This asks the finished widget instead:
+        // QLabel::sizeHint() on a rich-text label lays the QTextDocument out
+        // at its natural width and hands back that width plus the label's own
+        // insets, i.e. the number the panel will really try to draw. If it
+        // exceeds the row, the difference is a term the budget did not know
+        // about, and the name is re-elided by exactly that much.
+        //
+        // Why this exists at all: on 2026-09-04 the panel clipped rows whose
+        // suffix HAD already been measured and paid for before the name was
+        // elided (that reservation predates this task -- what was wrong was
+        // never the ORDER, contrary to the first reading of the screenshot).
+        // So at least one term was being measured differently from how it
+        // renders, and the candidates were not distinguishable off-device:
+        // the U+00A0 separators charged as U+0020 (fixed above), the
+        // N3Dialog chrome inset that nf_row_width_px could only over-estimate
+        // (now measured), the TouchLabel's own inset (now measured), the
+        // <img> box, the italic stylesheet applied just above, and
+        // FontSizeAdjustingLabel adjusting its own point size on setText --
+        // AFTER the QFontMetrics above was read off it, which no arithmetic
+        // here can anticipate. This pass does not care which one it was: it
+        // measures the assembled result, so it corrects for all of them, and
+        // it logs when it fires so the device run says how much was missing.
+        //
+        // The NAME is what gets shortened, never the suffix -- same rule as
+        // the budget above. ONE retry, not a loop: a second correction would
+        // be measuring the correction rather than the row, and a row that is
+        // a few px short is invisible where a loop that does not converge is
+        // a hung GUI thread.
+        //
+        // A CEILING on the correction, and it is a guard rather than a fudge
+        // factor: the shortfall this pass exists to absorb is a term or two of
+        // chrome, i.e. tens of px on a ~1196 px row. If sizeHint ever comes
+        // back wildly larger -- a stylesheet minimum width, a hint computed on
+        // some basis other than this text, a firmware whose QLabel differs --
+        // then honouring it would elide EVERY row down to nf_name_budget_px's
+        // 60 px floor, which is a far worse screen than the residual clipping
+        // this is trying to remove. So an implausible overflow is logged and
+        // NOT applied: the row keeps the first pass's label, i.e. exactly
+        // today's behaviour, and the log says why.
+        int hintWidth = rowLabel->sizeHint().width();
+        int overflow  = hintWidth - rowWidth;
+        if (overflow > rowWidth / 4) {
+            if (!loggedOverflow) {
+                loggedOverflow = true;
+                nh_log("browser: row %d's sizeHint is %d px against a %d px row -- an implausible %d px overflow, NOT corrected (the label's hint is not measuring this text)",
+                       i, hintWidth, rowWidth, overflow);
+            }
+        } else if (overflow > 0) {
+            int corrected = nf_name_budget_px(textWidth - overflow, iconWidth, suffixWidth);
+            QString reflowed = fm.elidedText(r.label, Qt::ElideMiddle, corrected).toHtmlEscaped();
+            reflowed += suffixMarkup;
+            rowLabel->setText(nf_icon_markup(kind) + reflowed);
+            // Logged for the FIRST row that needs it only. The terms are the
+            // same on every row of a listing, so the first one names the
+            // shortfall; 12 identical lines would only push it out of the log
+            // (nh_log truncates at 256 bytes, silently -- CLAUDE.md).
+            if (!loggedOverflow) {
+                loggedOverflow = true;
+                nh_log("browser: row %d overflowed by %d px (sizeHint %d vs row %d) -- name budget %d -> %d px; a term the arithmetic does not know about",
+                       i, overflow, hintWidth, rowWidth, nameWidth, corrected);
+            }
+        }
+
         QPushButton *shim = new QPushButton(content);
         shim->setVisible(false);
         if (!QObject::connect(reinterpret_cast<QObject*>(row), SIGNAL(tapped(bool)), shim, SLOT(click())))
@@ -1673,6 +1778,23 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
     // `content`/`layout`/the rows just built: nothing here may be touched
     // again afterward.
     N3Dialog__setContent(dialog, content);
+
+    // Recorded AFTER setContent, so this only ever names a widget the dialog
+    // has actually taken -- see nf_browser_active_content for what its width()
+    // is for. `content` is not touched here beyond being remembered as a
+    // pointer, which the comment above allows.
+    //
+    // The destroyed() clear is guarded on the pointer still being THIS
+    // widget: setContent deleteLater()s the previous content, so the previous
+    // widget's destroyed() fires later in the event loop, i.e. after this
+    // assignment -- an unguarded clear would then null out the LIVE pointer
+    // and quietly send the next navigation back to the dialog-width estimate.
+    nf_browser_active_content = content;
+    QWidget *tracked = content;
+    QObject::connect(content, &QObject::destroyed, [tracked] {
+        if (nf_browser_active_content == tracked)
+            nf_browser_active_content = NULL;
+    });
 }
 
 bool nf_browser_show(void) {
@@ -1701,8 +1823,37 @@ bool nf_browser_show(void) {
         // dialog is genuinely still the current view, pushView's own
         // early-return-on-already-current-widget check (nfnickel.h) makes
         // this a harmless no-op rather than a double push.
-        nh_log("browser: a screen already exists -- re-pushing it rather than building a new one");
-        MainWindowController__pushView(mwc, reinterpret_cast<QWidget*>(nf_browser_active_dialog));
+        //
+        // The rows are also REBUILT, not just re-pushed, which makes a
+        // re-trigger a genuine REFRESH. Two reasons, and the first is what
+        // asked for it: every change to how a row renders otherwise costs the
+        // owner a tap on the device to see, and a `touch /tmp/nfolders-native`
+        // over ssh that re-pushed WITHOUT rebuilding is actively misleading --
+        // it produced a screenshot of stale rows built under the previous
+        // setting, read as "the fix did not work", on 2026-09-04. The second
+        // is ordinary: the card can change under us (a USB session, a sideload),
+        // and a refresh is the obvious thing a reader would expect a
+        // re-trigger to do.
+        //
+        // Rooted at nf_browser_cwd, the directory that is already showing --
+        // NOT at NF_ROOT. Losing the reader's place on a refresh would be
+        // worse than not refreshing at all. resetPage is false for the same
+        // reason: the page number is part of "where I am", and nf_browser_go
+        // clamps it if the listing has since shrunk under it.
+        //
+        // The recovery case above still works exactly as before: rebuilding
+        // content is what an abandoned-but-alive dialog needs anyway, and the
+        // pushView that follows is unchanged.
+        QString cwd = QString::fromUtf8(nf_browser_cwd);
+        if (cwd.isEmpty())
+            cwd = QStringLiteral(NF_ROOT); // unreachable while a dialog exists
+                                           // (nf_browser_go sets cwd before it
+                                           // can), and a defined answer anyway
+        nh_log("browser: a screen already exists -- rebuilding '%s' in it and re-pushing rather than building a new one",
+               qPrintable(cwd));
+        N3Dialog *existing = static_cast<N3Dialog*>(nf_browser_active_dialog);
+        nf_browser_go(mwc, existing, cwd, false); // refresh -- same directory, same page
+        MainWindowController__pushView(mwc, reinterpret_cast<QWidget*>(existing));
         return true;
     }
 

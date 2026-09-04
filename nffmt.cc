@@ -484,3 +484,125 @@ nf_icon_kind nf_icon_kind_for(QString const& name, bool isDir) {
     // come out of here with a badge rather than with no icon at all.
     return NF_ICON_UNKNOWN;
 }
+
+// --- the two-form label pieces ------------------------------------------
+//
+// See nffmt.h for why both forms are built together and what the tests pin.
+// The shape of every function here is the same and is the whole point: ONE
+// authored string, in the plain form, with nf_nbsp() wherever the rendered
+// markup will carry a `&nbsp;` -- then the markup is DERIVED from it by
+// substitution. There is no second place to spell a separator, so the two
+// forms cannot drift and the measurement cannot be short by one.
+//
+// Substituting only `&nbsp;` is safe for these fragments specifically
+// because every other character in them is HTML-inert -- "/", "[", "]",
+// "(", ")", "%", letters and digits. Nothing here is card data (a filename
+// is escaped separately, by the caller, BEFORE our markup is appended --
+// nfview.cc's own ordering comment), so no fragment here can ever contain a
+// "&" or a "<" that would need escaping first.
+
+// The two-space separator, as the two real U+00A0 characters. Both suffix
+// separators are non-breaking on purpose: an ordinary space is a wrap
+// opportunity and a collapsible run, and a suffix that wrapped or collapsed
+// would be measured as one width and rendered at another.
+static QString nf_suffix_sep(void) {
+    return QString(2, nf_nbsp());
+}
+
+static QString nf_to_markup(QString const& plain) {
+    return QString(plain).replace(nf_nbsp(), QStringLiteral("&nbsp;"));
+}
+
+void nf_icon_badge(nf_icon_kind kind, QString *markup, QString *plain) {
+    char const *text = NULL;
+    switch (kind) {
+        case NF_ICON_FOLDER:  text = "[DIR]"; break;
+        case NF_ICON_BOOK:    text = "[EPB]"; break;
+        case NF_ICON_COMIC:   text = "[CMC]"; break;
+        case NF_ICON_PDF:     text = "[PDF]"; break;
+        case NF_ICON_UNKNOWN:
+        default:              text = "[ ? ]"; break;
+    }
+    // Every space becomes non-breaking, the inner ones in "[ ? ]" included:
+    // that badge is a five-character box and a collapsed run would make it
+    // three, so the labels after it would no longer line up with the other
+    // four badges'.
+    QString p = QString::fromLatin1(text).replace(QLatin1Char(' '), nf_nbsp())
+              + nf_nbsp(); // the separator between the badge and the name
+    if (plain)
+        *plain = p;
+    if (markup)
+        *markup = nf_to_markup(p);
+}
+
+void nf_row_suffix(nf_row const& row, QString *markup, QString *plain) {
+    QString p;
+    if (row.isDir) {
+        // A folder gets a trailing "/" as well as the folder icon. KEPT
+        // rather than replaced by the icon, even though the two now say the
+        // same thing: the icon depends on a PNG nfview.cc drew, wrote to
+        // /tmp and loaded back -- that is the whole reason it verifies
+        // rather than assumes -- and if any step of that failed, this one
+        // plain ASCII character is the only folder/file marker left that
+        // does not depend on it. Same reasoning as the [not in library]
+        // text below: the text carries the meaning, the picture is the
+        // addition, never the other way round.
+        //
+        // No separator: the "/" belongs to the name it terminates, and a
+        // gap in front of it would read as a row whose name ends in a
+        // slash-shaped decoration rather than as a directory.
+        //
+        // A folder never carries a progress marker either -- there is no
+        // Volume for one, so percentRead/finished are always -1/false for
+        // it (nf_build_listing, nflist.cc: metadata is never fetched for a
+        // directory row).
+        p = QStringLiteral("/");
+    } else if (!row.hasRow) {
+        // A file with NO library row gets its reason spelled out in the
+        // label TEXT itself, not left to colour/style alone: this panel
+        // gives four grey levels, and "slightly lighter" reads as "the
+        // same", not "different". The reference card's own example is
+        // exactly one row -- Fullmetal Alchemist v26, a truncated file
+        // Nickel's own import rejected (NOTES.md) -- and it must render as
+        // clearly wrong, not silently vanish and leave a reader wondering
+        // where volume 26 went. Which is also why it must not be elided
+        // away: it is paid for out of the row budget before the name is.
+        p = nf_suffix_sep() + QStringLiteral("[not in library]");
+    } else if (row.finished) {
+        // A file WITH a library row gets a progress marker: a percentage
+        // for in-progress books, a word for finished, and NOTHING for
+        // unread. "Finished" takes priority over any number sitting in
+        // percentRead -- a re-read that stopped partway through leaves a
+        // lower value there, and the word is the more informative answer
+        // regardless of what that number is.
+        //
+        // row.finished itself is DERIVED (nf_build_listing, nflist.cc) from
+        // row.readState, whose primary source is Content::getReadStatus()
+        // -- measured 0 = not started, 1 = in progress, 2 = finished
+        // (NOTES.md).
+        p = nf_suffix_sep() + QStringLiteral("[finished]");
+    } else if (row.percentRead > 0) {
+        // 0% and -1 (unknown, including a firmware that moved the +140
+        // offset -- nf_volume_exists's own guard) both render as nothing,
+        // deliberately: Nickel's own BookWidget::getPercentReadString
+        // clamps display to [1,99] for the same reason an untouched book's
+        // own stored percentage is 0, not a real progress value (NOTES.md).
+        p = nf_suffix_sep() + QStringLiteral("(%1%)").arg(row.percentRead);
+    }
+    if (plain)
+        *plain = p;
+    if (markup)
+        *markup = nf_to_markup(p);
+}
+
+int nf_name_budget_px(int rowWidth, int iconWidth, int suffixWidth) {
+    int w = rowWidth - iconWidth - suffixWidth;
+    // The floor is what makes a pathological row degrade instead of
+    // disappear (nffmt.h). It is deliberately applied to the RESULT rather
+    // than to the inputs: a nonsense row width or a suffix wider than the
+    // whole row are exactly the cases that must not come out negative, and
+    // clamping the terms one by one would leave their sum unguarded anyway.
+    if (w < NF_NAME_MIN_PX)
+        w = NF_NAME_MIN_PX;
+    return w;
+}
