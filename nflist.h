@@ -19,9 +19,21 @@ struct nf_row {
 // directory.
 typedef void (*nf_meta_fn)(void *ctx, QString const& name, nf_row *row);
 
-// list -> hide junk -> user filter -> fetch metadata -> group by kind ->
-// order -> label -> disambiguate. Spec section 6.1; `filter`/`key`/
+// list -> hide junk -> user filter -> group by kind -> order within group ->
+// fetch metadata -> label -> disambiguate. Spec section 6.1; `filter`/`key`/
 // `descending` are that spec's "FUTURE" insertions, now built.
+//
+// NOTE this differs from spec section 6.1's own listed order, which puts
+// "fetch metadata" ahead of "group by kind"/"order" -- v1's ORIGINAL
+// implementation (before this task) already sorted before fetching
+// metadata, because the one sort key it had (name) needs none, and nothing
+// about adding size/date changes that: both come from `nf_entry` fields
+// nf_browser_scan_dir fills off QFileInfo before nf_build_listing ever runs,
+// never from `meta`. This function's actual, tested order is the one above;
+// nflist.cc's own numbered stage comments match it. Left as v1 built it
+// rather than reordered to match the spec's prose exactly, since reordering
+// would cost nothing today but is not neutral either -- see nflist.cc's own
+// note on what WOULD force the reorder (a metadata-derived sort key).
 //
 // The four new parameters are all DEFAULTED to v1's original, pre-filter
 // behaviour (NF_FILTER_ALL, NF_SORT_NAME, ascending, no `filteredToNothing`)

@@ -57,7 +57,12 @@ void nf_build_listing(QVector<nf_entry> const& entries,
 
     // 2. Order: folders before files, then `key`/`descending` within each
     //    kind -- see nf_sort_entries' own comment (nffmt.cc) for why
-    //    grouping and ordering stay two separate concerns inside it.
+    //    grouping and ordering stay two separate concerns inside it. This
+    //    runs BEFORE metadata (stage 3, below) rather than after it, which
+    //    is safe today ONLY because every current key (name, size, date)
+    //    reads a field nf_entry already carries off QFileInfo, never
+    //    anything `meta` fills in -- see stage 3's own comment for what
+    //    WOULD force these two stages to swap.
     nf_sort_entries(&kept, key, descending);
 
     // 3. Metadata, for EVERY file row rather than the visible ones. Spec
