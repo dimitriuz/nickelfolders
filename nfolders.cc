@@ -233,7 +233,7 @@ static int nf_init() {
         nh_log("init: a libnickel symbol did not resolve; book-opening is inert until this is fixed");
     if (!nf_browser_resolve())
         nh_log("init: a libnickel symbol did not resolve; the browser screen is inert until this is fixed");
-    // A fourth, independent gate (nfnickel.h/.cc), for the native-dialog
+    // A third, independent gate (nfnickel.h/.cc), for the native-dialog
     // route (nfview.cc) only.
     if (!nf_native_view_resolve())
         nh_log("init: a libnickel symbol did not resolve; the native-dialog view is inert until this is fixed");

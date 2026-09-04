@@ -23,11 +23,16 @@
 
 // Builds a deliberately trivial screen -- three static TouchLabel rows and
 // nothing else, no listing logic, no folder navigation, no book opening --
-// wrapped in an N3Dialog with a title and a working back button, and pushes
-// it via MainWindowController::pushView. This milestone exists to prove taps
-// and back navigation on hardware, on this route, before anything real rides
-// on it -- the same one-thing-at-a-time staging CLAUDE.md's "Method: adding
-// a new libnickel call" already asks for.
+// wrapped in an N3Dialog with a title, and pushes it via
+// MainWindowController::pushView. This milestone exists to prove taps and
+// back navigation on hardware, on this route, before anything real rides on
+// it -- the same one-thing-at-a-time staging CLAUDE.md's "Method: adding a
+// new libnickel call" already asks for. The screen offers TWO independent
+// exits, deliberately not just one: the first row is a guaranteed "BACK"
+// affordance wired straight to popView, and N3Dialog's own backTapped()
+// signal is wired the same way -- review finding I-3, because getDialog's
+// own X button is wired to a controller-stack call this route's pushView
+// never populates, so it does nothing here (see nfview.cc/nfnickel.h).
 //
 // Returns false, without pushing anything, if a required symbol never
 // resolved (every symbol this needs is looked up through the usual

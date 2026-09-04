@@ -25,16 +25,24 @@ made it possible, including the rejected candidate that *would* have given
 folders for free and why it was rejected anyway. Read both before proposing
 anything.
 
-**`nfview.cc`'s own screen — a separate, not-yet-device-tested milestone
-built on our own compiler-generated `AbstractController` shim rather than a
-borrowed Nickel controller — has a proven input bug**, found by disassembly
-research rather than a device run: its `QPushButton` renders but can never
-receive a tap, because Nickel does not deliver touch as Qt mouse events (see
-"What the hardware overruled" below). A measured, un-built replacement route
-exists — `N3DialogFactory::getDialog` + `MainWindowController::pushView`,
-needing no `AbstractController` subclass at all — recorded in `NOTES.md`
-("Task 8"). Rewriting `nfview.cc` to that route is future work, not done as
-part of this research pass.
+**`nfview.cc`'s own screen was rewritten onto the measured replacement
+route and is not yet device-tested.** It used to be built on our own
+compiler-generated `AbstractController` shim, which had a proven input bug
+found by disassembly research rather than a device run: its `QPushButton`
+rendered but could never receive a tap, because Nickel does not deliver
+touch as Qt mouse events (see "What the hardware overruled" below). That
+shim is gone — `nfview.cc` now pushes a screen built entirely out of
+Nickel's own dialog chrome and tappable row widget
+(`N3DialogFactory::getDialog` + `MainWindowController::pushView`/`popView`,
+`TouchLabel` rows), needing no `AbstractController` subclass, no fabricated
+RTTI, and no cross-cast at all — the code and its full derivation are in
+`NOTES.md` ("Task 8"). **This retires the one sanctioned exception to "Nickel's
+classes stay opaque" below** — `libnfolders.so` no longer defines a fake
+`_ZTI18AbstractController` of its own, a real gain worth keeping this way.
+Two independent, hardware-untested exits are wired (a guaranteed "BACK" row
+straight to `popView`, and `N3Dialog`'s own `backTapped()` signal) because
+`getDialog`'s own X button is a dead affordance on this route (wired to a
+controller-stack call `pushView` never populates) — see `nfview.cc`.
 
 ## The one thing that was in doubt, and no longer is
 
@@ -286,21 +294,24 @@ see `DEVICE.local.md`.
   194–196/209 (touch) and routes 198 (gesture) to
   `GestureReceiver::gestureEvent`; and `GestureDelegate`-named RTTI, because
   dispatch is a genuine Itanium cross-cast on the mangled name, not pointer
-  identity. `nfview.cc`'s own `QPushButton` has none of the three, which is
-  why its click handler never fires — proven by disassembly, not a device
-  run. **The working route needs no `AbstractController` subclass at all**:
+  identity. `nfview.cc`'s own `QPushButton` USED to have none of the three,
+  which is why its click handler never fired — proven by disassembly, not a
+  device run, and fixed by rewriting `nfview.cc` onto the route below rather
+  than patching the `QPushButton` in place. **The working route needs no
+  `AbstractController` subclass at all, and `nfview.cc` now uses it**:
   `N3DialogFactory::getDialog(QWidget*, bool)` (static — no `this`, the same
   trap `VolumeManager::getById` set) wraps a plain `QWidget` in Nickel's own
   screen chrome (title, back arrow, `backTapped()`/`closeTapped()` signals),
   and `MainWindowController::pushView(QWidget*)` puts it on the stack — both
   proven in NickelHardcover's own shipped source, and both present on this
-  firmware. Populate the screen with Nickel's own tappable widgets
+  firmware. The screen is populated with Nickel's own tappable widgets
   (`TouchLabel` self-registers for taps in its own constructor) rather than
-  Qt ones. This **supersedes `nfview.cc`'s approach**, which built a real,
-  compiler-generated `AbstractController` shim only because
+  Qt ones. This **replaced `nfview.cc`'s previous approach**, which built a
+  real, compiler-generated `AbstractController` shim only because
   `MainWindowController::push`'s cross-cast demanded one — true for that
-  route, unneeded for this one. `NOTES.md` ("Task 8") has the full
-  derivation; not yet built or tested on hardware.
+  route, unneeded for this one, and that shim no longer exists anywhere in
+  this codebase. `NOTES.md` ("Task 8") has the full derivation; built, not
+  yet tested on hardware.
 
 ## Method: adding a new libnickel call
 

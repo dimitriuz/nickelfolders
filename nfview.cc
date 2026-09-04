@@ -67,6 +67,25 @@
 
 // --- construction ------------------------------------------------------
 
+// Pops this screen and logs why. Shared by both exit paths it offers (the
+// guaranteed BACK row and N3Dialog's own backTapped() signal, both below)
+// so a reader can see in one place that they really do the same thing,
+// rather than auditing two near-duplicate lambdas for drift. `why` is
+// always a string literal from the call site, never built here.
+//
+// popView DESTROYS the widget (setVisible(false), deleteLater(),
+// stack->removeWidget() -- NOTES.md) -- including, eventually, `content`
+// and everything under it, the very button whose clicked signal is what
+// got this function called. Safe from inside that signal handler because
+// deleteLater() only POSTS the deletion for later in the event loop
+// rather than deleting synchronously -- the standard Qt "a slot may
+// schedule its own object's death" pattern, not a hazard specific to this
+// call.
+static void nf_pop_native_view(void *mwc, N3Dialog *dialog, char const *why) {
+    nh_log("view: %s, popping", why);
+    MainWindowController__popView(mwc, reinterpret_cast<QWidget*>(dialog));
+}
+
 bool nf_browser_show(void) {
     if (!nf_native_view_resolve()) {
         nh_log("view: a required libnickel symbol did not resolve, refusing");
@@ -90,7 +109,21 @@ bool nf_browser_show(void) {
     QWidget *content = new QWidget();
     QVBoxLayout *layout = new QVBoxLayout(content);
 
-    char const * const kRowText[] = { "Row 1", "Row 2", "Row 3" }; // a local, not a file-scope object -- CLAUDE.md's dynamic-initialiser rule is about file scope only, but there is nothing to gain by pushing on that here
+    // Row 0 is a GUARANTEED exit, independent of N3Dialog's own
+    // backTapped() signal wired further below -- review finding I-3:
+    // getDialog wires the dialog's X (closeTapped()) to
+    // MainWindowController::closeActiveN3Dialogs(), which only affects the
+    // CONTROLLER stack (MainWindowController+60), and pushView never
+    // populates that stack -- so the X does nothing on this route (see
+    // N3Dialog__disableCloseButton below, which removes it). If
+    // backTapped() ALSO failed to fire for any reason, this screen would
+    // have no way off it short of a power cycle, on the owner's daily-use
+    // device. This row does not depend on N3Dialog's own signal at all --
+    // it is wired straight to popView, below, once `dialog` exists -- so
+    // it is the row most worth trusting if anything else on this screen
+    // is wrong. Labelled unmistakably, placed first.
+    char const * const kRowText[] = { "<< BACK -- tap to leave this screen", "Row 1", "Row 2" };
+    QPushButton *exitShim = NULL; // wired to popView once `dialog` exists, after this loop
     for (unsigned i = 0; i < sizeof kRowText / sizeof kRowText[0]; i++) {
         // 132 bytes measured at TouchLabel's own construction call sites,
         // cross-checked across several (NOTES.md) -- NOT the 128
@@ -127,21 +160,49 @@ bool nf_browser_show(void) {
         // not apply to it.
         QPushButton *tapShim = new QPushButton(content);
         tapShim->setVisible(false);
-        QObject::connect(reinterpret_cast<QObject*>(row), SIGNAL(tapped(bool)), tapShim, SLOT(click()));
-        QObject::connect(tapShim, &QPushButton::clicked, [i] {
-            nh_log("view: row %u tapped -- this milestone proves the tap, it does not act on it", i);
-        });
+        // Old-style string connects are NOT compile-checked -- a renamed
+        // or missing Qt signal fails SILENTLY at runtime and returns
+        // false. On this exact screen that failure is indistinguishable
+        // from the gesture-pipeline failure this whole route exists to
+        // work around (NOTES.md's "Task 8") unless it is logged loudly,
+        // which is what review finding I-2 asks for -- matching
+        // NickelMenu's own practice at this identical kind of connect
+        // (src/nickelmenu.cc:379, :562).
+        if (!QObject::connect(reinterpret_cast<QObject*>(row), SIGNAL(tapped(bool)), tapShim, SLOT(click())))
+            nh_log("view: row %u: connecting TouchLabel::tapped(bool) to the shim button FAILED -- taps on this row will silently do nothing", i);
+
+        if (i == 0) {
+            // Wired to popView after `dialog` exists, below -- the lambda
+            // needs to capture it and it is not built yet at this point
+            // in the loop.
+            exitShim = tapShim;
+        } else {
+            QObject::connect(tapShim, &QPushButton::clicked, [i] {
+                nh_log("view: row %u tapped -- this milestone proves the tap, it does not act on it", i);
+            });
+        }
 
         layout->addWidget(reinterpret_cast<QWidget*>(row));
     }
 
-    // `true`: unverified meaning (nfnickel.h), copied from NickelHardcover's
-    // own working use rather than decoded here.
+    // `true`: confirmed harmless (nfnickel.h's own decode) -- builds an
+    // inert GoToPageMenuController this screen never gives a page count
+    // to act on.
     N3Dialog *dialog = N3DialogFactory__getDialog(content, true);
     if (!dialog) {
         nh_log("view: N3DialogFactory::getDialog returned null, refusing");
         return false;
     }
+
+    // The guaranteed-exit row's real handler, wired now that `dialog`
+    // exists to capture. `exitShim` is never NULL here -- the loop above
+    // always sets it on i==0, unconditionally of whether the SIGNAL()
+    // connect above it succeeded (a failed connect there is already
+    // logged loudly, and this connect is a completely separate, new-style
+    // one that does not depend on it).
+    QObject::connect(exitShim, &QPushButton::clicked, [mwc, dialog] {
+        nf_pop_native_view(mwc, dialog, "BACK row tapped");
+    });
 
     // Restores the ndbCurrentView oracle (NOTES.md's "cosmetic" correction:
     // NDB::ndbCurrentView() reads MainWindowController::currentView()->
@@ -158,27 +219,35 @@ bool nf_browser_show(void) {
     N3Dialog__setTitle(dialog, QStringLiteral("NickelFolders (native view)"));
     N3Dialog__enableBackButton(dialog, true);
 
+    // Review finding I-3: the X (closeTapped(), pre-wired by getDialog to
+    // MainWindowController::closeActiveN3Dialogs()) does nothing on this
+    // route -- see N3Dialog__disableCloseButton's own comment (nfnickel.h)
+    // for why. Remove the misleading affordance rather than leave a
+    // visible button that does not work. NULL-gated and deliberately NOT
+    // part of nf_native_view_resolve()'s hard gate: a firmware missing
+    // just this symbol should still show the screen, with the X's
+    // cosmetic problem left unfixed, not refuse to build the whole thing.
+    if (N3Dialog__disableCloseButton)
+        N3Dialog__disableCloseButton(dialog);
+    else
+        nh_log("view: N3Dialog::disableCloseButton did not resolve -- the X button will remain visible and will do nothing on this route (the BACK row and back gesture are this screen's real exits)");
+
     // N3Dialog's closeTapped() is already wired, by getDialog itself, to
     // MainWindowController::closeActiveN3Dialogs() (NOTES.md) -- but
     // backTapped() is NOT pre-wired to anything, which is what makes this
     // route's "back" our own responsibility. Same signal-adaptor trick as
     // the rows above, this time relaying the DIALOG's own real signal
     // (built by getDialog's own N3Dialog constructor, not by this file) to
-    // a lambda that pops this exact widget off the stack.
+    // a lambda that pops this exact widget off the stack. This is this
+    // screen's SECOND exit, independent of the BACK row above -- see
+    // nf_pop_native_view's own comment for why sharing that one function
+    // matters here.
     QPushButton *backShim = new QPushButton(content);
     backShim->setVisible(false);
-    QObject::connect(reinterpret_cast<QObject*>(dialog), SIGNAL(backTapped()), backShim, SLOT(click()));
+    if (!QObject::connect(reinterpret_cast<QObject*>(dialog), SIGNAL(backTapped()), backShim, SLOT(click())))
+        nh_log("view: connecting N3Dialog::backTapped() to the shim button FAILED -- the back arrow/gesture will do nothing (the BACK row above is this screen's other, independent exit)");
     QObject::connect(backShim, &QPushButton::clicked, [mwc, dialog] {
-        nh_log("view: back tapped, popping");
-        // popView DESTROYS the widget (setVisible(false), deleteLater(),
-        // stack->removeWidget() -- NOTES.md) -- including, eventually,
-        // `content` and everything under it, `backShim` (this very button)
-        // among them. Safe from inside this button's own clicked handler
-        // because deleteLater() only POSTS the deletion for later in the
-        // event loop rather than deleting synchronously -- the standard
-        // Qt "a slot may schedule its own object's death" pattern, not a
-        // hazard specific to this call.
-        MainWindowController__popView(mwc, reinterpret_cast<QWidget*>(dialog));
+        nf_pop_native_view(mwc, dialog, "backTapped() fired");
     });
 
     nh_log("view: pushing the native-dialog view");

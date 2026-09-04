@@ -1646,9 +1646,26 @@ MainWindowController__pushView(mwc, d);                   // 0xea968c
 
 No `AbstractController` subclass. No hand-built vtable. No fabricated RTTI.
 No cross-cast to satisfy. This is a strictly smaller surface than
-`nfview.cc`'s shim, and it is what supersedes that file's approach — the
-shim's own `sanctioned exception` header comment argued at length that a
-real, compiler-generated C++ class was the only way, and it was, **for the
-`AbstractController` route specifically**; this route sidesteps the need
-for a controller at all. `nfview.cc` has not been changed as part of this
-research pass — the rewrite to this route is future work.
+`nfview.cc`'s former shim, and it is what superseded that file's approach —
+the shim's own `sanctioned exception` header comment argued at length that
+a real, compiler-generated C++ class was the only way, and it was, **for
+the `AbstractController` route specifically**; this route sidesteps the
+need for a controller at all.
+
+**Update: built.** `nfview.cc` was rewritten onto this route in a later
+pass in the same session — the shim class, its nine raw
+`AbstractController__*` symbols, and the runtime layout check are all
+deleted, and `nfnickel.h`/`nfnickel.cc` carry `N3DialogFactory::getDialog`,
+`N3Dialog::setTitle`/`enableBackButton`/`disableCloseButton`,
+`MainWindowController::pushView`/`popView` and `TouchLabel`'s constructor
+in their place, all resolved and `.optional`-gated the usual way. The
+screen also gained a second, independent exit beyond `backTapped()`: a
+guaranteed "BACK" `TouchLabel` row wired straight to `popView`, added
+because `getDialog`'s own X button (`closeTapped()` → `MainWindowController
+::closeActiveN3Dialogs()`) turned out to do nothing on this route — that
+function walks the CONTROLLER stack, which `pushView` never populates.
+`N3DialogFactory::getDialog`'s `bool` argument was also decoded in review
+(0x10e4ae6-0x10e4b02): it gates constructing a `GoToPageMenuController`,
+not full-view mode, and `true` is confirmed harmless here. None of this is
+device-tested yet — `./nickeltc make` is clean, but every claim above this
+paragraph about what the code does at runtime is still owed a reboot.

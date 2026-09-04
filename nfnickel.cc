@@ -80,6 +80,7 @@ void   (*MainWindowController__popView)(MainWindowController *_this, QWidget *vi
 N3Dialog *(*N3DialogFactory__getDialog)(QWidget *content, bool fullScreenIdk);
 void   (*N3Dialog__setTitle)(N3Dialog *_this, QString const &title);
 void   (*N3Dialog__enableBackButton)(N3Dialog *_this, bool enable);
+void   (*N3Dialog__disableCloseButton)(N3Dialog *_this);
 void   (*TouchLabel__ctor)(TouchLabel *_this, QWidget *parent, QFlags<Qt::WindowType> flags);
 
 // Nickel's classes stay opaque, same discipline as Volume/ReadBookActionProxy
@@ -156,6 +157,7 @@ struct nh_dlsym NFNickelDlsym[] = {
     {.name = "_ZN15N3DialogFactory9getDialogEP7QWidgetb",    .out = nh_symoutptr(N3DialogFactory__getDialog),      .desc = "N3DialogFactory::getDialog",             .optional = true},
     {.name = "_ZN8N3Dialog8setTitleERK7QString",              .out = nh_symoutptr(N3Dialog__setTitle),              .desc = "N3Dialog::setTitle",                     .optional = true},
     {.name = "_ZN8N3Dialog16enableBackButtonEb",              .out = nh_symoutptr(N3Dialog__enableBackButton),      .desc = "N3Dialog::enableBackButton",             .optional = true},
+    {.name = "_ZN8N3Dialog18disableCloseButtonEv",            .out = nh_symoutptr(N3Dialog__disableCloseButton),    .desc = "N3Dialog::disableCloseButton",           .optional = true},
     {.name = "_ZN10TouchLabelC1EP7QWidget6QFlagsIN2Qt10WindowTypeEE", .out = nh_symoutptr(TouchLabel__ctor),       .desc = "TouchLabel::TouchLabel",                 .optional = true},
     {.name = "_ZN7QVectorI6VolumeE6appendERKS0_",             .out = nh_symoutptr(QVectorVolume__append),           .desc = "QVector<Volume>::append",                .optional = true},
     {.name = "_ZN7QVectorI6VolumeED1Ev",                      .out = nh_symoutptr(QVectorVolume__dtor),             .desc = "QVector<Volume>::~QVector",              .optional = true},
@@ -201,14 +203,17 @@ bool nf_browser_resolve(void) {
 #endif
 }
 
-// A fourth independent gate, for the native-dialog route (nfview.cc) only
-// -- see nfnickel.h's own comment on each of these six for what they are.
-// Kept disjoint from the other three (nf_nickel_resolve, nf_browser_resolve)
-// for the same reason those two stay disjoint from each other: a firmware
-// that renames, say, TouchLabel's constructor must not also disable
-// book-opening or the borrowed-controller browser screen. A cheap,
-// side-effect-free predicate nf_init can log at boot, matching
-// nf_nickel_resolve/nf_browser_resolve's own pattern.
+// A third independent gate, for the native-dialog route (nfview.cc) only
+// -- see nfnickel.h's own comment on each of these seven for what they
+// are. Kept disjoint from the other two (nf_nickel_resolve,
+// nf_browser_resolve) for the same reason those two stay disjoint from
+// each other: a firmware that renames, say, TouchLabel's constructor must
+// not also disable book-opening or the borrowed-controller browser
+// screen. A cheap, side-effect-free predicate nf_init can log at boot,
+// matching nf_nickel_resolve/nf_browser_resolve's own pattern.
+// N3Dialog__disableCloseButton is deliberately NOT checked here -- see its
+// own declaration comment (nfnickel.h) for why it stays a soft, NULL-gated
+// best-effort at its own call site instead of part of this hard gate.
 bool nf_native_view_resolve(void) {
     return MainWindowController__sharedInstance && MainWindowController__pushView &&
            MainWindowController__popView && N3DialogFactory__getDialog &&
@@ -513,9 +518,11 @@ bool nf_build_volume_source(QStringList const& contentIds, QString const& dbName
     //     from (nfnickel.h) -- immediately before `blx operator new` then
     //     `blx 0x67775c` (this exact ctor).
     // Both exactly match this file's own earlier LOWER-BOUND derivation
-    // (read from each constructor's own writes to `this`, the technique
-    // CLAUDE.md's AbstractController precedent established for when no
-    // call site can be found): the lower bounds were 16 and 12, and the
+    // (read from each constructor's own writes to `this`, the same
+    // technique this project's now-retired AbstractController shim relied
+    // on when no allocation call site could be found -- CLAUDE.md never
+    // stated the technique itself, only the "over-allocate and record the
+    // measurement" rule it was serving): the lower bounds were 16 and 12, and the
     // real, Nickel-measured sizes are 16 and 12. Still over-allocated to
     // 256 below -- CLAUDE.md's margin, not a reaction to any remaining
     // doubt about the number itself.

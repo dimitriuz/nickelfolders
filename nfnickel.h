@@ -168,22 +168,49 @@ typedef void N3Dialog;
 // closeTapped() signal to MainWindowController::closeActiveN3Dialogs().
 // Returns the new N3Dialog* in r0, not by value.
 //
-// What the `bool` means is NOT established (NOTES.md): it is forwarded
-// verbatim into N3Dialog's own constructor and never otherwise examined
-// inside getDialog. `true` is what NickelHardcover (MIT,
-// codeberg.org/StrayRose/NickelHardcover) passes, unexplained there too --
-// followed here as working prior art, not as an understood value.
-extern N3Dialog *(*N3DialogFactory__getDialog)(QWidget *content, bool fullScreenIdk);
+// The `bool` DECODED (review pass, 0x10e4ae6-0x10e4b02, inside N3Dialog's
+// own constructor): `if (bool) { this->+64 = new
+// GoToPageMenuController(ui->+92, true); }` -- it gates constructing a
+// page-jump menu controller, NOT full-view mode (that is the separate,
+// unrelated `N3Dialog::enableFullViewMode()`, 0x10e4734, not resolved
+// here). The parameter used to be spelled `fullScreenIdk`, a guessed name
+// -- exactly the mistake this project has a standing rule against ("a
+// plausible-sounding method name is not evidence of what it does",
+// NOTES.md's `registerForTapGestures` entry) -- renamed to
+// `buildGoToPageMenu` to say what the decode actually found. `true` is
+// confirmed harmless for this screen: an inert extra controller is built
+// and never acted on, since nothing here ever sets a page count for it to
+// respond to.
+extern N3Dialog *(*N3DialogFactory__getDialog)(QWidget *content, bool buildGoToPageMenu);
 extern void      (*N3Dialog__setTitle)(N3Dialog *_this, QString const &title);
 extern void      (*N3Dialog__enableBackButton)(N3Dialog *_this, bool enable);
 
+// N3Dialog::disableCloseButton() -- 0x10e4084
+// (`_ZN8N3Dialog18disableCloseButtonEv`). getDialog wires the dialog's
+// closeTapped() signal (the X button) to MainWindowController::
+// closeActiveN3Dialogs() (0xeabf1c) UNCONDITIONALLY -- but that function
+// iterates the controller stack at MainWindowController+60, which
+// pushView (below) never populates. So on this route the X is a
+// misleading, non-functional affordance: tapping it does nothing. Call
+// this to remove it. Deliberately NOT folded into
+// nf_native_view_resolve()'s hard gate below -- a firmware missing just
+// this symbol should still show the screen (with the X's cosmetic problem
+// left unfixed), not refuse to build the whole thing over a call that
+// fixes an appearance, not a function; nfview.cc NULL-gates this one at
+// its own call site instead.
+extern void (*N3Dialog__disableCloseButton)(N3Dialog *_this);
+
 // MainWindowController::pushView(QWidget*) -- 0xea968c (NOTES.md). Distinct
-// from MainWindowController::push(AbstractController*, bool), above: this
-// sets NO objectName, does NOT touch the controller stack
-// (MainWindowController+60) at all, and just does `stack->addWidget(v);
-// stack->setCurrentWidget(v)` after closing any open touch menus -- which
-// is exactly why this route needs no controller and no cross-cast: nothing
-// here ever asks the pushed widget to BE one.
+// from MainWindowController::push(AbstractController*, bool), above: it
+// warns and returns EARLY, doing nothing else, if `v` is already
+// `stack->currentWidget()`; otherwise it carries three status-bar
+// properties over from the OUTGOING widget (title/status-bar-related
+// properties read off whatever was on top before, per NOTES.md's own
+// disassembly), calls `closeActiveTouchMenus()`, then does
+// `stack->addWidget(v); stack->setCurrentWidget(v)`. It sets NO objectName
+// and does NOT touch the controller stack (MainWindowController+60) at
+// all -- which is exactly why this route needs no controller and no
+// cross-cast: nothing here ever asks the pushed widget to BE one.
 //
 // popView(QWidget*) -- 0xea91e0 -- is the exact counterpart:
 // setVisible(false), deleteLater(), stack->removeWidget(v). It DESTROYS the
@@ -213,13 +240,16 @@ extern void (*MainWindowController__popView)(MainWindowController *_this, QWidge
 typedef void TouchLabel;
 extern void (*TouchLabel__ctor)(TouchLabel *_this, QWidget *parent, QFlags<Qt::WindowType> flags);
 
-// True once every symbol this route needs has resolved -- a FOURTH,
+// True once every symbol this route needs has resolved -- a THIRD,
 // independent gate from nf_nickel_resolve()/nf_browser_resolve() (the same
 // independence those two already keep from each other): a firmware that
-// renames one of these six does not disable book-opening or the borrowed-
-// controller browser screen, and vice versa. nf_browser_show() (nfview.cc)
-// refuses to build anything at all if this is false, rather than pushing a
-// half-wired dialog with some calls silently skipped.
+// renames one of these seven does not disable book-opening or the
+// borrowed-controller browser screen, and vice versa. nf_browser_show()
+// (nfview.cc) refuses to build anything at all if this is false, rather
+// than pushing a half-wired dialog with some calls silently skipped. Note
+// N3Dialog__disableCloseButton is deliberately NOT among these seven --
+// see its own comment above for why that one call stays a soft,
+// NULL-gated best-effort instead.
 bool nf_native_view_resolve(void);
 
 // QSharedPointer<T>'s complete runtime layout, for every T, per Qt 5.2's
