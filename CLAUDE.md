@@ -11,8 +11,20 @@ as a Qt image-format plugin, built on
 [NickelHook](https://github.com/pgaskin/NickelHook). Nickel is not modified on
 disk; the mod is removable by deleting one file.
 
-**STATUS: rungs 0–2 are device-verified; the folder browser now exists in
-code and is NOT YET DEVICE-TESTED.** Opening an arbitrary sideloaded book by
+**STATUS: rungs 0–2 AND the folder browser are device-verified**
+(2026-09-04, Kobo Libra 2, firmware 4.38.23684). Verified on hardware:
+browsing the tree, opening a book in the stock reader and returning to the
+same folder, folders-first natural sort with a descending toggle, sort by
+name/size/date, type filters, the three read-state filters
+(finished / in progress / not started), greyed `[not in library]` rows,
+reading-progress badges, pagination, and per-row icons the mod draws
+itself. The read-state filters were checked by ARITHMETIC on a 27-entry
+folder — in-progress 3 + not-started 23 + finished 0 leaves exactly the one
+row with no library row — which is a stronger check than any single count
+and is the pattern to reuse for the next partition (`NOTES.md`, Task 13).
+Still NOT device-tested: the two date sort keys (recently read, recently
+added), which are archaeologically established but unimplemented — see
+"What comes next".** Opening an arbitrary sideloaded book by
 ContentID (rung 1) and pushing a screen of our own choosing onto Nickel's
 window stack (rung 2) are both proven on hardware. **The folder tree itself
 is now wired up, in `nfview.cc`**: one `N3Dialog`, rooted at
@@ -367,6 +379,30 @@ afterward.
   `FolderItemMenuController`, and `folder://` among its URL schemes.
 - `MainWindowController::sharedInstance()` / `::push(AbstractController*, bool)`
   and `LibraryNavMixin::pushShelf(QString const&)` are all exported.
+- **Qt 5.2.1 will not resolve `<img src="file:///...">`; a bare absolute
+  path works.** Rich text in a `TouchLabel` referencing a PNG the mod wrote
+  to `/tmp` rendered Qt's own broken-image placeholder for every row under
+  the `file://` URL, and rendered correctly as `<img src="/tmp/...">`. Host
+  Qt 5.15 renders BOTH, so this is exactly the version skew the two build
+  paths are kept apart to expose (`NOTES.md`, Task 13). The read-back check
+  is what proved the files were fine — it uses `QImage(path)` directly while
+  rich text goes through `QTextDocument::loadResource`, and the two can
+  disagree.
+- **Nickel's own Qt resources ARE reachable from the injected library**
+  (`<img src=":/images/...">` renders), but `:/images/widgets/folder.png` is
+  **not a folder icon** — it is a 250x350 cover-shaped grey placeholder, and
+  there is no folder or document pictogram among Nickel's 373 `:/images`
+  entries. The mod draws its own set instead and writes them to `/tmp`
+  (tmpfs, so no `/mnt/onboard` handle, and regenerated every Nickel start).
+  `rcc` is barred here because it registers resources with a file-scope
+  static initialiser — see the no-file-scope rule above.
+- **`N3Dialog::width()` returns 600 before the dialog is laid out, and 1264
+  after** — the VISIBLE panel width, not the padded 1280 that sysfs
+  `virtual_size` reports. Rows built for the first listing after a
+  `pushView` necessarily read the 600 default, which is a plausible-looking
+  number that announces nothing, so any width derived from it silently
+  mis-sizes every row. Log which of the two a measurement came from; that
+  marker is the only way to tell them apart.
 - **A plain `QWidget` renders but can never receive a tap.** Nickel does not
   deliver touch as Qt mouse events — it reads the panel itself and turns
   touches into its own gestures via six custom `QGestureRecognizer`
