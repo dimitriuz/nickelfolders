@@ -2476,3 +2476,68 @@ result that is only readable because it is logged.
 Worth watching on the first device run: `sizeHint()` on a Nickel widget,
 12 times per navigation, is the only part of this that reaches into Nickel's
 own layout machinery. Check the PID and `logread`.
+
+### Device results: the elision fix, and the fallback width that caused the clipping
+
+Verified on hardware 2026-09-04, firmware 4.38.23684, Nickel PID 7714, no
+crash traces and PID unchanged across the run — which matters here because
+this build calls `QLabel::sizeHint()` on a Nickel widget twelve times per
+navigation, the only part of it reaching into Nickel's own layout machinery.
+
+The row-width log now names its own provenance, and the two paths differ by
+exactly the amount that was clipping:
+
+```
+row width 1196 px -- FALLBACK, nothing is laid out yet
+    (N3Dialog::width() read back 600, last content widget -1,
+     our layout margins 34+34, panel clamp 1264)
+row width 1144 px -- CONTENT, measured off the widget the dialog last laid out
+    (N3Dialog::width() read back 1264, last content widget 1212,
+     our layout margins 34+34, panel clamp 1264)
+```
+
+So the FIRST listing after a push necessarily takes the fallback — rows are
+built before `pushView` has sized anything, and `N3Dialog::width()` reads
+back its **600 px default** at that moment, not 1264. The fallback's 1196
+was **52 px too generous** against the measured 1144, and 52 px is about one
+character at this font size, which is precisely the observed symptom: a
+final `f` or `%)` falling off the edge. Every listing after the first reads
+CONTENT.
+
+Worth keeping: `N3Dialog::width()` returning 600 on a dialog that has not
+been laid out is a perfectly plausible-looking number. Nothing about it
+announces itself as a default, and a width term derived from it silently
+mis-sizes every row. The MEASURED/FALLBACK marker in the log is the only
+reason the two cases can be told apart at all — a value that looks
+reasonable is not evidence that it was measured.
+
+The name budget is logged with every term spelled out:
+
+```
+name budget 1069 px = row 1144 - label inset 0 - icon 52 - suffix 23 ('/')
+```
+
+`label inset 0` is itself a measurement rather than an omission — this
+`TouchLabel` reports no text inset — and `icon 52` is the 40 px icon plus
+its `&nbsp;` separator measured in the entity's own width, not a plain
+space's, which was one of the four mismeasured terms.
+
+**The measured retry pass never fired**, across both the fallback and the
+content path. That is the result worth recording: the four named terms add
+up on their own, and the `FontSizeAdjustingLabel` font-resize term that
+could not be computed by arithmetic is not biting in practice. It is only
+readable as a result because the retry logs when it fires, so its silence
+means something — a negative result that had to be designed for in advance.
+
+Outcome on the panel: folder rows carry a folder pictogram, `.epub` rows an
+open book, and the two files that were byte-identical rows —
+
+```
+steven l. kent - the ultimate history of video games, volume 1 - 2001.kepub.epub
+steven l. kent - the ultimate history of video games, volume 2 - 2021.kepub.epub
+```
+
+— now render as `steven l. kent - the... 1 - 2001.kepub.epub  (52%)` and
+`steven l. kent - the ult...lume 2 - 2021.kepub.epub`. They elide at
+DIFFERENT points, which is correct rather than sloppy: the first carries a
+` (52%)` suffix and so has less room for its name. Nothing clips.
