@@ -313,6 +313,44 @@ trap 'log "signal TERM"; finish; exit 143' TERM
 # holding the framebuffer, the input devices and a write handle on
 # /mnt/onboard is a strictly worse state than this script refusing to
 # proceed. So: escalate instead of hoping, in two more steps below.
+#
+# LIVENESS CHECK, AND A TRAP NAMED IN FULL BECAUSE IT COST A RECOVERY
+# REBOOT ONCE ALREADY: this script checked "is nickel still alive" with
+# `pkill -0 nickel`. pgrep/pkill match the process name as an unanchored
+# regex, i.e. by SUBSTRING, unless given `-x` for an exact match -- and
+# this device runs a probe literally named `nickel-selftest`
+# (`pgrep -l nickel` -> `222 nickel` and `1605 nickel-selftest`, both
+# lines). So the check was true for this script's ENTIRE run regardless
+# of whether the real Nickel was alive, every single time it has ever
+# been run: the SIGTERM wait always burned its full budget, and after the
+# SIGKILL escalation below was added, the FOLLOW-ON wait also always
+# burned its budget and the FATAL bail-out always fired -- refusing to
+# relaunch a Nickel that had, in fact, already exited, and leaving the
+# device with no UI. `pidof nickel` is exact (verified against the same
+# `nickel-selftest` process: `pidof nickel` returned only the real
+# Nickel's pid), so that is the check used below and at every other
+# liveness test in this function.
+#
+# This script's own filename CONTAINS "nickel" (restart-nickel.sh), which
+# is precisely the shape of trap that bit the check above: any future
+# edit that reaches for `pkill nickel` / `pgrep nickel` / `killall
+# nickel` without an exact-match flag risks matching either this script's
+# own shell process or another "*nickel*"-named helper on this device,
+# and the symptom is invisible until the day it isn't -- a false "still
+# alive" just burns a wait budget, but combined with a bail-out (below)
+# it strands the device with no UI. `pidof` is exact by design and is
+# what every liveness check in this function uses; do not swap it for a
+# pgrep/pkill form without `-x`.
+#
+# `killall`, used just below to actually SEND the signals, is a different
+# tool and was checked separately: both GNU psmisc killall and BusyBox's
+# implementation match a process's exact name (comm), not a regex or
+# substring -- `-r`/`--regexp` is what opts GNU killall INTO pattern
+# matching, and it is not used here. So `killall -q -TERM nickel` was
+# never at risk of also signalling `nickel-selftest` or this script's own
+# interpreter (whose own comm is the shell's name, e.g. `sh`, which does
+# not equal "nickel" either way). The signalling side of this script was
+# never the bug; only the liveness CHECK was.
 log "stopping Nickel"
 NICKEL_KILLNAMES="nickel hindenburg sickel fickel strickel fontickel adobehost foxitpdf iink"
 killall -q -TERM $NICKEL_KILLNAMES
@@ -325,35 +363,47 @@ killall -q -TERM $NICKEL_KILLNAMES
 # for shortening it -- doing so would just turn "graceful shutdown that is
 # slightly slow today" into "escalates to SIGKILL more often for no gain."
 i=0
-while pkill -0 nickel 2>/dev/null; do
+while pidof nickel >/dev/null 2>&1; do
     [ "$i" -ge 40 ] && break
     usleep 250000 2>/dev/null || sleep 1
     i=$((i + 1))
 done
 
-if ! pkill -0 nickel 2>/dev/null; then
+if ! pidof nickel >/dev/null 2>&1; then
     log "Nickel stopped after SIGTERM, $((i * 250))ms"
 else
     # SIGTERM did not finish the job inside its budget. SIGKILL cannot be
     # caught, blocked or ignored -- the kernel delivers it unconditionally
-    # -- so unlike the wait above, this second wait is not accommodating a
-    # shutdown ROUTINE, only the kernel's own teardown of the process (and,
-    # rarely, a process stuck in an uninterruptible D-state on flash I/O
-    # that even SIGKILL cannot interrupt until the I/O completes). 8 * 250ms
-    # = 2s is generous for that and far short of the 10s above on purpose:
-    # if Nickel is still there after being SIGKILLed, waiting longer buys
-    # nothing, because a process that ignores an uncatchable signal past a
-    # couple of seconds is not going to disappear on its own.
+    # -- so this second wait is not accommodating a shutdown ROUTINE the
+    # way the first one is, only what the kernel itself still has to do:
+    # tear the process down, and finish any I/O the process was blocked
+    # in when the kernel killed it. That second part is not negligible
+    # here -- Nickel is the process that owns the content database on
+    # /mnt/onboard and can be flushing it on the way out, and a process
+    # blocked in an uninterruptible (D-state) write to that flash does
+    # not respond to SIGKILL until the I/O itself completes, however long
+    # that takes. This budget was originally set to 8 * 250ms = 2s on the
+    # theory that SIGKILL leaves little left to wait for, but that
+    # reasoning was never actually exercised: the liveness check above
+    # was broken from the start, so this branch could never previously be
+    # reached by a real "still alive" result -- only by the false
+    # positive. With the check now trustworthy, 2s is too tight for a
+    # slow flash write to fit inside, and this path bailing out instead
+    # of relaunching is exactly the failure this project just had. So:
+    # 20 * 250ms = 5s -- half of the SIGTERM budget above, long enough to
+    # give a real flash write room to finish, short enough that a
+    # genuinely wedged process (stuck past that) is still recognised as
+    # wedged rather than waited on indefinitely.
     log "WARNING nickel still alive after SIGTERM+${i}*250ms, escalating to SIGKILL"
     killall -q -KILL $NICKEL_KILLNAMES
     j=0
-    while pkill -0 nickel 2>/dev/null; do
-        [ "$j" -ge 8 ] && break
+    while pidof nickel >/dev/null 2>&1; do
+        [ "$j" -ge 20 ] && break
         usleep 250000 2>/dev/null || sleep 1
         j=$((j + 1))
     done
 
-    if ! pkill -0 nickel 2>/dev/null; then
+    if ! pidof nickel >/dev/null 2>&1; then
         log "Nickel stopped after SIGKILL, $((j * 250))ms"
     else
         # Still here. This is the one outcome this script refuses to paper
