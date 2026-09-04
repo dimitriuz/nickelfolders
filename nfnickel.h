@@ -10,6 +10,13 @@
 #include <QStringList>
 #include <QWidget> // TouchLabel's parent parameter, and QFlags<Qt::WindowType> (qnamespace.h, pulled in transitively) for its ctor's own signature
 
+// nf_read_state, for nf_volume_exists' own out-parameter below. The ONLY pure
+// header this one includes, and the dependency deliberately points this way:
+// nffmt.h knows nothing about libnickel, so the read-state enum stays testable
+// on the host while the call that fills it stays in this file with every other
+// libnickel signature.
+#include "nffmt.h"
+
 #include <NickelHook.h>
 
 // The dlsym table nfnickel.cc's symbols resolve through. NickelHook processes
@@ -281,7 +288,7 @@ bool nf_native_view_resolve(void);
 // at all -- consistent with every other gate in this file staying
 // independent per feature.
 //
-// Also fills *outPercentRead and *outFinished from the SAME Volume, in the
+// Also fills *outPercentRead and *outReadState from the SAME Volume, in the
 // SAME getById/isValid/dtor round trip -- one lookup per row, not two --
 // via Content::getReadStatus()/isFinished() and a hardcoded offset into
 // Volume::d(), NOT Volume::getDbValues(): that call is safe to invoke but
@@ -302,12 +309,22 @@ bool nf_native_view_resolve(void);
 // feature alone, same independence as every other gate here), or when the
 // value read back is outside 0..100 -- that last case is a hardcoded
 // struct offset's only safety net (nfnickel.cc has the full guard and why
-// clamping instead would be the wrong fix). *outFinished is false in every
-// one of those cases too. Both are always written, even when this returns
-// false, the same convention nf_build_volume_source's *outKept already
-// uses.
+// clamping instead would be the wrong fix). *outReadState is
+// NF_READ_UNKNOWN in every one of those cases too, plus whenever
+// Content::getReadStatus() answers something outside the measured 0..2 --
+// unknown, deliberately not "not started", because 0 is a real bucket and a
+// wrong 0 would be invisible (nffmt.cc, nf_read_state_from_status). Both are
+// always written, even when this returns false, the same convention
+// nf_build_volume_source's *outKept already uses.
+//
+// This replaced an earlier `bool *outFinished`: a bool cannot carry three
+// states, and the three read-state filters need all three. nf_row::finished is
+// now DERIVED from the tri-state by nf_build_listing (nflist.cc), so there is
+// still exactly one source of truth for "is this book finished" -- it just
+// moved from Content::isFinished() to Content::getReadStatus(), with
+// isFinished() kept as the cross-check it always was (nfnickel.cc).
 bool nf_volume_exists(QString const& contentId, QString const& dbName,
-                      int *outPercentRead, bool *outFinished);
+                      int *outPercentRead, nf_read_state *outReadState);
 
 // QSharedPointer<T>'s complete runtime layout, for every T, per Qt 5.2's
 // public qsharedpointer_impl.h: a value pointer, then an

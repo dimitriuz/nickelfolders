@@ -255,11 +255,14 @@ static void nf_pop_native_view(void *mwc, N3Dialog *dialog, char const *why) {
 // crashed on once already, a ReadStatus value that reads back as 0 through
 // the only exported unwrap path, and an operator[] that inserts rather
 // than fails) rather than merely deferred as unestablished archaeology.
-// This fills nf_row::hasRow, ::percentRead and ::finished in ONE call --
+// This fills nf_row::hasRow, ::percentRead and ::readState in ONE call --
 // nf_volume_exists's own comment has the full derivation for the three
 // narrower symbols it reads instead (Content::getReadStatus()/isFinished()
 // and a guarded offset off Volume::d()) and NOTES.md's "reading progress
-// on folder rows" section has the archaeology behind them.
+// on folder rows" section has the archaeology behind them. Deliberately does
+// NOT touch nf_row::finished: nf_build_listing derives that from ::readState
+// once this callback returns (nflist.cc), so there is one source of truth for
+// it rather than two that can disagree.
 struct NFMetaCtx {
     QString dirPath; // the directory `name` (below) is relative to; ABSOLUTE, no trailing slash
     QString dbName;  // this device's own getById partition key -- nf_db_name(), read once per directory, not per file
@@ -268,7 +271,7 @@ struct NFMetaCtx {
 static void nf_row_meta(void *ctx, QString const& name, nf_row *row) {
     NFMetaCtx const *c = static_cast<NFMetaCtx const*>(ctx);
     QString contentId = QStringLiteral("file://") + c->dirPath + QLatin1Char('/') + name;
-    row->hasRow = nf_volume_exists(contentId, c->dbName, &row->percentRead, &row->finished);
+    row->hasRow = nf_volume_exists(contentId, c->dbName, &row->percentRead, &row->readState);
 }
 
 // QDir::entryInfoList against ONE directory, never recursive -- the spec's
@@ -336,15 +339,27 @@ static void nf_browser_cycle_sort(void) {
     }
 }
 
-// Cycles nf_browser_filter through all -> cbz -> cbr -> pdf -> epub -> all.
+// Cycles nf_browser_filter through all -> cbz -> cbr -> pdf -> epub ->
+// finished -> in progress -> not started -> all.
+//
+// The three read-state options come AFTER the five format ones, in that order,
+// so the tap sequence the owner has already learned on hardware (all -> cbz ->
+// cbr -> pdf -> epub) is unchanged and the new options are appended past the
+// end of it rather than inserted into the middle. Eight states on one row is a
+// long cycle -- but a second chrome row would cost an item row out of the
+// panel's measured budget of 17, which is a worse trade than a few extra taps
+// (nffmt.h, nf_filter_kind).
 static void nf_browser_cycle_filter(void) {
     switch (nf_browser_filter) {
-        case NF_FILTER_ALL:  nf_browser_filter = NF_FILTER_CBZ;  break;
-        case NF_FILTER_CBZ:  nf_browser_filter = NF_FILTER_CBR;  break;
-        case NF_FILTER_CBR:  nf_browser_filter = NF_FILTER_PDF;  break;
-        case NF_FILTER_PDF:  nf_browser_filter = NF_FILTER_EPUB; break;
-        case NF_FILTER_EPUB:
-        default:              nf_browser_filter = NF_FILTER_ALL;  break;
+        case NF_FILTER_ALL:         nf_browser_filter = NF_FILTER_CBZ;         break;
+        case NF_FILTER_CBZ:         nf_browser_filter = NF_FILTER_CBR;         break;
+        case NF_FILTER_CBR:         nf_browser_filter = NF_FILTER_PDF;         break;
+        case NF_FILTER_PDF:         nf_browser_filter = NF_FILTER_EPUB;        break;
+        case NF_FILTER_EPUB:        nf_browser_filter = NF_FILTER_FINISHED;    break;
+        case NF_FILTER_FINISHED:    nf_browser_filter = NF_FILTER_IN_PROGRESS; break;
+        case NF_FILTER_IN_PROGRESS: nf_browser_filter = NF_FILTER_NOT_STARTED; break;
+        case NF_FILTER_NOT_STARTED:
+        default:                     nf_browser_filter = NF_FILTER_ALL;         break;
     }
 }
 
@@ -365,15 +380,25 @@ static QString nf_sort_row_label(void) {
         nf_browser_sort_desc ? QStringLiteral("v") : QStringLiteral("^"));
 }
 
+// The read-state names are spelled out in words ("finished", "in progress",
+// "not started") rather than shortened to match the four lowercase format
+// abbreviations above them: the abbreviations are the formats' own file
+// extensions, which a reader already knows, whereas an abbreviated read state
+// would be this mod inventing a vocabulary. This string is also what the
+// "everything here was filtered out" message quotes back (below), so it has to
+// read as a sentence fragment, not a code.
 static QString nf_filter_row_label(void) {
     QString filterName;
     switch (nf_browser_filter) {
-        case NF_FILTER_CBZ:  filterName = QStringLiteral("cbz");  break;
-        case NF_FILTER_CBR:  filterName = QStringLiteral("cbr");  break;
-        case NF_FILTER_PDF:  filterName = QStringLiteral("pdf");  break;
-        case NF_FILTER_EPUB: filterName = QStringLiteral("epub"); break;
+        case NF_FILTER_CBZ:         filterName = QStringLiteral("cbz");         break;
+        case NF_FILTER_CBR:         filterName = QStringLiteral("cbr");         break;
+        case NF_FILTER_PDF:         filterName = QStringLiteral("pdf");         break;
+        case NF_FILTER_EPUB:        filterName = QStringLiteral("epub");        break;
+        case NF_FILTER_FINISHED:    filterName = QStringLiteral("finished");    break;
+        case NF_FILTER_IN_PROGRESS: filterName = QStringLiteral("in progress"); break;
+        case NF_FILTER_NOT_STARTED: filterName = QStringLiteral("not started"); break;
         case NF_FILTER_ALL:
-        default:              filterName = QStringLiteral("all");  break;
+        default:                     filterName = QStringLiteral("all");         break;
     }
     return QStringLiteral("filter: %1").arg(filterName);
 }

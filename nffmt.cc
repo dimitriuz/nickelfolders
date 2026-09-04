@@ -297,6 +297,36 @@ void nf_sort_entries(QVector<nf_entry> *entries, nf_sort_key key, bool descendin
     }
 }
 
+// The row-level sort borrows nf_entry_before through a throwaway nf_entry
+// rather than restating any of it. What gets duplicated below is the
+// insertion-sort LOOP -- five self-evident lines -- and not the ordering
+// RULES, which are the part with a measured trap in them (6.2's
+// "reverse the list", and the tie-break) and stay in exactly one function.
+// The copy is shallow: an nf_row's `name` is a refcounted QString, so this is
+// two atomic increments per comparison against a 27-entry worst case measured
+// on the reference card -- cheaper than a second copy of the rules for
+// somebody to keep in sync with the first.
+static nf_entry nf_entry_of(nf_row const& r) {
+    nf_entry e;
+    e.name  = r.name;   // the ON-DISK name, never the label: labels are derived last, after ordering (nflist.cc)
+    e.isDir = r.isDir;
+    e.size  = r.size;
+    e.mtime = r.mtime;
+    return e;
+}
+
+void nf_sort_rows(QVector<nf_row> *rows, nf_sort_key key, bool descending) {
+    for (int i = 1; i < rows->size(); i++) {
+        nf_row cur = rows->at(i);
+        int j = i - 1;
+        while (j >= 0 && nf_entry_before(nf_entry_of(cur), nf_entry_of(rows->at(j)), key, descending)) {
+            (*rows)[j + 1] = rows->at(j);
+            j--;
+        }
+        (*rows)[j + 1] = cur;
+    }
+}
+
 bool nf_is_book_name(QString const& name) {
     return !nf_book_extension(name).isEmpty();
 }
@@ -315,8 +345,94 @@ bool nf_matches_filter(QString const& name, nf_filter_kind filter) {
         case NF_FILTER_PDF:  return ext.compare(QStringLiteral(".pdf"), Qt::CaseInsensitive) == 0;
         case NF_FILTER_EPUB: return ext.compare(QStringLiteral(".epub"), Qt::CaseInsensitive) == 0
                                   || ext.compare(QStringLiteral(".kepub.epub"), Qt::CaseInsensitive) == 0;
+        // Every read-state value lands here and admits the file, which is
+        // exactly right: a read-state filter has no opinion about FORMAT.
+        // The mirror image is nf_matches_read_filter returning true for every
+        // format filter -- one enum, two axes, and each function answers only
+        // its own.
         case NF_FILTER_ALL:
         default:              return true;
+    }
+}
+
+// --- the read-state axis ------------------------------------------------
+//
+// Kobo's own ReadingStatus values decoded into this file's enum. THE ONLY
+// place 0/1/2 appear in this project -- see nffmt.h for why the two
+// numberings are deliberately kept apart.
+nf_read_state nf_read_state_from_status(int status) {
+    switch (status) {
+        case 0:  return NF_READ_NOT_STARTED;
+        case 1:  return NF_READ_IN_PROGRESS;
+        case 2:  return NF_READ_FINISHED;
+        // Anything else degrades to UNKNOWN rather than to a bucket. 0 is a
+        // REAL bucket here, so treating an unexpected value as 0 would file
+        // every book under "not started" with nothing to distinguish it from
+        // a book that genuinely is unread -- an invisible wrong answer, where
+        // UNKNOWN is a visible one (the row simply appears under no
+        // read-state filter at all). Same reasoning, and the same refusal to
+        // clamp into range, as the percentRead offset guard in nfnickel.cc.
+        default: return NF_READ_UNKNOWN;
+    }
+}
+
+// Deliberately no `default:`: this switch names every nf_filter_kind, so
+// adding a filter value later fails the build here (-Wswitch, and the Makefile
+// builds with -Werror) until somebody says which of the two axes it belongs
+// to. A `default:` would instead silently classify it as a format filter.
+static bool nf_filter_is_read_state(nf_filter_kind filter) {
+    switch (filter) {
+        case NF_FILTER_FINISHED:
+        case NF_FILTER_IN_PROGRESS:
+        case NF_FILTER_NOT_STARTED:
+            return true;
+        case NF_FILTER_ALL:
+        case NF_FILTER_CBZ:
+        case NF_FILTER_CBR:
+        case NF_FILTER_PDF:
+        case NF_FILTER_EPUB:
+            break;
+    }
+    return false;
+}
+
+bool nf_matches_read_filter(nf_row const& row, nf_filter_kind filter) {
+    if (!nf_filter_is_read_state(filter))
+        return true;
+
+    // A folder is NEVER filtered out, by any filter -- nf_build_listing's own
+    // type-filter comment (nflist.cc) has the full reason: a folder may hold
+    // matching files one level down, and hiding it makes them unreachable
+    // rather than merely invisible. On this axis there is a second reason as
+    // well: a folder has no Volume, so there is no read state to match against
+    // even in principle. Answered HERE rather than short-circuited by the
+    // caller the way the type filter's folder rule has to be -- a name-only
+    // predicate cannot see isDir, this one can, so the rule lives in one place.
+    if (row.isDir)
+        return true;
+
+    // No library row means no MEASURABLE read state, which is not the same
+    // thing as "not started". The reference card carries a truncated 8 MiB
+    // file Nickel failed to import (CLAUDE.md) -- calling that book unread
+    // would be a guess dressed up as a fact, and it would show up under
+    // "not started" alongside books that really are. So an unknown state is
+    // hidden by all three read-state filters, and shown by every other filter.
+    //
+    // hasRow is checked as WELL as readState, not instead of it: hasRow is the
+    // fact an nf_meta_fn establishes first, and a row with no Volume must never
+    // land in a bucket however some future `meta` happens to leave readState.
+    if (!row.hasRow || row.readState == NF_READ_UNKNOWN)
+        return false;
+
+    switch (filter) {
+        case NF_FILTER_FINISHED:    return row.readState == NF_READ_FINISHED;
+        case NF_FILTER_IN_PROGRESS: return row.readState == NF_READ_IN_PROGRESS;
+        case NF_FILTER_NOT_STARTED: return row.readState == NF_READ_NOT_STARTED;
+        // Unreachable: nf_filter_is_read_state above already returned for
+        // every other value. Present because a switch over an enum still needs
+        // a return on every path, and answering "yes" is the safe direction --
+        // a filter this function does not understand must not make rows vanish.
+        default:                     return true;
     }
 }
 

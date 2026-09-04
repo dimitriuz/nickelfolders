@@ -57,14 +57,22 @@ static void    (*Volume__dtor)(Volume *_this);
 // Content::getReadStatus() const / Content::isFinished() const -- plain
 // (this in r0, scalar out in r0) convention, nothing to destroy (NOTES.md,
 // "reading progress on folder rows"). isFinished() is measured equivalent
-// to getReadStatus() == 2, and is what nf_volume_exists calls for the
-// finished bit -- calling Nickel's own predicate rather than reimplementing
-// "== 2" by hand means this mod never has to hardcode Kobo's own
-// ReadingStatus enum value. getReadStatus() is resolved and called too,
-// purely as a cross-check against isFinished()'s own answer -- this
-// project has shipped one mangled-wrong symbol before (getDbValues' own
-// length prefix, NOTES.md), and two independently-resolved symbols
-// disagreeing is exactly the kind of thing that would catch a repeat.
+// to getReadStatus() == 2.
+//
+// getReadStatus() is now the PRIMARY read, and that is a reversal: until the
+// read-state filters existed, isFinished() was primary precisely so this mod
+// never had to hardcode Kobo's own ReadingStatus values, and getReadStatus()
+// was called only as a cross-check. A bool cannot tell "not started" from "in
+// progress", so the three-bucket filter forces the tri-state -- and with it,
+// the 0/1/2 this mod used to avoid naming. Those three numbers now live in
+// exactly one place, nf_read_state_from_status (nffmt.cc), which is in the
+// pure layer so that the range check guarding them is one of the few things
+// `make test` can actually run.
+//
+// isFinished() keeps the job getReadStatus() used to have: the cross-check.
+// This project has shipped one mangled-wrong symbol before (getDbValues' own
+// length prefix, NOTES.md), and two independently-resolved symbols disagreeing
+// is exactly the kind of thing that would catch a repeat.
 //
 // Both are Content:: members called directly on a Volume*: Content is a
 // public, non-virtual base of Volume AT OFFSET 0 (Volume's own _ZTI,
@@ -272,22 +280,32 @@ bool nf_native_view_resolve(void) {
 // any other .bss byte.
 static bool nf_percent_offset_warned = false;
 
+// The same one-shot discipline for an out-of-range Content::getReadStatus():
+// a firmware that renumbered Kobo's own ReadingStatus should be findable in
+// logread once, not once per file per listing. A separate flag from the
+// percent one above rather than a shared "something about progress looked
+// wrong" bit, because the two failures have different causes -- a moved struct
+// offset versus a renumbered enum -- and a shared flag would let whichever
+// fired first silence the other for the rest of the run. Plain zero-
+// initialised .bss, same reason as above.
+static bool nf_read_status_warned = false;
+
 // Same discipline as nf_open_book_staged (above): getById answers an
 // unknown ContentID with a default-constructed Volume rather than an
 // error, so isValid is what actually distinguishes "found it" from "no
 // such book" -- and the dtor runs on the SAME path either way, since
 // getById always constructs into volbuf when it returns non-null.
 //
-// Reading progress (percentRead/finished) is read from this SAME Volume,
+// Reading progress (percentRead/readState) is read from this SAME Volume,
 // not a second lookup -- nfnickel.h has the full rationale for using
 // Content::getReadStatus()/isFinished() and Volume::d()+140 rather than
 // Volume::getDbValues(). Both progress reads happen only once isValid()
 // is true: an invalid Volume's private data is not something any of this
 // project's archaeology says anything about reading.
 bool nf_volume_exists(QString const& contentId, QString const& dbName,
-                      int *outPercentRead, bool *outFinished) {
+                      int *outPercentRead, nf_read_state *outReadState) {
     *outPercentRead = -1;
-    *outFinished    = false;
+    *outReadState   = NF_READ_UNKNOWN;
 
     if (!nf_nickel_resolve())
         return false;
@@ -309,17 +327,39 @@ bool nf_volume_exists(QString const& contentId, QString const& dbName,
         // Content is a public, non-virtual base of Volume AT OFFSET 0
         // (Volume's own _ZTI, NOTES.md) -- v is usable as the Content*
         // `this` for both calls below with no adjustment.
-        if (Content__isFinished)
-            *outFinished = Content__isFinished(v);
+        //
+        // getReadStatus() is the primary read now that the answer has to be a
+        // tri-state -- see its own declaration comment, above, for why that
+        // reversed. The raw int is decoded by nf_read_state_from_status
+        // (nffmt.cc), NOT compared against 0/1/2 here: that keeps the one
+        // place Kobo's own enum values appear in the pure, host-tested layer,
+        // and its out-of-range answer is UNKNOWN rather than a bucket.
+        if (Content__getReadStatus) {
+            int status     = Content__getReadStatus(v);
+            *outReadState  = nf_read_state_from_status(status);
+            if (*outReadState == NF_READ_UNKNOWN && !nf_read_status_warned) {
+                nf_read_status_warned = true;
+                nh_log("progress: Content::getReadStatus() read %d for '%s' -- outside the measured 0..2, treating the read state as unknown; this firmware may have renumbered ReadingStatus", status, qPrintable(contentId));
+            }
+        } else if (Content__isFinished) {
+            // getReadStatus() gone but isFinished() still resolving: degrade
+            // to what a bool can answer rather than to nothing at all, so the
+            // row's own "[finished]" marker (nfview.cc) keeps working on a
+            // firmware that renamed only the wider symbol. A false isFinished()
+            // cannot tell "not started" from "in progress", so it stays
+            // UNKNOWN -- guessing a bucket is what this whole file refuses to
+            // do.
+            if (Content__isFinished(v))
+                *outReadState = NF_READ_FINISHED;
+        }
 
-        // Cross-check, not the primary read: see Content__getReadStatus's
-        // own declaration comment, above, for why this is resolved and
-        // called even though isFinished() alone already answers
-        // *outFinished. Logged, not asserted -- a mismatch degrades to
-        // isFinished()'s own answer, never a crash.
+        // Cross-check, not the primary read -- the roles of these two swapped
+        // when the tri-state arrived (see Content__getReadStatus's own
+        // declaration comment). Logged, not asserted: a mismatch degrades to
+        // getReadStatus()'s own answer, never a crash.
         if (Content__getReadStatus && Content__isFinished) {
-            bool expectFinished = (Content__getReadStatus(v) == 2);
-            if (expectFinished != *outFinished)
+            bool expectFinished = Content__isFinished(v);
+            if (expectFinished != (*outReadState == NF_READ_FINISHED))
                 nh_log("progress: Content::getReadStatus()/isFinished() disagree for '%s' -- one of the two resolved to the wrong symbol", qPrintable(contentId));
         }
 

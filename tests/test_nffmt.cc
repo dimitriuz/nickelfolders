@@ -363,6 +363,139 @@ static void test_hidden_dirs(void) {
     CHECK(!nf_is_hidden_dir("Sandman Mystery Theatre"));
 }
 
+// --- read state, and the three read-state filters -----------------------
+
+// A row fixture. Every field nf_matches_read_filter can read is set here
+// explicitly rather than left to nf_row's own constructor, because what these
+// tests are ABOUT is which combination of them the predicate believes.
+static nf_row rw(char const *name, bool isDir, bool hasRow, nf_read_state st) {
+    nf_row r;
+    r.name      = QString::fromUtf8(name);
+    r.label     = r.name;
+    r.isDir     = isDir;
+    r.hasRow    = hasRow;
+    r.readState = st;
+    r.finished  = (st == NF_READ_FINISHED);
+    return r;
+}
+
+// Kobo's own ReadingStatus values, which this project's enum deliberately is
+// NOT numerically equal to -- nf_read_state_from_status is the one place
+// those three numbers appear (nffmt.h), so this test is the one place they
+// are pinned.
+static void test_read_state_from_status(void) {
+    CHECK(nf_read_state_from_status(0) == NF_READ_NOT_STARTED);
+    CHECK(nf_read_state_from_status(1) == NF_READ_IN_PROGRESS);
+    CHECK(nf_read_state_from_status(2) == NF_READ_FINISHED);
+}
+
+// THE GUARD, and the reason it is in the pure layer at all: an unexpected
+// value must degrade to UNKNOWN, never to 0. 0 is a REAL bucket ("not
+// started"), so a firmware that renumbered ReadingStatus, or an offset/symbol
+// that came back wrong, would otherwise file every book under "not started"
+// with nothing to tell it apart from a book that really is unread -- an
+// invisible wrong answer. Same reasoning as the percentRead offset guard
+// (nfnickel.cc), which treats an out-of-range percentage as unknown rather
+// than clamping it into range.
+static void test_read_state_out_of_range_degrades_to_unknown(void) {
+    CHECK(nf_read_state_from_status(3) == NF_READ_UNKNOWN);
+    CHECK(nf_read_state_from_status(-1) == NF_READ_UNKNOWN);
+    CHECK(nf_read_state_from_status(1919) == NF_READ_UNKNOWN);
+    // Negative control: a mapping that answered UNKNOWN for EVERY input would
+    // pass all three checks above and be worthless, so one real bucket has to
+    // be checked not to degrade.
+    CHECK(nf_read_state_from_status(0) != NF_READ_UNKNOWN);
+}
+
+static void test_read_filter_matches_only_its_own_bucket(void) {
+    nf_row fin  = rw("Done.epub", false, true, NF_READ_FINISHED);
+    nf_row prog = rw("Halfway.epub", false, true, NF_READ_IN_PROGRESS);
+    nf_row cold = rw("Untouched.epub", false, true, NF_READ_NOT_STARTED);
+
+    CHECK(nf_matches_read_filter(fin, NF_FILTER_FINISHED));
+    CHECK(!nf_matches_read_filter(fin, NF_FILTER_IN_PROGRESS));
+    CHECK(!nf_matches_read_filter(fin, NF_FILTER_NOT_STARTED));
+
+    CHECK(nf_matches_read_filter(prog, NF_FILTER_IN_PROGRESS));
+    CHECK(!nf_matches_read_filter(prog, NF_FILTER_FINISHED));
+    CHECK(!nf_matches_read_filter(prog, NF_FILTER_NOT_STARTED));
+
+    CHECK(nf_matches_read_filter(cold, NF_FILTER_NOT_STARTED));
+    CHECK(!nf_matches_read_filter(cold, NF_FILTER_FINISHED));
+    CHECK(!nf_matches_read_filter(cold, NF_FILTER_IN_PROGRESS));
+}
+
+// The owner's real v26 case: a file on disk Nickel never imported. It has no
+// MEASURABLE read state, which is not the same as being unread, so all three
+// read-state filters hide it -- and every other filter still shows it.
+static void test_read_filter_hides_unknown_state(void) {
+    nf_row noRow = rw("missing Volume 26.cbz", false, false, NF_READ_UNKNOWN);
+    CHECK(!nf_matches_read_filter(noRow, NF_FILTER_FINISHED));
+    CHECK(!nf_matches_read_filter(noRow, NF_FILTER_IN_PROGRESS));
+    CHECK(!nf_matches_read_filter(noRow, NF_FILTER_NOT_STARTED));
+    CHECK(nf_matches_read_filter(noRow, NF_FILTER_ALL));
+
+    // hasRow is checked as well as readState, not instead of it: a row with no
+    // Volume must never land in a bucket however some future `meta` leaves
+    // readState behind.
+    nf_row lying = rw("Contradictory.epub", false, false, NF_READ_FINISHED);
+    CHECK(!nf_matches_read_filter(lying, NF_FILTER_FINISHED));
+
+    // And the reverse: a row that HAS a Volume whose state came back
+    // unreadable is hidden too.
+    nf_row unreadable = rw("Odd.epub", false, true, NF_READ_UNKNOWN);
+    CHECK(!nf_matches_read_filter(unreadable, NF_FILTER_NOT_STARTED));
+}
+
+// Folders are never filtered out by anything -- nf_build_listing's type-filter
+// comment has the reason (hiding a folder makes the files inside it
+// unreachable, not merely invisible), and a folder has no Volume and so no
+// read state to match against in the first place.
+static void test_read_filter_never_hides_a_folder(void) {
+    nf_row dir = rw("Comics", true, false, NF_READ_UNKNOWN);
+    CHECK(nf_matches_read_filter(dir, NF_FILTER_FINISHED));
+    CHECK(nf_matches_read_filter(dir, NF_FILTER_IN_PROGRESS));
+    CHECK(nf_matches_read_filter(dir, NF_FILTER_NOT_STARTED));
+    CHECK(nf_matches_read_filter(dir, NF_FILTER_ALL));
+}
+
+// The two axes ignore each other, in both directions: a read-state filter has
+// no opinion about format and a type filter has none about read state. That is
+// what keeps ONE enum and ONE chrome row honest.
+static void test_the_two_filter_axes_ignore_each_other(void) {
+    nf_row fin = rw("Done.epub", false, true, NF_READ_FINISHED);
+    CHECK(nf_matches_read_filter(fin, NF_FILTER_PDF));
+    CHECK(nf_matches_read_filter(fin, NF_FILTER_EPUB));
+    CHECK(nf_matches_filter("Booklet.pdf", NF_FILTER_FINISHED));
+    CHECK(nf_matches_filter("Some Book.epub", NF_FILTER_NOT_STARTED));
+    // Negative control for the pair above: nf_matches_filter really does say
+    // no to something, so "it says yes to a read-state filter" is not just
+    // this function agreeing with everything.
+    CHECK(!nf_matches_filter("Booklet.pdf", NF_FILTER_EPUB));
+}
+
+// nf_sort_rows applies the SAME rules as nf_sort_entries over the row type the
+// pipeline actually holds by the time it orders (metadata now runs first --
+// nflist.cc). Pinned here rather than only through nf_build_listing so a
+// folders-before-files regression names the sort, not the pipeline.
+static void test_sort_rows_matches_entry_sort_rules(void) {
+    QVector<nf_row> r;
+    nf_row a = rw("Volume 10.cbz", false, true, NF_READ_NOT_STARTED); a.size = 10;
+    nf_row b = rw("Volume 2.cbz",  false, true, NF_READ_NOT_STARTED); b.size = 200;
+    nf_row d = rw("Extras", true, false, NF_READ_UNKNOWN);            d.size = 1;
+    r << a << b << d;
+
+    nf_sort_rows(&r, NF_SORT_NAME, false);
+    CHECK(r.at(0).isDir);                       // folders first, in either direction
+    CHECK_EQ_STR(r.at(1).name, "Volume 2.cbz"); // natural order, not lexicographic
+    CHECK_EQ_STR(r.at(2).name, "Volume 10.cbz");
+
+    nf_sort_rows(&r, NF_SORT_SIZE, true);
+    CHECK(r.at(0).isDir);                       // ... including descending
+    CHECK_EQ_STR(r.at(1).name, "Volume 2.cbz"); // 200 bytes, the larger
+    CHECK_EQ_STR(r.at(2).name, "Volume 10.cbz");
+}
+
 int main(void) {
     test_unpadded_volume_dirs();
     test_strip_fullmetal();
@@ -390,6 +523,13 @@ int main(void) {
     test_allowlist_excludes_txt_deliberately();
     test_filter_all_admits_everything();
     test_filter_by_extension();
+    test_read_state_from_status();
+    test_read_state_out_of_range_degrades_to_unknown();
+    test_read_filter_matches_only_its_own_bucket();
+    test_read_filter_hides_unknown_state();
+    test_read_filter_never_hides_a_folder();
+    test_the_two_filter_axes_ignore_each_other();
+    test_sort_rows_matches_entry_sort_rules();
     test_hidden_dirs();
     NF_TEST_MAIN_END
 }

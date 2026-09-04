@@ -27,6 +27,56 @@ struct nf_entry {
     nf_entry() : isDir(false), size(0), mtime(0) {}
 };
 
+// A file's reading state, as far as this mod can measure it. Read state is
+// metadata, not a filename property, so unlike the format filters it can only
+// be known once a library row has been looked up -- which is why the listing
+// pipeline fetches metadata BEFORE it filters or orders (nflist.cc).
+//
+// Deliberately NOT numerically equal to Kobo's own ReadingStatus (0 = not
+// started, 1 = in progress, 2 = finished, measured -- NOTES.md and
+// nfnickel.cc). nf_read_state_from_status, below, is the ONE place those three
+// numbers appear, so a firmware that renumbers them is a one-function change
+// and there is no second, implicit copy of the mapping hiding inside an int
+// cast somewhere. NF_READ_UNKNOWN is the zero value on purpose: a zeroed or
+// calloc()ed nf_read_state then reads as "we do not know", never as a real
+// bucket -- the same reasoning as nf_row::percentRead's -1.
+enum nf_read_state {
+    NF_READ_UNKNOWN,      // no library row, an unresolved symbol, or a value outside 0..2
+    NF_READ_NOT_STARTED,
+    NF_READ_IN_PROGRESS,
+    NF_READ_FINISHED,
+};
+
+// One row the panel will show: an nf_entry that has been through the listing
+// pipeline (nflist.h). Lives HERE, next to nf_entry, rather than in nflist.h
+// where it started -- nf_matches_read_filter and nf_sort_rows (both below)
+// have to see a whole row, and nflist.h includes THIS header, not the other
+// way round, so the struct has to be on this side of that edge. Same reason
+// nf_entry is here rather than in the browser.
+struct nf_row {
+    QString       name;         // the on-disk name, never modified
+    QString       label;        // what the panel shows
+    bool          isDir;
+    bool          hasRow;       // a Volume exists for it; always false for a directory
+    int           percentRead;  // -1 when unknown, not applicable, or no row
+    nf_read_state readState;    // NF_READ_UNKNOWN unless a library row said otherwise
+    // DERIVED from readState by nf_build_listing (nflist.cc), never filled in
+    // by an nf_meta_fn: two independently-written sources for the same fact
+    // are two things that can disagree, and the row renderer (nfview.cc) reads
+    // this one. Kept as a field rather than becoming an accessor only because
+    // every existing reader spells it `r.finished`.
+    bool          finished;
+    // Carried forward from the nf_entry this row came from, because ordering
+    // now happens AFTER metadata (nflist.cc) and therefore over rows -- an
+    // nf_row that lost these two would silently order by nothing at all under
+    // NF_SORT_SIZE/NF_SORT_DATE while every name-sorted test kept passing.
+    qint64        size;
+    qint64        mtime;
+
+    nf_row() : isDir(false), hasRow(false), percentRead(-1),
+               readState(NF_READ_UNKNOWN), finished(false), size(0), mtime(0) {}
+};
+
 // Orders two names the way a reader expects when they contain numbers.
 // Returns <0, 0 or >0. See nffmt.cc for why this is hand-written rather than
 // QCollator.
@@ -64,6 +114,17 @@ enum nf_sort_key {
 void nf_sort_entries(QVector<nf_entry> *entries,
                      nf_sort_key key = NF_SORT_NAME, bool descending = false);
 
+// The SAME grouping and ordering rules, over the nf_row the listing pipeline
+// is actually holding by the time it orders: metadata now runs first
+// (nflist.cc), so ordering can no longer be done on nf_entry. Shares the one
+// comparison function with nf_sort_entries rather than restating the rules --
+// see nffmt.cc, where the folders-before-files trap 6.2 names lives in exactly
+// one place. nf_sort_entries stays because it is the entry-level primitive
+// this one is defined in terms of, and because ten tests pin the ordering
+// rules through it; neither is dead code.
+void nf_sort_rows(QVector<nf_row> *rows,
+                  nf_sort_key key = NF_SORT_NAME, bool descending = false);
+
 // The type filter, section 6.3. NF_FILTER_ALL is the default everywhere, for
 // the same "old callers keep old behaviour" reason as nf_sort_entries' key
 // default above. NF_FILTER_EPUB matches BOTH .epub and .kepub.epub -- the
@@ -74,6 +135,19 @@ enum nf_filter_kind {
     NF_FILTER_CBR,
     NF_FILTER_PDF,
     NF_FILTER_EPUB,
+    // Read state, section 6.3's second axis, in ONE enum and ONE chrome row
+    // with the formats above rather than a second filter axis of their own:
+    // the panel's measured row budget is 17 rows total and every chrome row
+    // costs an item row, so "combine two axes" would buy a combination
+    // ("unread epubs") nobody asked for at the price of a row everybody pays
+    // for. Appended AFTER the formats so the cycle order a reader has already
+    // learned (all -> cbz -> cbr -> pdf -> epub) does not shift under them.
+    //
+    // These are answered by nf_matches_read_filter, NOT nf_matches_filter: a
+    // filename cannot tell you whether a book has been read.
+    NF_FILTER_FINISHED,
+    NF_FILTER_IN_PROGRESS,
+    NF_FILTER_NOT_STARTED,
 };
 
 // True if FILE `name` matches `filter` (always true for NF_FILTER_ALL).
@@ -85,6 +159,26 @@ enum nf_filter_kind {
 // see nf_build_listing's own comment for why a folder is never even passed
 // to this function, let alone filtered by its result.
 bool nf_matches_filter(QString const& name, nf_filter_kind filter);
+
+// Kobo's ReadingStatus (measured: 0 = not started, 1 = in progress, 2 =
+// finished) mapped onto this file's own enum, with anything else degrading to
+// NF_READ_UNKNOWN. Pure, and deliberately NOT inlined into nfnickel.cc next to
+// the Content::getReadStatus() call it decodes: every libnickel call site is
+// untestable off-device by construction, and this range check is exactly the
+// kind of guard that has to be tested -- see nffmt.cc for why an unexpected
+// value must not become 0.
+nf_read_state nf_read_state_from_status(int status);
+
+// True if `row` matches `filter`'s READ-STATE question (always true for
+// NF_FILTER_ALL and for every format filter, which have no opinion about read
+// state -- the mirror image of nf_matches_filter admitting every file under a
+// read-state filter). Takes the whole ROW, not a name, because none of the
+// three questions can be answered from a filename; that also lets this
+// function answer for a FOLDER itself instead of leaving that to its caller
+// the way the name-only nf_matches_filter has to. Spec section 6.3. See
+// nffmt.cc for the two rulings baked in here: a folder is never filtered out,
+// and an unknown read state is not "unread".
+bool nf_matches_read_filter(nf_row const& row, nf_filter_kind filter);
 
 // True for a name v1 will show as a book. Extension allowlist only -- see
 // NF_EXTS in nffmt.cc for why ".txt" is not on it.

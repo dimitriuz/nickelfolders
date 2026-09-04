@@ -42,7 +42,8 @@
 // Directory listing is QDir::entryInfoList against ONE directory, never
 // recursive, never held past the single Qt signal handler that runs it
 // (CLAUDE.md's /mnt/onboard file-handle constraint). Per-file metadata
-// (nf_row::hasRow, ::percentRead, ::finished) comes from VolumeManager::
+// (nf_row::hasRow, ::percentRead, ::readState -- with ::finished derived
+// from the last of those by nf_build_listing, nflist.cc) comes from VolumeManager::
 // getById + Volume::isValid + Content::getReadStatus()/isFinished() + a
 // guarded offset off Volume::d() (nf_volume_exists, nfnickel.h) -- NOT
 // Volume::getDbValues, whose calling convention IS now fully resolved

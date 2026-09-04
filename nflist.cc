@@ -20,11 +20,16 @@ void nf_build_listing(QVector<nf_entry> const& entries,
         }
     }
 
-    // 1.5. User filter. Spec section 6.1's own stage, right after hide-junk
-    //    and before everything else -- in particular before labelling
-    //    (section 4, below), which is what test_labels_are_derived_after_
-    //    filtering (test_nflist.cc) pins for the ORIGINAL junk-hiding stage
-    //    and now pins for this one too.
+    // 2. Type filter. Spec section 6.1's own stage, right after hide-junk and
+    //    before everything else -- in particular before labelling (stage 6,
+    //    below), which is what test_labels_are_derived_after_filtering
+    //    (test_nflist.cc) pins for the ORIGINAL junk-hiding stage and now
+    //    pins for this one too.
+    //
+    //    Deliberately still FIRST of the two filter stages, ahead of metadata,
+    //    even though its sibling (the read-state filter, stage 4) cannot be:
+    //    an extension is knowable from the name alone, and every file this
+    //    stage drops is a libnickel round trip stage 3 does not have to make.
     //
     //    A SEPARATE layer from the allowlist above (section 6.3): that
     //    answers "is this a book", this answers "which books do I want to
@@ -42,7 +47,7 @@ void nf_build_listing(QVector<nf_entry> const& entries,
     //    failure than showing a folder that turns out to hold none of the
     //    wanted type once entered.
     //
-    //    `hadAnythingBeforeFilter` is read BEFORE the filter runs, which is
+    //    `hadAnythingBeforeFilter` is read BEFORE either filter runs, which is
     //    what makes it able to tell "genuinely empty" apart from "everything
     //    here was filtered out" below -- see filteredToNothing's own
     //    derivation at the bottom of this function.
@@ -55,34 +60,74 @@ void nf_build_listing(QVector<nf_entry> const& entries,
     }
     kept = filteredKept;
 
-    // 2. Order: folders before files, then `key`/`descending` within each
-    //    kind -- see nf_sort_entries' own comment (nffmt.cc) for why
-    //    grouping and ordering stay two separate concerns inside it. This
-    //    runs BEFORE metadata (stage 3, below) rather than after it, which
-    //    is safe today ONLY because every current key (name, size, date)
-    //    reads a field nf_entry already carries off QFileInfo, never
-    //    anything `meta` fills in -- see stage 3's own comment for what
-    //    WOULD force these two stages to swap.
-    nf_sort_entries(&kept, key, descending);
-
     // 3. Metadata, for EVERY file row rather than the visible ones. Spec
-    //    section 6.2: a future sort by a metadata field needs it before the
-    //    sort runs, and building it lazily now would have to be undone then.
-    //    Directories are skipped -- there is no Volume for a folder.
+    //    section 6.2: a sort or a filter that reads a metadata field needs it
+    //    before either runs, and building it lazily would have to be undone
+    //    then. That "would" is now a "did": the read-state filters (stage 4)
+    //    are the metadata-derived stage the OLD stage-2 comment predicted
+    //    would force ordering and metadata to swap places, and this is that
+    //    swap. Directories are skipped -- there is no Volume for a folder.
+    //
+    //    hasRow/percentRead/readState are left at nf_row's own constructor
+    //    defaults (nffmt.h) rather than restated here: "nothing is known yet"
+    //    belongs in one place, and `meta` overwrites what it can establish.
     for (int i = 0; i < kept.size(); i++) {
         nf_row r;
-        r.name        = kept.at(i).name;
-        r.label       = kept.at(i).name;
-        r.isDir       = kept.at(i).isDir;
-        r.hasRow      = false;
-        r.percentRead = -1;
-        r.finished    = false;
+        r.name  = kept.at(i).name;
+        r.label = kept.at(i).name;
+        r.isDir = kept.at(i).isDir;
+        // Carried forward so stage 5 can still order by size/date now that it
+        // orders rows rather than entries -- nf_row's own comment (nffmt.h)
+        // has why losing these would be a silent regression.
+        r.size  = kept.at(i).size;
+        r.mtime = kept.at(i).mtime;
         if (!r.isDir && meta)
             meta(ctx, r.name, &r);
+        // DERIVED, never supplied by `meta` (nflist.h says so at nf_meta_fn):
+        // readState is the single source of truth for read state and this is a
+        // convenience the row renderer (nfview.cc) reads. A folder keeps
+        // NF_READ_UNKNOWN and so lands here as false, which is what it was
+        // before this field existed.
+        r.finished = (r.readState == NF_READ_FINISHED);
         *out << r;
     }
 
-    // 4. Labels, LAST and over the surviving rows only. Folders and files are
+    // 4. Read-state filter, section 6.3's second axis. It has to be HERE and
+    //    not up alongside the type filter: read state is metadata, so nothing
+    //    before stage 3 knows it. Everything the stage-2 comment says about
+    //    the type filter being a separate layer from the junk allowlist
+    //    applies to this one too.
+    //
+    //    A folder is never removed -- but unlike stage 2, this loop does not
+    //    have to say so, because nf_matches_read_filter takes the whole row
+    //    and owns that rule itself (nffmt.cc). One rule, one place; a
+    //    name-only predicate could not have done the same.
+    //
+    //    Runs unconditionally rather than behind an "is this a read-state
+    //    filter" test: nf_matches_read_filter already answers true for every
+    //    format filter and for NF_FILTER_ALL, so this stage is a no-op copy of
+    //    at most 27 rows (the largest listing measured on the reference card)
+    //    in those cases -- not worth a second classifier function in the
+    //    header, and one less place that has to be updated when a filter value
+    //    is added.
+    {
+        QVector<nf_row> surviving;
+        for (int i = 0; i < out->size(); i++) {
+            if (nf_matches_read_filter(out->at(i), filter))
+                surviving << out->at(i);
+        }
+        *out = surviving;
+    }
+
+    // 5. Order: folders before files, then `key`/`descending` within each
+    //    kind -- see nf_sort_entries' own comment (nffmt.cc) for why grouping
+    //    and ordering stay two separate concerns inside it. Over ROWS
+    //    (nf_sort_rows), because stages 3 and 4 have already turned the
+    //    entries into rows; the ordering rules themselves are the same single
+    //    function either way.
+    nf_sort_rows(out, key, descending);
+
+    // 6. Labels, LAST and over the surviving rows only. Folders and files are
     //    labelled as separate sets: a folder name and a book name share nothing
     //    useful, so pooling them finds a common run of "" and silently disables
     //    stripping in any folder holding both kinds -- which on this card is the
@@ -124,19 +169,27 @@ void nf_build_listing(QVector<nf_entry> const& entries,
     // Section 6.3/3.6's third empty state. `out` is empty here in exactly two
     // situations this function can tell apart: nothing survived hide-junk at
     // all (a genuinely empty, or all-junk, directory -- hadAnythingBeforeFilter
-    // is false), or something DID survive hide-junk and the user filter then
-    // removed every one of it (hadAnythingBeforeFilter is true). Only the
-    // second is "everything here was filtered out" -- a directory that was
-    // never going to show anything regardless of `filter` is just empty, full
-    // stop, and must not be blamed on a filter the user may not even have
-    // touched.
+    // is false), or something DID survive hide-junk and one of the two filter
+    // stages then removed every one of it (hadAnythingBeforeFilter is true).
+    // Only the second is "everything here was filtered out" -- a directory
+    // that was never going to show anything regardless of `filter` is just
+    // empty, full stop, and must not be blamed on a filter the user may not
+    // even have touched.
     //
-    // A folder-only directory can never trip this: folders always survive the
-    // filter stage above (nf_matches_filter is never even consulted for one),
-    // so `out` is non-empty whenever hide-junk left any folder behind, no
-    // matter what `filter` removed from alongside it. That is deliberate --
-    // there is still somewhere to navigate, which is a different situation
-    // from a folder of files that all got filtered out.
+    // Unchanged by the read-state filters, and deliberately not extended for
+    // them: this expression asks "did hide-junk leave anything, and is `out`
+    // empty now", which is true of whichever filter stage did the emptying.
+    // There is one filter row and one `filter` value, so a second flag saying
+    // WHICH stage emptied the listing would have nothing to tell the message
+    // that `filter` does not already say.
+    //
+    // A folder-only directory can never trip this: folders always survive both
+    // filter stages above (nf_matches_filter is never even consulted for one,
+    // and nf_matches_read_filter always answers true for one), so `out` is
+    // non-empty whenever hide-junk left any folder behind, no matter what
+    // `filter` removed from alongside it. That is deliberate -- there is still
+    // somewhere to navigate, which is a different situation from a folder of
+    // files that all got filtered out.
     if (filteredToNothing)
         *filteredToNothing = hadAnythingBeforeFilter && out->isEmpty();
 }
