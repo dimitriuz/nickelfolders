@@ -43,6 +43,7 @@
 #include "nfnickel.h"
 #include "nflist.h"
 
+#include <QDateTime>
 #include <QDir>
 #include <QFileInfo>
 #include <QFileInfoList>
@@ -97,27 +98,36 @@
 // image -- and this constant now has to answer for MORE fixed chrome per
 // page than that screenshot had (BACK, a position indicator, and now BOTH
 // PREV and NEXT, all four together on a middle page of a multi-page
-// listing, not just BACK and one notice). 14 keeps the same 17-row total
+// listing, not just BACK and one notice). 14 kept the same 17-row total
 // (BACK + PREV + NEXT + 14 items) that is the one number this project can
 // actually cite a screenshot for, rather than betting the extra chrome on
-// the estimated, unmeasured margin above it. The position indicator adds
-// one more row on top of that 17 whenever it is shown (more than one
-// page) -- smaller than a TouchLabel row, and not separately proven, but
-// the smallest addition available.
+// the estimated, unmeasured margin above it.
+//
+// LOWERED to 12, UNMEASURED, when the sort/filter chrome rows were added
+// below: those two rows are NOT conditional the way the position indicator/
+// PREV/NEXT are -- they show on every listing, multi-page or not -- so the
+// worst-case page's fixed-chrome count grew from 4 (BACK, indicator, PREV,
+// NEXT) to 6 (those four plus sort, filter). 12 keeps BACK + PREV + NEXT +
+// sort + filter + 12 items at 17, the same proven total the original 14 was
+// keyed to, treating the position indicator the same way the original
+// comment already did -- as an accepted, unproven 18th row, "the smallest
+// addition available" -- rather than compounding two unproven guesses (the
+// indicator AND the two new rows) on top of each other. This has NOT been
+// confirmed on hardware; see the task report's device checklist.
 //
 // 27 entries -- the largest listing measured on this card (Fullmetal
 // Alchemist, same screenshot) -- is comfortably ABOVE this page size, not
-// under it: it needs two pages at 14 per page (ceil(27/14) = 2), which is
+// under it: it needs three pages at 12 per page (ceil(27/12) = 3), which is
 // the multi-page case this whole feature exists to reach -- volume 26 is
-// on page 2, and page 2 is precisely what nothing before this change ever
-// rendered. A single-page listing (fewer than 14 entries) is still the
-// common case elsewhere on the card and drops the indicator/PREV/NEXT
-// rows entirely; 27 is not an example of that case.
+// on page 3, and multi-page is precisely what nothing before pagination
+// existed ever rendered. A single-page listing (fewer than 12 entries) is
+// still the common case elsewhere on the card and drops the indicator/
+// PREV/NEXT rows entirely; 27 is not an example of that case.
 //
-// Trivially raised once a fuller worst-case page -- indicator, PREV, 14
-// items, AND NEXT together -- has actually been seen on hardware; see the
-// task report's device checklist.
-#define NF_ITEMS_PER_PAGE 14
+// Trivially raised once a fuller worst-case page -- indicator, PREV, sort,
+// filter, 12 items, AND NEXT together -- has actually been seen on
+// hardware; see the task report's device checklist.
+#define NF_ITEMS_PER_PAGE 12
 
 // PAGINATION, not scrolling -- a deliberate choice, not a shortcut, and
 // the reasoning is load-bearing enough to spell out here so nobody
@@ -193,6 +203,30 @@ static char nf_browser_cwd[PATH_MAX];
 // NEXT PAGE always land back on page 0.
 static int nf_browser_page = 0;
 
+// Sort key/direction and type filter -- the state the two new chrome rows
+// below cycle through. Enum/bool file-scope statics, same POD discipline as
+// nf_browser_page above: `= NF_SORT_NAME`/`= false`/`= NF_FILTER_ALL` are
+// CONSTANT initialisers the compiler folds into .data at link time, not a
+// constructor call needing a runtime _GLOBAL__sub_I entry -- unlike a
+// QString/QByteArray at file scope, which is exactly the failure mode
+// nf_browser_active_dialog's own comment (above) documents. Confirmed empty
+// with the same `nm ... GLOBAL__sub_I` check the task report cites.
+//
+// PERSIST across navigation -- deliberately NOT reset by nf_browser_go the
+// way nf_browser_page is. A reader who just sorted a folder by date, or
+// filtered it to PDF, is almost always trying to do the same thing one
+// level up or down, not starting over in every new directory; resetting
+// these on every descend/ascend would undo the reader's own last tap on
+// every single navigation, which is more surprising than carrying it
+// forward. nf_browser_page still resets on every navigation (its own
+// comment, above) because a page NUMBER has no relationship to a different
+// directory's listing, whereas a sort key or a format filter is a
+// preference about how ANY listing is read, not a fact about one specific
+// directory's contents.
+static nf_sort_key    nf_browser_sort_key  = NF_SORT_NAME;
+static bool           nf_browser_sort_desc = false;
+static nf_filter_kind nf_browser_filter    = NF_FILTER_ALL;
+
 // --- construction ------------------------------------------------------
 
 // Pops this screen and logs why. Shared by both of the ROOT-level exit
@@ -266,9 +300,82 @@ static QVector<nf_entry> nf_browser_scan_dir(QString const &path) {
         nf_entry e;
         e.name  = infos.at(i).fileName();
         e.isDir = infos.at(i).isDir();
+        // size()/lastModified() are read off the SAME QFileInfo the loop
+        // already built for name()/isDir() -- no extra stat() call, and no
+        // new libnickel symbol: both are what nf_sort_entries' NF_SORT_SIZE/
+        // NF_SORT_DATE keys read (nffmt.h). toMSecsSinceEpoch() rather than
+        // the now-deprecated toTime_t(), and available since Qt 4.7 -- well
+        // inside both the host's 5.15 and the device's 5.2.1, the same
+        // cross-version floor every pure source in this project already
+        // holds itself to (Makefile's own comment).
+        e.size  = infos.at(i).size();
+        e.mtime = infos.at(i).lastModified().toMSecsSinceEpoch();
         entries << e;
     }
     return entries;
+}
+
+// Cycles nf_browser_sort_key/nf_browser_sort_desc as ONE combined six-state
+// sequence on a single tap -- name-ascending, name-descending, size-
+// ascending, size-descending, date-ascending, date-descending, back to
+// name-ascending -- rather than needing two separate rows for what the task
+// brief frames as two orthogonal choices (key, direction). Direction flips
+// first and key advances only every second tap, so a reader sees both
+// directions of whichever key they just picked before it moves on.
+static void nf_browser_cycle_sort(void) {
+    if (!nf_browser_sort_desc) {
+        nf_browser_sort_desc = true;
+        return;
+    }
+    nf_browser_sort_desc = false;
+    switch (nf_browser_sort_key) {
+        case NF_SORT_NAME: nf_browser_sort_key = NF_SORT_SIZE; break;
+        case NF_SORT_SIZE: nf_browser_sort_key = NF_SORT_DATE; break;
+        case NF_SORT_DATE:
+        default:            nf_browser_sort_key = NF_SORT_NAME; break;
+    }
+}
+
+// Cycles nf_browser_filter through all -> cbz -> cbr -> pdf -> epub -> all.
+static void nf_browser_cycle_filter(void) {
+    switch (nf_browser_filter) {
+        case NF_FILTER_ALL:  nf_browser_filter = NF_FILTER_CBZ;  break;
+        case NF_FILTER_CBZ:  nf_browser_filter = NF_FILTER_CBR;  break;
+        case NF_FILTER_CBR:  nf_browser_filter = NF_FILTER_PDF;  break;
+        case NF_FILTER_PDF:  nf_browser_filter = NF_FILTER_EPUB; break;
+        case NF_FILTER_EPUB:
+        default:              nf_browser_filter = NF_FILTER_ALL;  break;
+    }
+}
+
+// Plain ASCII, e-ink-safe, matching the "^"/"v"-style affordance the task
+// brief itself suggests ("sort: name ^") and the same convention as this
+// file's other ASCII chrome ("<< BACK", "< PREV PAGE"). "^" reads as
+// ascending (smallest/oldest/A first, pointing at the top of the list) and
+// "v" as descending, without needing a real glyph this panel may not have.
+static QString nf_sort_row_label(void) {
+    QString keyName;
+    switch (nf_browser_sort_key) {
+        case NF_SORT_SIZE: keyName = QStringLiteral("size"); break;
+        case NF_SORT_DATE: keyName = QStringLiteral("date"); break;
+        case NF_SORT_NAME:
+        default:            keyName = QStringLiteral("name"); break;
+    }
+    return QStringLiteral("sort: %1 %2").arg(keyName,
+        nf_browser_sort_desc ? QStringLiteral("v") : QStringLiteral("^"));
+}
+
+static QString nf_filter_row_label(void) {
+    QString filterName;
+    switch (nf_browser_filter) {
+        case NF_FILTER_CBZ:  filterName = QStringLiteral("cbz");  break;
+        case NF_FILTER_CBR:  filterName = QStringLiteral("cbr");  break;
+        case NF_FILTER_PDF:  filterName = QStringLiteral("pdf");  break;
+        case NF_FILTER_EPUB: filterName = QStringLiteral("epub"); break;
+        case NF_FILTER_ALL:
+        default:              filterName = QStringLiteral("all");  break;
+    }
+    return QStringLiteral("filter: %1").arg(filterName);
 }
 
 static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool resetPage);
@@ -337,7 +444,15 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
 
     QVector<nf_entry> raw = nf_browser_scan_dir(path);
     QVector<nf_row> rows;
-    nf_build_listing(raw, &nf_row_meta, &ctx, &rows);
+    // filteredToNothing distinguishes spec section 6.3/3.6's third empty
+    // state -- see nf_build_listing's own derivation (nflist.cc) and the
+    // message built below, right before the item-row loop, for how it is
+    // shown: a folder that HAD books before nf_browser_filter ran must not
+    // read the same as one that never had anything.
+    bool filteredToNothing = false;
+    nf_build_listing(raw, &nf_row_meta, &ctx, &rows,
+                     nf_browser_filter, nf_browser_sort_key, nf_browser_sort_desc,
+                     &filteredToNothing);
 
     // Pagination bounds. totalPages is at least 1 even for an empty listing,
     // so "page 1/1" (below) is always a sensible thing to compute, never a
@@ -512,6 +627,95 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
         } else {
             nh_log("browser: calloc(1,256) failed for the NEXT PAGE row, skipping it");
         }
+    }
+
+    // Sort and filter chrome -- ALWAYS shown (unlike the indicator/PREV/NEXT
+    // above, which are conditional on more than one page), same TouchLabel/
+    // shim construction as every other tappable row in this function.
+    // Deliberately placed BELOW PREV/NEXT rather than above them: PREV/NEXT
+    // are the ONLY route to a page past the first (this file's own NEXT
+    // PAGE placement comment, above, already established that principle for
+    // moving them ahead of the item rows), so if this panel's real capacity
+    // is ever tight enough that something here gets clipped, it must be
+    // these two rather than PREV/NEXT -- losing them costs a reader the
+    // CONVENIENCE of changing sort/filter in this one directory (the default
+    // state, or whatever was carried in from wherever they navigated from,
+    // still works), where losing NEXT PAGE would cost outright reachability
+    // of whatever is on page 2 and beyond. Still placed ABOVE every item
+    // row, per the task brief: these are chrome, not content.
+    //
+    // Tapping either one changes what THIS directory shows, which is a
+    // bigger change to the row set than a mere page turn -- unlike PREV/
+    // NEXT (resetPage=false, same directory, different slice), both of
+    // these pass resetPage=TRUE: the total row/page count can shrink or
+    // grow arbitrarily (a filter can turn a 3-page listing into a 1-page
+    // one), and landing on whatever page NUMBER happened to be current
+    // would be an arbitrary slice of a now-different listing, not a
+    // meaningful "same place" the way it is for BACK/descend's own
+    // resetPage=true callers.
+    {
+        void *row = calloc(1, 256); // 132 measured, 256 over-allocated -- see the BACK row's comment
+        if (row) {
+            TouchLabel__ctor(row, content, 0);
+            reinterpret_cast<QLabel*>(row)->setText(nf_sort_row_label());
+
+            QPushButton *shim = new QPushButton(content);
+            shim->setVisible(false);
+            if (!QObject::connect(reinterpret_cast<QObject*>(row), SIGNAL(tapped(bool)), shim, SLOT(click())))
+                nh_log("browser: connecting the sort row's tapped(bool) failed -- this row will silently do nothing");
+            QObject::connect(shim, &QPushButton::clicked, [mwc, dialog, path] {
+                nf_browser_cycle_sort();
+                nh_log("browser: sort -- now %s", qPrintable(nf_sort_row_label()));
+                nf_browser_go(mwc, dialog, path, true); // resetPage -- see this block's own comment
+            });
+
+            layout->addWidget(reinterpret_cast<QWidget*>(row));
+        } else {
+            nh_log("browser: calloc(1,256) failed for the sort row, skipping it");
+        }
+    }
+    {
+        void *row = calloc(1, 256); // 132 measured, 256 over-allocated -- see the BACK row's comment
+        if (row) {
+            TouchLabel__ctor(row, content, 0);
+            reinterpret_cast<QLabel*>(row)->setText(nf_filter_row_label());
+
+            QPushButton *shim = new QPushButton(content);
+            shim->setVisible(false);
+            if (!QObject::connect(reinterpret_cast<QObject*>(row), SIGNAL(tapped(bool)), shim, SLOT(click())))
+                nh_log("browser: connecting the filter row's tapped(bool) failed -- this row will silently do nothing");
+            QObject::connect(shim, &QPushButton::clicked, [mwc, dialog, path] {
+                nf_browser_cycle_filter();
+                nh_log("browser: filter -- now %s", qPrintable(nf_filter_row_label()));
+                nf_browser_go(mwc, dialog, path, true); // resetPage -- see this block's own comment
+            });
+
+            layout->addWidget(reinterpret_cast<QWidget*>(row));
+        } else {
+            nh_log("browser: calloc(1,256) failed for the filter row, skipping it");
+        }
+    }
+
+    // Spec sections 3.6/6.3: an empty ROW SET reads one of two ways, and
+    // conflating them tells a reader who filtered to PDF and got nothing
+    // that their books are gone rather than that their filter matched
+    // nothing. A plain QLabel, like the page indicator above -- informational
+    // only, not a tap target. Says WHICH filter is active so the fix (tap
+    // "filter: ..." until it reads "all") is discoverable from this message
+    // alone, without hunting for the filter row above it.
+    //
+    // Spec section 3.6's OTHER distinction -- "empty" versus "cannot be listed at all"
+    // (a read failure) -- is NOT built here: nf_browser_scan_dir (above)
+    // has no readability check of its own, so a genuinely unreadable
+    // directory today looks identical to an empty one, same as before this
+    // task. Not addressed here because it is a pre-existing gap this task
+    // was not asked to close, not a regression this task introduced.
+    if (rows.isEmpty()) {
+        QLabel *emptyMsg = new QLabel(content);
+        emptyMsg->setText(filteredToNothing
+            ? QStringLiteral("Everything here was filtered out (%1).").arg(nf_filter_row_label())
+            : QStringLiteral("This folder is empty."));
+        layout->addWidget(emptyMsg);
     }
 
     for (int i = startIdx; i < endIdx; i++) {
