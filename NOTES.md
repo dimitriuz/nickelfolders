@@ -1669,3 +1669,36 @@ function walks the CONTROLLER stack, which `pushView` never populates.
 not full-view mode, and `true` is confirmed harmless here. None of this is
 device-tested yet — `./nickeltc make` is clean, but every claim above this
 paragraph about what the code does at runtime is still owed a reboot.
+
+## Task 9: the real folder listing, and a Qt version-skew finding worth recording
+
+`nfview.cc` was wired to `nflist.h`/`nffmt.h`'s pure listing pipeline
+(`nf_build_listing`), which meant `nflist.cc`/`nffmt.cc` moved from
+host-test-only into the actual cross build (`Makefile`'s `SOURCES`) for the
+first time — previously they only ever compiled against the HOST's Qt
+(5.15), never against the device's own Qt (5.2.1), via `./nickeltc make`.
+
+Code review of that first real cross-compile caught a genuine divergence
+between the two: `nf_natural_compare`'s (`nffmt.cc`) `QChar::isDigit()` and
+`QChar::toCaseFolded()` both read Qt's own bundled Unicode character-property
+tables, and Qt 5.15 ships a materially newer Unicode revision (~13.0) than
+Qt 5.2.1 (~6.2, contemporary with Unicode 6.x). A character whose digit-ness
+or case-folding was added or changed between those two Unicode revisions
+would sort differently on the device than the identical input sorts under
+`make test` on the host — **ordering only, never a crash or a wrong
+answer about which characters exist at all**, and specifically NOT the kind
+of divergence the "every API exists in both" reasoning in `Makefile`'s own
+comment on this skew was written to cover (that comment is about which
+*functions* are callable on both Qt versions, not about a function that
+exists identically on both but consults a table that does not).
+
+**This is a real gap in `make test`'s own guarantee**, stated plainly: the
+host test suite runs against host Qt's tables, so it structurally cannot
+catch a device-only sorting difference that both Qt versions agree is a
+row of `nffmt.h`'s public API, just disagree about the data one function
+reads. No fix is proposed here — the reference card's own book/folder names
+are overwhelmingly ASCII digits and Latin letters, where every Unicode
+revision this project could plausibly meet agrees, so this is recorded as a
+known, low-probability, ordering-only edge rather than chased further.
+Worth re-checking if a future card's real folder names turn up sorting
+oddly in a way `nf_natural_compare`'s own logic does not explain.

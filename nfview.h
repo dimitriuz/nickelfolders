@@ -51,19 +51,28 @@
 // this panel gives four grey levels, and "slightly lighter" does not read
 // as "different"), and a tap on it logs why and does nothing.
 //
-// Guarded against a second concurrent call by nf_browser_active_dialog
-// (nfview.cc, file-scope POD `void*` -- a second trigger while a screen is
-// already up used to leak a dialog and leave BACK landing on a stale
-// duplicate; this refuses instead, and the guard clears itself off
-// N3Dialog's own destroyed() signal, so it self-heals however the dialog
-// eventually goes away).
+// Tracks its one live dialog in nf_browser_active_dialog (nfview.cc,
+// file-scope POD `void*` -- a second trigger while a screen was already up
+// used to leak a dialog and leave BACK landing on a stale duplicate). If a
+// dialog already exists, this RE-PUSHES that same dialog rather than
+// building a second one or refusing outright -- refusing was the original
+// fix, but the guard clearing only on the dialog's own destroyed() signal
+// left a dead end if Nickel's own navigation ever left the dialog alive
+// but off-screen (tapping Home while browsing, e.g.) without destroying
+// it: every later trigger would have done nothing until a reboot. Re-
+// pushing recovers instead, and costs nothing extra if the dialog is
+// already the current view (MainWindowController::pushView's own
+// early-return, nfnickel.h). The guard itself still clears off the
+// dialog's own destroyed() signal for the case that IS destruction (BACK
+// at the root, e.g.), so a later call builds a fresh dialog rather than
+// re-pushing a dead pointer.
 //
-// Returns false, without pushing anything, if a screen is already up, if a
-// required symbol never resolved (every symbol this needs is looked up
-// through the usual nh_dlsym table, nfnickel.cc, and is .optional -- see
+// Returns false, without pushing anything, if a required symbol never
+// resolved (every symbol this needs is looked up through the usual
+// nh_dlsym table, nfnickel.cc, and is .optional -- see
 // nf_native_view_resolve in nfnickel.h), or if MainWindowController::
 // sharedInstance() or N3DialogFactory::getDialog() themselves returned
-// null.
+// null. Returns true on either a fresh push or a re-push.
 bool nf_browser_show(void);
 
 #endif

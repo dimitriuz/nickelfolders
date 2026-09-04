@@ -9,11 +9,12 @@
 # check the first time it is used.
 #
 # Everything hard about this script -- the environment gate below, the wifi
-# teardown, the FIFO -- is copied from ../../koboy/scripts/koboy.sh, which
-# already solved "how do you safely hand Nickel back its own process slot"
-# for the same device. Copied, not reinvented: koboy.sh's own header says
-# "Everything hard about this script is the way back," and that is equally
-# true here. Read that file before changing this one.
+# teardown, the FIFO, the restore-on-any-exit net -- is copied from
+# ../../koboy/scripts/koboy.sh, which already solved "how do you safely hand
+# Nickel back its own process slot" for the same device. Copied, not
+# reinvented: koboy.sh's own header says "Everything hard about this script
+# is the way back," and that is equally true here. Read that file before
+# changing this one.
 
 # Kobo's own rcS writes PATH with a trailing colon, which makes the empty
 # last element mean "the current directory" -- not copied here, since this
@@ -29,6 +30,14 @@ LOG="$DIR/restart-nickel.log"
 # does not fill the user partition with a log nobody is reading. Same
 # threshold as koboy.sh, for no reason beyond "it already picked a
 # reasonable number."
+#
+# $LOG deliberately lives NEXT TO THIS SCRIPT, under /mnt/onboard, so it is
+# readable over ssh after the fact -- but that is safe only because every
+# write to it (via log(), below) opens, appends and closes within a single
+# shell builtin, never held open. The two backgrounded processes THIS
+# script launches (hindenburg/nickel, near the bottom) must NOT inherit an
+# fd on this file for exactly that reason -- see the comment at the
+# relaunch itself.
 if [ -f "$LOG" ] && [ "$(wc -c <"$LOG" 2>/dev/null || echo 0)" -gt 262144 ]; then
     mv -f "$LOG" "$LOG.1"
 fi
@@ -122,29 +131,6 @@ if ! mkdir "$LOCK" 2>/dev/null; then
     mkdir "$LOCK" 2>/dev/null || { log "REFUSED: cannot take $LOCK"; exit 1; }
 fi
 echo $$ >"$LOCK/pid"
-trap 'rm -rf "$LOCK"' EXIT INT TERM
-
-# --------------------------------------------------------------- stop Nickel
-#
-# By name, via killall, and deliberately not `pkill -f /usr/local/Kobo/
-# nickel`: a pattern passed to pkill -f matches the command line of the
-# shell running IT too, so that form would kill this script's own launcher
-# before it kills Nickel. Same name list as koboy.sh's own "stopping
-# Nickel" step -- copied rather than trimmed to just "nickel", because
-# koboy.sh already worked out which of Kobo's own alternate reader/DRM
-# helper binaries can be running alongside it on some firmware/device
-# combinations, and a stale one of those left running is exactly the kind
-# of thing that makes a "restart" not actually be one.
-log "stopping Nickel"
-killall -q -TERM nickel hindenburg sickel fickel strickel fontickel \
-                 adobehost foxitpdf iink
-i=0
-while pkill -0 nickel 2>/dev/null; do
-    [ "$i" -ge 40 ] && { log "WARNING nickel still alive after 10s, continuing anyway"; break; }
-    usleep 250000 2>/dev/null || sleep 1
-    i=$((i + 1))
-done
-log "Nickel stopped after $((i * 250))ms"
 
 # --------------------------------------------------------------------- wifi
 #
@@ -158,6 +144,17 @@ log "Nickel stopped after $((i * 250))ms"
 # running over the radio this would otherwise take down -- and is
 # deliberately a DIFFERENT variable name: it has nothing to do with koboy's
 # own runs and must not be confused for a setting that affects them.
+#
+# The `env -u LD_LIBRARY_PATH dhcpcd` below only makes sense if
+# LD_LIBRARY_PATH IS already present in this script's own environment by
+# the time wifi_down runs -- unsetting a variable that was never set is a
+# no-op, so this line is itself evidence for the reconciliation in the
+# relaunch section's own comment, below: NickelMenu's `cmd_spawn` does not
+# sanitise the environment it hands to a spawned command, so Nickel's own
+# rcS-exported LD_LIBRARY_PATH=/usr/local/Kobo most likely IS already
+# inherited this far, and this line strips it back off before running
+# dhcpcd specifically (not independently confirmed here why dhcpcd would
+# mind it, but koboy.sh's own copy does the same thing).
 wifi_down() {
     if [ -z "$WIFI_MODULE" ]; then
         log "restart: WARNING WIFI_MODULE is not set, so the WiFi teardown was"
@@ -190,39 +187,132 @@ wifi_down() {
         rmmod sdio_wifi_pwr 2>/dev/null
     fi
 }
-wifi_down
 
-# ------------------------------------------------------- the hardware-status FIFO
+# ------------------------------------------------------------------- restore
 #
-# rcS creates this before Nickel starts and udev writes device events into
-# it; Nickel is the reader. It must exist again before Nickel starts
-# looking for it, and it is recreated fresh (not just left alone) because a
-# FIFO with a reader that went away can be left in a state a new reader does
-# not expect -- same reasoning, same recreation, as koboy.sh's own restore()
-# step 5.
-rm -f /tmp/nickel-hardware-status
-mkfifo /tmp/nickel-hardware-status 2>>"$LOG" || log "restart: WARNING mkfifo failed"
+# Idempotent (the `restored` guard), because it is invoked from the EXIT
+# trap below NO MATTER HOW this script's own body ends -- normal
+# completion, an early `exit`, or a signal -- and koboy.sh's own comment on
+# why is copied verbatim because the reasoning is unchanged here: "the
+# alternative is a user staring at a dead panel," and this script's own
+# risk window is worse than a quiet script that merely forgot to relaunch
+# something -- between "stop Nickel" (below) and this function running,
+# BOTH nickel and hindenburg are dead, and koboy.sh's own measurement for
+# that state left too long is a watchdog reboot ("PMU2: Watchdog timeout
+# triggered"). So restore() is the ONLY place Nickel comes back, and it
+# runs unconditionally on exit rather than being called once, hopefully,
+# at the end of a script that might not reach its end.
+restored=""
+restore() {
+    [ -n "$restored" ] && return 0
+    restored=1
 
-sync
+    # LD_LIBRARY_PATH is exported here as DEFENSE IN DEPTH, not because it
+    # is surely absent: see wifi_down's own comment, above, for why this
+    # script's environment most likely already carries it down from
+    # Nickel's own rcS export. Exporting it again removes any doubt for
+    # the one call that actually matters -- Nickel itself will not start
+    # without it (rcS:325, libQtSolutions_IOCompressor-2.3.so.1). The two
+    # GStreamer variables are koboy.sh's own audio-path exports, copied so
+    # a Nickel restarted this way matches a freshly booted one for TTS and
+    # Bluetooth output, not just for shared-library resolution.
+    export LD_LIBRARY_PATH=/usr/local/Kobo
+    export QT_GSTREAMER_PLAYBIN_AUDIOSINK="alsasink"
+    export QT_GSTREAMER_PLAYBIN_AUDIOSINK_DEVICE_PARAMETER="bluealsa:DEV=00:00:00:00:00:00"
 
-# ------------------------------------------------------------------- relaunch
+    # Back to / before Nickel is started -- copied from koboy.sh's own
+    # restore(), same measured reason: a stale working directory (or
+    # OLDPWD) left on the user partition is what makes USB mass storage
+    # misbehave later, because the partition cannot be unmounted while a
+    # process holds a directory on it open. Do not rely on NickelMenu
+    # happening to hand this script a safe cwd.
+    cd / 2>/dev/null || true
+    unset OLDPWD
+
+    wifi_down
+
+    # rcS creates this before Nickel starts and udev writes device events
+    # into it; Nickel is the reader. It must exist again before Nickel
+    # starts looking for it, and it is recreated fresh (not just left
+    # alone) because a FIFO with a reader that went away can be left in a
+    # state a new reader does not expect -- same reasoning, same
+    # recreation, as koboy.sh's own restore() step 5.
+    rm -f /tmp/nickel-hardware-status
+    mkfifo /tmp/nickel-hardware-status 2>>"$LOG" || log "restore: WARNING mkfifo failed"
+
+    sync
+
+    # hindenburg first: koboy.sh's own comment records that leaving it dead
+    # while Nickel is missing gets the device rebooted out from under you
+    # by the watchdog. Then Nickel itself, with the exact flags rcS starts
+    # it with. Then udevadm trigger, to replay the device events Nickel
+    # missed while it was down (radio-down included).
+    #
+    # Both backgrounded processes redirect to /dev/null, NOT $LOG, and this
+    # is load-bearing, not a style choice: $LOG lives under
+    # /mnt/onboard/.adds/nfolders, and a background process holding a
+    # write fd open on it for its ENTIRE LIFETIME -- these two run until
+    # the next reboot -- is exactly the corruption risk CLAUDE.md names
+    # ("never hold a file handle on /mnt/onboard for more than a few
+    # hundred milliseconds -- a USB session while one is open risks
+    # corruption"). Nickel is also the process that has to cleanly unmount
+    # that partition to export it over USB, and it cannot do that with its
+    # own stdout/stderr fd still pinned open on a file living on it. This
+    # script's OWN log() calls are safe (open/append/close per line,
+    # nothing held), which is why $LOG can live here at all and still be
+    # readable over ssh afterward -- only these two long-lived children may
+    # not inherit an fd on it. `udevadm trigger` is a one-shot command that
+    # exits immediately, so a $LOG redirect for it does not hold anything
+    # open past this function returning.
+    log "restore: starting hindenburg and nickel"
+    /usr/local/Kobo/hindenburg >/dev/null 2>&1 &
+    LIBC_FATAL_STDERR_=1 /usr/local/Kobo/nickel -platform kobo -skipFontLoad >/dev/null 2>&1 &
+    udevadm trigger >>"$LOG" 2>&1 &
+
+    log "restore: done"
+}
+
+finish() {
+    restore
+    rm -rf "$LOCK"
+}
+
+# Unconditional, same as koboy.sh's own `trap 'finish' EXIT`: a normal
+# finish, a crash, a kill -TERM -- Nickel comes back either way. INT/TERM
+# get their OWN traps, each ending in an explicit `exit`, because a POSIX
+# signal handler that does not exit returns control to whatever the script
+# was doing and CONTINUES running -- with the lock already removed by
+# `finish` above, which is precisely the double-start the lock exists to
+# prevent (a second NickelMenu tap could then take the now-free lock while
+# this instance is still limping toward its own relaunch). The exit codes
+# (130 = 128+SIGINT, 143 = 128+SIGTERM) match koboy.sh's own convention.
+trap 'finish' EXIT
+trap 'log "signal INT";  finish; exit 130' INT
+trap 'log "signal TERM"; finish; exit 143' TERM
+
+# --------------------------------------------------------------- stop Nickel
 #
-# LD_LIBRARY_PATH is the one late rcS export (rcS:325) a launch from inside
-# Nickel does not already carry down to a spawned child the way PLATFORM/
-# PRODUCT/NICKEL_HOME do: Nickel's own Qt libraries (including
-# libQtSolutions_IOCompressor-2.3.so.1) live in /usr/local/Kobo, and without
-# this Nickel dies immediately on that missing library.
-#
-# hindenburg first: koboy.sh's own comment records that leaving it dead
-# while Nickel is missing gets the device rebooted out from under you by
-# the watchdog ("PMU2: Watchdog timeout triggered"). Then Nickel itself,
-# with the exact flags rcS starts it with. Then udevadm trigger, to replay
-# the device events Nickel missed while it was down (radio-down included).
-export LD_LIBRARY_PATH=/usr/local/Kobo
+# By name, via killall, and deliberately not `pkill -f /usr/local/Kobo/
+# nickel`: a pattern passed to pkill -f matches the command line of the
+# shell running IT too, so that form would kill this script's own launcher
+# before it kills Nickel. Same name list as koboy.sh's own "stopping
+# Nickel" step -- copied rather than trimmed to just "nickel", because
+# koboy.sh already worked out which of Kobo's own alternate reader/DRM
+# helper binaries can be running alongside it on some firmware/device
+# combinations, and a stale one of those left running is exactly the kind
+# of thing that makes a "restart" not actually be one.
+log "stopping Nickel"
+killall -q -TERM nickel hindenburg sickel fickel strickel fontickel \
+                 adobehost foxitpdf iink
+i=0
+while pkill -0 nickel 2>/dev/null; do
+    [ "$i" -ge 40 ] && { log "WARNING nickel still alive after 10s, continuing anyway"; break; }
+    usleep 250000 2>/dev/null || sleep 1
+    i=$((i + 1))
+done
+log "Nickel stopped after $((i * 250))ms"
 
-log "restart: starting hindenburg and nickel"
-/usr/local/Kobo/hindenburg >>"$LOG" 2>&1 &
-LIBC_FATAL_STDERR_=1 /usr/local/Kobo/nickel -platform kobo -skipFontLoad >>"$LOG" 2>&1 &
-udevadm trigger >>"$LOG" 2>&1 &
-
-log "=== restart-nickel.sh done, rc=0"
+# Nothing else to do in the main body: restore() (above) is what brings
+# Nickel back, and it runs from the EXIT trap when this script reaches its
+# own end, exactly like koboy.sh's own `exit "$rc"` fires its `finish` trap.
+log "=== restart-nickel.sh reaching its own end, handing off to the EXIT trap"

@@ -57,7 +57,6 @@
 #include <linux/limits.h> // PATH_MAX -- same header nfnickel.cc's own nf_watch_dir uses
 #include <stdio.h>         // snprintf
 #include <stdlib.h>        // calloc -- see the row-allocation comment below for why not ::operator new
-#include <string.h>        // strlen
 
 #include <NickelHook.h>
 
@@ -113,13 +112,19 @@
 // failure mode. `nm libnfolders.so | grep GLOBAL__sub_I` must stay empty --
 // see the task report for the check.
 //
-// nf_browser_active_dialog: the re-trigger guard (CLAUDE.md's task brief,
-// Part 2). A second `touch /tmp/nfolders-native` while a screen is already
-// up used to leak a dialog and leave BACK landing on a stale duplicate --
-// this refuses instead (nf_browser_show, below) and the guard is cleared by
-// the dialog's own destroyed() signal, so it self-heals no matter which of
-// this file's several pop paths (or, in principle, some path outside this
-// file's control) is what actually tears the dialog down.
+// nf_browser_active_dialog: tracks the one live dialog (CLAUDE.md's task
+// brief, Part 2). A second `touch /tmp/nfolders-native` while a screen was
+// already up used to leak a dialog and leave BACK landing on a stale
+// duplicate -- nf_browser_show, below, now RE-PUSHES this same dialog
+// instead of building a second one when it is non-NULL (review finding
+// L5: refusing outright left a dead end if Nickel's own navigation ever
+// left the dialog alive but off-screen, e.g. tapping Home while browsing,
+// since destroyed() -- the only thing that clears this -- does not fire
+// for mere abandonment). Cleared by the dialog's own destroyed() signal,
+// so it self-heals no matter which of this file's several pop paths (or,
+// in principle, some path outside this file's control) is what actually
+// tears the dialog down -- a later nf_browser_show then builds a fresh
+// one rather than re-pushing a dead pointer.
 static void *nf_browser_active_dialog = NULL;
 
 // The one directory nf_browser_go (below) most recently rebuilt content
@@ -228,11 +233,19 @@ static void nf_browser_back(void *mwc, N3Dialog *dialog) {
 
     int slash = cwd.lastIndexOf(QLatin1Char('/'));
     QString parent = (slash > 0) ? cwd.left(slash) : QStringLiteral(NF_ROOT);
-    // Never walk above the root, however `cwd` got constructed -- a pure
-    // defensive floor, not something this file's own navigation should ever
-    // be able to reach on its own (every path nf_browser_go is called with
-    // is either NF_ROOT or NF_ROOT + a real child name it read off disk).
-    if (parent.length() < static_cast<int>(strlen(NF_ROOT)))
+    // A genuine path-boundary check, not a length check -- review finding
+    // L2: a length-only floor (`parent.length() < strlen(NF_ROOT)`) passes
+    // "/mnt/onboardX/a" straight through, since that string is LONGER than
+    // NF_ROOT despite not being under it at all. `parent` must be NF_ROOT
+    // itself, or begin with NF_ROOT followed by a real "/" (not just share
+    // its characters), to count as still being inside the tree. Not
+    // reachable from this file's own navigation today (every path
+    // nf_browser_go is called with is either NF_ROOT or NF_ROOT + a real
+    // child name it read off disk) -- this is a defensive floor for a
+    // caller that changes later, and now the comment matches what the code
+    // actually enforces.
+    QString const rootPrefix = QStringLiteral(NF_ROOT) + QLatin1Char('/');
+    if (parent != QStringLiteral(NF_ROOT) && !parent.startsWith(rootPrefix))
         parent = QStringLiteral(NF_ROOT);
 
     nh_log("browser: BACK -- up from '%s' to '%s'", qPrintable(cwd), qPrintable(parent));
@@ -261,6 +274,7 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path) {
     QVector<nf_entry> raw = nf_browser_scan_dir(path);
     QVector<nf_row> rows;
     nf_build_listing(raw, &nf_row_meta, &ctx, &rows);
+    int shown = qMin(rows.size(), static_cast<int>(NF_MAX_VISIBLE_ROWS));
 
     QWidget *content = new QWidget();
     QVBoxLayout *layout = new QVBoxLayout(content);
@@ -318,7 +332,24 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path) {
         }
     }
 
-    int shown = qMin(rows.size(), static_cast<int>(NF_MAX_VISIBLE_ROWS));
+    // Do NOT silently truncate (CLAUDE.md's task brief) -- a plain QLabel,
+    // not a TouchLabel: this line is informational only, not a tap target,
+    // so it needs none of TouchLabel's gesture machinery.
+    //
+    // Placed HERE -- immediately after the BACK row, ABOVE the listing rows
+    // it is warning about -- not after them. Review finding L1:
+    // NF_MAX_VISIBLE_ROWS exists because whether that many TouchLabel rows
+    // actually fit this panel's real height is untested, and a notice
+    // placed after the rows is exactly what a layout that overflows the
+    // screen would clip first -- degrading exactly as silently as having
+    // no cap at all. Placed first, it is pushed off screen last, if
+    // anything is.
+    if (rows.size() > shown) {
+        QLabel *more = new QLabel(content);
+        more->setText(QStringLiteral("...and %1 more (scrolling not implemented yet)").arg(rows.size() - shown));
+        layout->addWidget(more);
+    }
+
     for (int i = 0; i < shown; i++) {
         nf_row const &r = rows.at(i);
 
@@ -355,9 +386,17 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path) {
             // panel's own Qt/QStyle (Nickel's custom style may or may not
             // honour a plain stylesheet the way desktop Qt does) -- the
             // bracketed text above is what actually carries the meaning,
-            // this is not load-bearing on its own. Left in because it
-            // costs nothing if it is a no-op, and confirming or dropping
-            // it is one of the report's own device-checklist items.
+            // and is applied UNCONDITIONALLY (it is plain QLabel::setText,
+            // above, not gated on this call succeeding), which is what
+            // makes the signal survive regardless of what this line does.
+            // Review finding L4: "costs nothing if it is a no-op" was not
+            // established and has been removed -- setStyleSheet installs a
+            // QStyleSheetStyle for this widget, which can change its
+            // layout metrics relative to its neighbours, so it is not
+            // necessarily inert even when its own visual effect does
+            // nothing. Left in anyway because the label text does not
+            // depend on it; confirming or dropping it is one of the
+            // report's own device-checklist items.
             reinterpret_cast<QWidget*>(row)->setStyleSheet(QStringLiteral("font-style: italic; color: gray;"));
         }
 
@@ -399,15 +438,6 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path) {
         layout->addWidget(reinterpret_cast<QWidget*>(row));
     }
 
-    // Do NOT silently truncate (CLAUDE.md's task brief) -- a plain QLabel,
-    // not a TouchLabel: this line is informational only, not a tap target,
-    // so it needs none of TouchLabel's gesture machinery.
-    if (rows.size() > shown) {
-        QLabel *more = new QLabel(content);
-        more->setText(QStringLiteral("...and %1 more (scrolling not implemented yet)").arg(rows.size() - shown));
-        layout->addWidget(more);
-    }
-
     QString title = (path == QStringLiteral(NF_ROOT))
         ? QStringLiteral("NickelFolders")
         : QFileInfo(path).fileName();
@@ -425,11 +455,6 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path) {
 }
 
 bool nf_browser_show(void) {
-    if (nf_browser_active_dialog) {
-        nh_log("browser: a screen is already up, ignoring this trigger (CLAUDE.md's re-trigger guard)");
-        return false;
-    }
-
     if (!nf_native_view_resolve()) {
         nh_log("browser: a required libnickel symbol did not resolve, refusing");
         return false;
@@ -439,6 +464,25 @@ bool nf_browser_show(void) {
     if (!mwc) {
         nh_log("browser: MainWindowController::sharedInstance() returned null, refusing");
         return false;
+    }
+
+    if (nf_browser_active_dialog) {
+        // Review finding L5: the guard used to refuse outright here, and
+        // its own destroyed() clear (below) covers outright destruction
+        // but NOT abandonment -- Nickel's own navigation (tapping Home
+        // while browsing is the obvious way) can leave our dialog alive
+        // but off the window stack, with nothing in this file positioned
+        // to notice. Refusing in that state would be a dead end: every
+        // later trigger would do nothing at all until a reboot, with no
+        // way back to the browser. Re-pushing the SAME dialog instead
+        // turns that into a recovery -- nothing tore its content down, so
+        // whatever directory it was last showing is still there. If the
+        // dialog is genuinely still the current view, pushView's own
+        // early-return-on-already-current-widget check (nfnickel.h) makes
+        // this a harmless no-op rather than a double push.
+        nh_log("browser: a screen already exists -- re-pushing it rather than building a new one");
+        MainWindowController__pushView(mwc, reinterpret_cast<QWidget*>(nf_browser_active_dialog));
+        return true;
     }
 
     // A placeholder, ONLY to satisfy getDialog's signature -- nf_browser_go

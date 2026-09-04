@@ -470,9 +470,12 @@ nfview.h/.cc          THE FOLDER BROWSER: one N3Dialog, built out of
                      Volume::isValid supplies nf_row::hasRow (NOT
                      Volume::getDbValues -- unestablished ABI, out of
                      scope), BACK steps up one level and pops the dialog
-                     only at the root. Guarded against a re-trigger by a
-                     file-scope POD `void*` cleared off the dialog's own
-                     destroyed() signal.
+                     only at the root. A re-trigger while a dialog already
+                     exists RE-PUSHES that same dialog (a file-scope POD
+                     `void*` tracks it, cleared off the dialog's own
+                     destroyed() signal) rather than building a second one
+                     -- recovers if Nickel's own navigation ever leaves it
+                     alive but off-screen, instead of refusing forever.
 nffmt.h/.cc           PURE display/ordering logic (natural sort, book-
                      extension matching, common-prefix label stripping):
                      no libnickel, no NickelHook, no I/O, so it is the one

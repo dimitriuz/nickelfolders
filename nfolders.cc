@@ -208,9 +208,10 @@ static void nf_on_trigger_show() {
 // nf_init (below) calls nf_watch_init from the GUI thread, and every
 // callback it registers fires from the QSocketNotifier's activated() signal
 // on that same thread. `touch`'d with no content -- unlike the other two
-// triggers, this one takes no ContentIDs or arguments at all: the milestone
-// it drives (nf_browser_show, nfview.cc) is deliberately a fixed, hardcoded
-// screen, not something a trigger file's content could parameterise yet.
+// triggers, this one takes no ContentIDs or arguments at all: nf_browser_show
+// (nfview.cc) always starts the folder browser at the root, /mnt/onboard,
+// and there is nothing else here for a trigger file's content to
+// parameterise.
 static void nf_on_trigger_view() {
     // Same "the file exists and is fully written by the time this runs"
     // reasoning as the other two triggers -- IN_CLOSE_WRITE/IN_MOVED_TO
