@@ -1975,3 +1975,146 @@ same class of mistake as this section's own `Content::getReadStatus`/
 `isFinished` cross-check exists to catch, just caught by hand instead, by
 checking the mangling against the identifier's own `strlen` rather than
 trusting a first guess.
+
+## Task 12: v2 data sources — what is free, what needs archaeology, and one non-bug
+
+Prompted by the owner asking for two more sort keys (recently read, recently
+added), three read-state filters (finished / in progress / not started), and
+icons for folders and known file types. Everything below is symbol-table and
+resource-table archaeology against the staged `libnickel.so.1.0.0`
+(23,966,636 bytes, firmware 4.38.23684), plus device inspection.
+
+### The reported "folders hide under a filter" bug is not a bug
+
+Owner's report: with the filter set to `cbz`, "the road folder is hiding".
+
+`find` over the card's real content directories:
+
+```
+/mnt/onboard/books/Comics/English/The Road - A Graphic Novel Adaptation (2024) (Digital) (phillywilly-Empire).cbr
+```
+
+`The Road` is a **file**, and a `.cbr` — so a `.cbz` filter correctly
+excludes it. There is no directory named anything like `road` anywhere on
+the card (`find /mnt/onboard -iname "*road*" -type d` is empty across the
+content directories). Folders are never filtered: `nflist.cc`'s filter
+stage is `if (e.isDir || nf_matches_filter(...))`.
+
+What the report actually found is a **presentation** defect. The
+folder/file distinction is a trailing `/` appended in `nfview.cc`'s row
+loop, and a trailing marker on a long stripped label is the worst possible
+place for it: first to go to elision, easy to miss when present. The label
+here is `The Road - A Graphic Novel Adaptation` — long, and shaped exactly
+like a folder name once `nf_strip_common` has taken the extension and the
+release-group suffix off. Hence icons, at the LEADING edge, where nothing
+can elide them away.
+
+Worth keeping as a general lesson: a user reporting a filter bug had in
+fact found a labelling bug. The filter was innocent and the fix belongs in
+the renderer.
+
+### Read state is already in hand — no new libnickel call
+
+`nfnickel.cc` has resolved and called both of these since Task 11:
+
+- `_ZNK7Content13getReadStatusEv` -> int, Kobo's ReadingStatus enum,
+  measured **0 = not started, 1 = in progress, 2 = finished**
+- `_ZNK7Content10isFinishedEv` -> bool, measured equivalent to `== 2`
+
+So the three read-state filters are pure wiring over data the pipeline
+already fetches. The only structural consequence is that read state is
+**metadata**, so it cannot be filtered at `nf_browser_build_rows`' stage
+1.5 the way a type filter can — the filter has to move after the metadata
+fetch. Stage 2's own comment already anticipated precisely this and named
+the condition that would force the swap.
+
+### The two date sorts DO need archaeology, and it is the dangerous shape
+
+Both getters exist and are exported:
+
+- `_ZNK7Content9dateAddedEv`      -> `Content::dateAdded() const`
+- `_ZNK7Content15getDateLastReadEv` -> `Content::getDateLastRead() const`
+
+Both **return by value**, which means the hidden-return-buffer (sret)
+convention — the exact ABI shape that crashed Nickel on the first device
+run of `VolumeManager::getById`. Neither may be called until it has been
+through the full procedure in CLAUDE.md's "Method": disassemble, resolve
+EVERY PLT stub with `tools/plt.sh`, take object sizes off Nickel's own
+`operator new`, add one staged rung, and give it a negative control.
+
+Nickel's own sorters are visible in the symbol table and confirm the
+concepts are first-class there — `DateAddedSorter<Volume>`,
+`DateAddedOnlySorter<Volume>`, `DateAddedKey<Volume>`,
+`AuthorLastReadKeySorter<Author>`, and `ReverseSorter<...>` wrappers around
+them. Reusing a Nickel sorter is not obviously easier than reading the two
+timestamps ourselves (they are templates, so instantiations are
+per-type and the comparator would still need our rows), but the symbols are
+recorded here in case the direct route proves hostile.
+
+### Reading Nickel's database in-process: ruled OUT, with the measurements
+
+Tempting, because one SQLite query would answer read state, both dates,
+title/author, and `ImageId` for covers. It does not work here:
+
+- `libnickel.so.1.0.0` exports **zero** `sqlite3_*` symbols
+  (`strings | grep -c '^sqlite3_'` is 0), so there is no C API to borrow
+  in-process.
+- `libQt5Sql.so.5` exists on disk at `/usr/local/Qt-5.2.1-arm/lib/`, but is
+  **not mapped into the running Nickel** (`grep libQt5Sql
+  /proc/$(pidof nickel)/maps` is empty), so Nickel does not use Qt SQL at
+  runtime despite referencing the library name.
+- The only SQLite **driver plugin** on the device is a Qt **4** one, at
+  `/usr/local/Trolltech/QtEmbedded-4.6.2-arm/plugins/sqldrivers/libqsqlite.so`.
+  There is no `/usr/local/Kobo/sqldrivers/` at all. So
+  `QSqlDatabase::addDatabase("QSQLITE")` has no driver to load.
+- A `libsqlite3.so` does exist twice on this device — under
+  `/mnt/onboard/.adds/koreader/libs/` and `/usr/local/AutoShelf/` — but both
+  belong to OTHER PEOPLE'S MODS. Linking a dependency the user can uninstall
+  by removing an unrelated mod is not acceptable.
+- There is no `sqlite3` CLI binary on the device either.
+
+`/mnt/onboard/.kobo/KoboReader.sqlite` is **432,752,640 bytes** on this
+device, which is its own argument against any scheme that would read it
+synchronously on the GUI thread.
+
+Conclusion: metadata comes from libnickel getters, one staged rung at a
+time. If a future need genuinely requires SQL, the honest route is shipping
+our own statically-linked SQLite — which collides with the no-stdlib rule
+and the one-file-install property, so it needs its own decision.
+
+### Icons: Nickel's own Qt resources are free, and there is no PDF icon
+
+`libnickel` compiles in **373** `:/images/...` resources. Because the mod
+runs inside Nickel's process, those are already registered and resolve from
+our code with no archaeology at all — a `QLabel` holding rich text can
+reference them directly as `<img src=":/images/...">`.
+
+Useful ones, by group (`statusbar` 66, `reading` 59, `fte` 44, `library` 29,
+`widgets` 26, `menu` 26, `home` 18, ...):
+
+| purpose | resource |
+|---|---|
+| folder | `:/images/widgets/folder.png` |
+| Dropbox folder variant | `:/images/widgets/dropbox_folder.png` |
+| book / epub | `:/images/home/main_nav_books.png` |
+| comics, image-ish | `:/images/reading/reading_image_view.png` |
+| audiobook | `:/images/library/audiobook_small.png` |
+| notebook | `:/images/home/my_notebooks_book.png` |
+
+**There is no PDF icon and no generic document icon** anywhere in the 373.
+So pdf and unknown types need either a text badge or a pixmap of our own.
+
+A pixmap of our own has no clean path into a `QLabel`: `QLabel` exposes no
+public `QTextDocument`, so `QTextDocument::addResource` is unreachable, and
+`rcc` registers its resource with a **file-scope static initialiser** —
+exactly the construct that caused the boot loop into NickelHook's shared
+failsafe. So the first pass uses Nickel's own art plus a text badge for the
+gaps; drawing whole rows into a `QPixmap` ourselves is the fallback if that
+looks wrong, and it costs reimplementing text elision.
+
+Two traps to respect when a row becomes rich text: every label must be
+`toHtmlEscaped()`d (names on this card contain `&`), and the escape must
+happen **before** our own markup is appended, not after. That is the same
+ordering mistake the `nf_strip_common` letter guard already made once, where
+the guard ran after the extension was appended and therefore passed
+vacuously.
