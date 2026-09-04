@@ -88,21 +88,36 @@
 // every ContentID this file builds starts with.
 #define NF_ROOT "/mnt/onboard"
 
-// Items shown per page. MEASURED-CONSERVATIVE rather than a fresh
-// measurement: the one screenshot on file (NOTES.md, 2026-09-03) shows 15
-// item rows plus BACK plus the truncation notice this constant used to
-// gate (now removed, see below) fitting on this panel WITH CLEAR BLANK
-// SPACE still below them -- so this panel's real capacity reads closer to
-// ~20 rows than 15. 18 leaves headroom for BACK plus the extra chrome a
-// page can now carry -- the position indicator, PREV PAGE, and NEXT PAGE
-// rows below, up to all three at once on a middle page of a multi-page
-// listing (BACK + indicator + PREV + 18 items + NEXT = 22 rows, the worst
-// case; a first or last page drops one of PREV/NEXT, and a single-page
-// listing -- the common case, 27 being the largest measured -- drops all
-// three). Trivially raised once an actual full page -- not just 15 fixed
-// rows -- has been seen on hardware; see the task report's device
-// checklist.
-#define NF_ITEMS_PER_PAGE 18
+// Items shown per page. PROVEN, not merely conservative -- review finding
+// F3 deliberately gave up some headroom for this: NOTES.md's Task 10
+// records the one row count actually seen fitting this panel, with clear
+// blank space still below it -- BACK + a truncation notice + 15 item rows,
+// 17 rows total. That screenshot's own margin READS as room for roughly
+// 20, but 20 was never itself measured, only estimated from the same
+// image -- and this constant now has to answer for MORE fixed chrome per
+// page than that screenshot had (BACK, a position indicator, and now BOTH
+// PREV and NEXT, all four together on a middle page of a multi-page
+// listing, not just BACK and one notice). 14 keeps the same 17-row total
+// (BACK + PREV + NEXT + 14 items) that is the one number this project can
+// actually cite a screenshot for, rather than betting the extra chrome on
+// the estimated, unmeasured margin above it. The position indicator adds
+// one more row on top of that 17 whenever it is shown (more than one
+// page) -- smaller than a TouchLabel row, and not separately proven, but
+// the smallest addition available.
+//
+// 27 entries -- the largest listing measured on this card (Fullmetal
+// Alchemist, same screenshot) -- is comfortably ABOVE this page size, not
+// under it: it needs two pages at 14 per page (ceil(27/14) = 2), which is
+// the multi-page case this whole feature exists to reach -- volume 26 is
+// on page 2, and page 2 is precisely what nothing before this change ever
+// rendered. A single-page listing (fewer than 14 entries) is still the
+// common case elsewhere on the card and drops the indicator/PREV/NEXT
+// rows entirely; 27 is not an example of that case.
+//
+// Trivially raised once a fuller worst-case page -- indicator, PREV, 14
+// items, AND NEXT together -- has actually been seen on hardware; see the
+// task report's device checklist.
+#define NF_ITEMS_PER_PAGE 14
 
 // PAGINATION, not scrolling -- a deliberate choice, not a shortcut, and
 // the reasoning is load-bearing enough to spell out here so nobody
@@ -402,39 +417,59 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
     // Position indicator -- "page 2/2" -- a plain QLabel, not a TouchLabel:
     // informational only, not a tap target, so it needs none of
     // TouchLabel's gesture machinery. Shown only when there is more than
-    // one page: on a single-page listing (the common case -- 27 entries,
-    // the largest measured, is comfortably under NF_ITEMS_PER_PAGE) "page
-    // 1/1" says nothing a reader does not already know from PREV/NEXT both
-    // being absent.
+    // one page: on a single-page listing -- fewer than NF_ITEMS_PER_PAGE
+    // entries, still the common case elsewhere on this card even though
+    // 27 (Fullmetal Alchemist, the largest listing measured) is NOT an
+    // example of it -- "page 1/1" says nothing a reader does not already
+    // know from PREV/NEXT both being absent.
     //
     // Placed HERE -- immediately after the BACK row, ABOVE the listing rows
     // -- for the same reason review finding L1 placed the old truncation
-    // notice here rather than after the rows: this panel's real capacity
-    // for this many rows at once (BACK + indicator + PREV + 18 items +
-    // NEXT) is still not device-measured, only judged conservative
-    // (NF_ITEMS_PER_PAGE's own comment), so whatever gets clipped first
-    // should be the least useful row, and knowing "where I ended up" (the
-    // rows themselves) matters more than a reminder of "where I already
-    // was" (this label, and PREV below it).
+    // notice here rather than after the rows, and the same reason PREV/NEXT
+    // (below) were moved here too (review finding F3): this panel's real
+    // capacity for this many rows at once is still not device-measured
+    // beyond the 17-row screenshot NF_ITEMS_PER_PAGE's own comment cites, so
+    // whatever gets clipped first should be the least useful row -- and
+    // "where I already am" (this label) is the least useful of the three
+    // pieces of page-navigation chrome, which is why it sits above PREV/NEXT
+    // rather than below them.
     if (totalPages > 1) {
         QLabel *pageInfo = new QLabel(content);
         pageInfo->setText(QStringLiteral("page %1/%2").arg(nf_browser_page + 1).arg(totalPages));
         layout->addWidget(pageInfo);
     }
 
-    // PREV PAGE row -- a TouchLabel, same construction/shim pattern as
-    // every other tappable row in this function (see the BACK row's own
-    // comment for the allocation-size and signal-adaptor derivation, not
-    // repeated at each row). Only built when there IS a previous page --
-    // an always-present, sometimes-disabled row was rejected because this
-    // panel gives no reliable "disabled" visual state (CLAUDE.md's task
-    // brief on the four grey levels applies here too), so absence is the
-    // only unambiguous way to say "no previous page" on this hardware.
+    // PREV PAGE and NEXT PAGE rows -- TouchLabels, same construction/shim
+    // pattern as every other tappable row in this function (see the BACK
+    // row's own comment for the allocation-size and signal-adaptor
+    // derivation, not repeated per row). Each is built only when that
+    // direction actually exists -- an always-present, sometimes-disabled
+    // row was rejected because this panel gives no reliable "disabled"
+    // visual state (CLAUDE.md's task brief on the four grey levels applies
+    // here too), so absence is the only unambiguous way to say "no such
+    // page" on this hardware.
     //
-    // `path` (this directory) is captured by value and nf_browser_go is
-    // called with resetPage=FALSE -- this is a page change WITHIN the
-    // current directory, not a navigation to a different one, so
-    // nf_browser_page must survive the rebuild this triggers.
+    // BOTH placed HERE, directly under the position indicator and ABOVE
+    // every item row -- review finding F3, reversing this file's own
+    // earlier placement of NEXT PAGE after the items. That placement had
+    // NEXT PAGE clipped FIRST if this page's row count ever exceeds the
+    // panel's real height, and NEXT PAGE is the only route to any page
+    // past the first -- concretely, the only route to Fullmetal Alchemist
+    // volume 26, which is the entire reason pagination exists. A user
+    // could see "page 1/2" (the indicator, above) with genuinely no way to
+    // reach page 2 -- worse than the truncation notice ever being clipped,
+    // because L1's old finding was about a MISSING clue, not a VISIBLE
+    // clue to a control that isn't there. This file's own
+    // NF_ITEMS_PER_PAGE comment already states the principle ("whatever
+    // gets clipped first should be the least useful row"); this placement
+    // is what makes the code match it -- PREV/NEXT are both more useful
+    // than any single item row below them, not less.
+    //
+    // `path` (this directory) is captured by value in both, and
+    // nf_browser_go is called with resetPage=FALSE in both -- this is a
+    // page change WITHIN the current directory, not a navigation to a
+    // different one, so nf_browser_page must survive the rebuild this
+    // triggers.
     if (hasPrev) {
         void *row = calloc(1, 256); // 132 measured, 256 over-allocated -- see the BACK row's comment
         if (row) {
@@ -454,6 +489,28 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
             layout->addWidget(reinterpret_cast<QWidget*>(row));
         } else {
             nh_log("browser: calloc(1,256) failed for the PREV PAGE row, skipping it");
+        }
+    }
+
+    if (hasNext) {
+        void *row = calloc(1, 256); // 132 measured, 256 over-allocated -- see the BACK row's comment
+        if (row) {
+            TouchLabel__ctor(row, content, 0);
+            reinterpret_cast<QLabel*>(row)->setText(QStringLiteral("NEXT PAGE >"));
+
+            QPushButton *shim = new QPushButton(content);
+            shim->setVisible(false);
+            if (!QObject::connect(reinterpret_cast<QObject*>(row), SIGNAL(tapped(bool)), shim, SLOT(click())))
+                nh_log("browser: connecting the NEXT PAGE row's tapped(bool) failed -- this row will silently do nothing");
+            QObject::connect(shim, &QPushButton::clicked, [mwc, dialog, path] {
+                nf_browser_page++;
+                nh_log("browser: page -- next, now %d in '%s'", nf_browser_page, qPrintable(path));
+                nf_browser_go(mwc, dialog, path, false);
+            });
+
+            layout->addWidget(reinterpret_cast<QWidget*>(row));
+        } else {
+            nh_log("browser: calloc(1,256) failed for the NEXT PAGE row, skipping it");
         }
     }
 
@@ -543,32 +600,6 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
         });
 
         layout->addWidget(reinterpret_cast<QWidget*>(row));
-    }
-
-    // NEXT PAGE row -- same TouchLabel/shim pattern and same "absent, not
-    // disabled" reasoning as PREV PAGE above, placed after the item rows
-    // (PREV steps back to content already seen, above; NEXT steps forward
-    // to content not yet seen, below -- top-to-bottom reading order).
-    if (hasNext) {
-        void *row = calloc(1, 256); // 132 measured, 256 over-allocated -- see the BACK row's comment
-        if (row) {
-            TouchLabel__ctor(row, content, 0);
-            reinterpret_cast<QLabel*>(row)->setText(QStringLiteral("NEXT PAGE >"));
-
-            QPushButton *shim = new QPushButton(content);
-            shim->setVisible(false);
-            if (!QObject::connect(reinterpret_cast<QObject*>(row), SIGNAL(tapped(bool)), shim, SLOT(click())))
-                nh_log("browser: connecting the NEXT PAGE row's tapped(bool) failed -- this row will silently do nothing");
-            QObject::connect(shim, &QPushButton::clicked, [mwc, dialog, path] {
-                nf_browser_page++;
-                nh_log("browser: page -- next, now %d in '%s'", nf_browser_page, qPrintable(path));
-                nf_browser_go(mwc, dialog, path, false);
-            });
-
-            layout->addWidget(reinterpret_cast<QWidget*>(row));
-        } else {
-            nh_log("browser: calloc(1,256) failed for the NEXT PAGE row, skipping it");
-        }
     }
 
     QString title = (path == QStringLiteral(NF_ROOT))

@@ -115,16 +115,32 @@ static void test_strip_refuses_short_remainder_even_when_mixed(void) {
     CHECK_EQ_STR(n.at(1), "Vol 2.pdf");
 }
 
-// The device-found bug (2026-09-03): the shared run at the card's root is
-// the TITLE, not noise around it. nf_strip_common was working exactly as
-// designed -- the run really is common to both names -- and stripped it
-// anyway, leaving "1 - 2001" / "2 - 2021" with the title gone. Contrast
-// test_strip_fullmetal/test_strip_backs_off_past_open_bracket below, the
-// inverse case this guard must NOT fire for.
+// The device-found bug (NOTES.md, Task 10, measured 2026-09-04): the shared
+// run at the card's root is the TITLE, not noise around it. nf_strip_common
+// was working exactly as designed -- the run really is common to both
+// names -- and stripped it anyway, leaving "1 - 2001" / "2 - 2021" with the
+// title gone. Contrast test_strip_fullmetal/test_strip_backs_off_past_open_
+// bracket below, the inverse case this guard must NOT fire for.
 static void test_strip_refuses_when_remainder_has_no_letter(void) {
     QStringList n;
     n << "steven l. kent - the ultimate history of video games, volume 1 - 2001.kepub.epub"
       << "steven l. kent - the ultimate history of video games, volume 2 - 2021.kepub.epub";
+    QStringList before = n;
+    nf_strip_common(&n);
+    CHECK(n == before);
+}
+
+// Review finding F1, reproduced: the letter guard used to run on the
+// POST-extension label, which a MIXED-extension listing satisfies
+// vacuously off the extension's own letters ("1 - 2001.kepub.epub" reads
+// as "has a letter"). Kepubifying just ONE of the two Kent volumes -- a
+// routine Kobo operation -- reaches exactly this case: same shared title,
+// but now two different extensions. Must refuse exactly like the
+// same-extension pair above.
+static void test_strip_refuses_when_remainder_has_no_letter_even_mixed(void) {
+    QStringList n;
+    n << "steven l. kent - the ultimate history of video games, volume 1 - 2001.kepub.epub"
+      << "steven l. kent - the ultimate history of video games, volume 2 - 2021.epub";
     QStringList before = n;
     nf_strip_common(&n);
     CHECK(n == before);
@@ -242,6 +258,7 @@ int main(void) {
     test_strip_refuses_when_remainder_too_short();
     test_strip_refuses_short_remainder_even_when_mixed();
     test_strip_refuses_when_remainder_has_no_letter();
+    test_strip_refuses_when_remainder_has_no_letter_even_mixed();
     test_sort_folders_before_files();
     test_sort_uses_natural_order_within_kind();
     test_sort_is_deterministic();

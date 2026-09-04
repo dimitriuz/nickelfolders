@@ -1702,3 +1702,70 @@ revision this project could plausibly meet agrees, so this is recorded as a
 known, low-probability, ordering-only edge rather than chased further.
 Worth re-checking if a future card's real folder names turn up sorting
 oddly in a way `nf_natural_compare`'s own logic does not explain.
+
+## Task 10: device results from Task 9's wiring, and two findings that came out of them
+
+Measured on the same hardware run as Task 9's own wiring (2026-09-04,
+commits `43f9e10..f222271`), both previously recorded only in this
+session's own SDD progress ledger, not here — corrected per review (a
+measurement belongs in `NOTES.md`).
+
+**Row capacity.** `books/Comics/English/Fullmetal Alchemist` (27 entries,
+the largest listing measured on the card) rendered as `<< BACK`, the
+`"...and 12 more (scrolling not implemented yet)"` notice, and v01–v15 —
+17 rows total — with clear blank space still below v15
+(`.superpowers/sdd/2026-09-03-nickelfolders-v1/browser-fma.png`, captured
+10:38). `NF_MAX_VISIBLE_ROWS` (15, the cap in force at the time) was
+confirmed conservative; the screenshot's own margin reads as room for
+roughly 20 rows, though 17 is the only row count actually proven to fit —
+everything past it is headroom estimated from the screenshot, not itself
+measured. L1's placement fix (the notice above the rows, not below) was
+also validated by this same screenshot: had the notice been last, it is
+exactly what the panel's blank margin shows would NOT have been clipped
+either, so the finding was about a real risk this listing happened not to
+trigger, not a hazard already proven absent.
+
+**The root-books label bug.** The card's root holds exactly two files
+alongside its folders:
+
+```
+steven l. kent - the ultimate history of video games, volume 1 - 2001.kepub.epub
+steven l. kent - the ultimate history of video games, volume 2 - 2021.kepub.epub
+```
+
+and the root screenshot from the same run
+(`.superpowers/sdd/2026-09-03-nickelfolders-v1/browser-root.png`, captured
+10:33) shows them rendered as `1 - 2001` and `2 - 2021` — `nf_strip_common`
+working exactly as designed (the run really is common to both names) and
+the result being useless, because here the common run **is** the title and
+only the volume number and year distinguish the two rows. This is the
+mirror image of the Fullmetal Alchemist/Pokémon fixtures `nf_strip_common`
+was built against, where the common run is noise rather than the title —
+so the fix could not be "strip less," it had to be a rule that tells the
+two cases apart. Fixed in `nffmt.cc`: refuse to strip if the pre-extension
+remainder contains no `QChar::isLetter()` character at all (`v01 (2005)`
+keeps its `v`; `1 - 2001` has none) — see that file's own comment, and
+`tests/test_nffmt.cc`'s fixtures, for the full derivation including the
+mixed-extension case a first pass of this fix missed (checking the
+post-extension label let a `.kepub.epub`/`.epub` mix's own extension
+letters satisfy the check vacuously).
+
+**A better rule than "contains a letter", recorded but not implemented.**
+Two alternatives were measured against this card and found worse: a
+length-ratio threshold is inverted here (Fullmetal strips 85–96% of the
+name and must; the Kent pair strips 90% and must not — no threshold
+separates them), and "the stripped run was whole words" fails identically
+(both stripped runs are whole words). The genuinely better rule is
+**context-based**: allow an all-digit remainder when the stripped common
+run appears in the *folder name* the listing is inside, and refuse when it
+does not. This classifies `Series 01`..`Series 27` inside a folder literally
+named `Series/` as safe to strip (the folder name already supplies the
+title, right there in `N3Dialog::setTitle` — already shipping, `nfnickel.h`
+— so `01`/`02`/etc. is not actually ambiguous to a reader looking at the
+screen) and correctly refuses the Kent pair at the card's root, whose
+"folder name" is `NickelFolders` (`nfview.cc`'s own title for `NF_ROOT`),
+which shares nothing with either filename. Not implemented: it needs
+`nf_strip_common` (pure, `nffmt.cc`) to take the containing folder's own
+display name as an input it does not currently have, which is a real
+signature change and a real new fixture set, not a one-line fix — left for
+a future pass rather than folded into the finding that motivated it.

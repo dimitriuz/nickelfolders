@@ -166,42 +166,46 @@ void nf_strip_common(QStringList *names) {
         if (u >= 0)
             r = r.left(u);          // never show a dangling half-bracket
         r = r.trimmed();
-        if (mixed)
-            r += exts.at(i);        // in a mixed listing the extension is the distinguisher
-        out << r;
-    }
-    for (int i = 0; i < out.size(); i++) {
-        if (out.at(i).length() < 2)
-            return;
-    }
 
-    // Refuse to strip if any resulting label carries no letter at all.
-    // Measured on the reference card's own root: the two Steven L. Kent
-    // "Ultimate History of Video Games" volumes share "steven l. kent - the
-    // ultimate history of video games, volume " -- the run common to BOTH,
-    // which strips to "1 - 2001" / "2 - 2021". Both remainders are well
-    // past the two-character floor above, so that guard does not fire; the
-    // title -- the one thing a reader needs -- is exactly what got
-    // stripped, because here the shared run IS the title rather than noise
-    // around it (contrast Fullmetal Alchemist/Pokémon, where the shared
-    // run really is noise and the guard below must NOT fire for them).
-    // "Contains a letter" is a low bar on purpose: "v01 (2005)" keeps its
-    // "v", "(Part 1) - Rouge, Bleu et Jaune T01" keeps plenty, and only a
-    // label of nothing but digits/punctuation/whitespace fails it.
-    //
-    // QChar::isLetter() reads Qt's own bundled Unicode character-property
-    // table, and that table is measurably older on the device's Qt 5.2.1
-    // than on the host's Qt 5.15 (NOTES.md, Task 9's natural-sort finding).
-    // The check below is deliberately the WEAKEST possible use of that
-    // table -- "does this string contain any letter of any script at all",
-    // true for every alphabet either Unicode revision has ever known about
-    // -- rather than anything alphabet- or script-specific, so a table
-    // skew could only matter for a codepoint added as "a letter" between
-    // those two revisions, and even then the failure mode is the safe
-    // direction (falling through to full, untouched names), never the
-    // unsafe one (stripping a title away).
-    for (int i = 0; i < out.size(); i++) {
-        QString const &r = out.at(i);
+        // Refuse to strip if the REMAINDER -- before any extension is
+        // appended below -- carries no letter at all. Measured on the
+        // reference card's own root: the two Steven L. Kent "Ultimate
+        // History of Video Games" volumes share "steven l. kent - the
+        // ultimate history of video games, volume " -- the run common to
+        // BOTH, which strips to "1 - 2001" / "2 - 2021". Both remainders
+        // are well past the two-character floor above, so that guard does
+        // not fire; the title -- the one thing a reader needs -- is
+        // exactly what got stripped, because here the shared run IS the
+        // title rather than noise around it (contrast Fullmetal
+        // Alchemist/Pokémon, where the shared run really is noise and this
+        // guard must NOT fire for them). "Contains a letter" is a low bar
+        // on purpose: "v01 (2005)" keeps its "v", "(Part 1) - Rouge, Bleu
+        // et Jaune T01" keeps plenty, and only a remainder of nothing but
+        // digits/punctuation/whitespace fails it.
+        //
+        // MUST run on `r` here, BEFORE `if (mixed) r += exts.at(i)` below
+        // -- a review finding (F1), reproduced on the host: checking the
+        // POST-extension `out` instead let the extension's own letters
+        // satisfy the test vacuously, so kepubifying just ONE of the two
+        // Kent volumes (a routine Kobo operation, and .kepub.epub is
+        // already on this card) made the listing MIXED, and
+        // "1 - 2001.kepub.epub" / "2 - 2021.epub" both contain a letter --
+        // silently restoring the exact bug this guard exists to catch.
+        // Checking the bare remainder is immune to that: the extension is
+        // not part of what is being judged "a title or not" here.
+        //
+        // QChar::isLetter() reads Qt's own bundled Unicode character-
+        // property table, and that table is measurably older on the
+        // device's Qt 5.2.1 than on the host's Qt 5.15 (NOTES.md, Task 9's
+        // natural-sort finding). The check below is deliberately the
+        // WEAKEST possible use of that table -- "does this string contain
+        // any letter of any script at all", true for every alphabet either
+        // Unicode revision has ever known about -- rather than anything
+        // alphabet- or script-specific, so a table skew could only matter
+        // for a codepoint added as "a letter" between those two revisions,
+        // and even then the failure mode is the safe direction (falling
+        // through to full, untouched names), never the unsafe one
+        // (stripping a title away).
         bool hasLetter = false;
         for (int k = 0; k < r.length(); k++) {
             if (r.at(k).isLetter()) {
@@ -211,6 +215,14 @@ void nf_strip_common(QStringList *names) {
         }
         if (!hasLetter)
             return;                 // deliberate: leave EVERY row alone, not just this one
+
+        if (mixed)
+            r += exts.at(i);        // in a mixed listing the extension is the distinguisher
+        out << r;
+    }
+    for (int i = 0; i < out.size(); i++) {
+        if (out.at(i).length() < 2)
+            return;
     }
 
     *names = out;
