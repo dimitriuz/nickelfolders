@@ -47,8 +47,11 @@
 #include <QDir>
 #include <QFileInfo>
 #include <QFileInfoList>
+#include <QFontMetrics>
 #include <QImage>
 #include <QLabel>
+#include <QLayout>
+#include <QMargins>
 #include <QObject>
 #include <QPushButton>
 #include <QString>
@@ -466,7 +469,37 @@ static void nf_browser_back(void *mwc, N3Dialog *dialog) {
 // each). That they are present is NOT the same claim as that they RESOLVE from
 // this library, which is what nf_probe_icon_resources below exists to settle
 // on the device rather than leave to inference.
-#define NF_ICON_FOLDER_RES ":/images/widgets/folder.png"
+//
+// THE FOLDER ROW HAS NO FOLDER PICTOGRAM, and this is measured, not a
+// preference. `:/images/widgets/folder.png` -- the obvious candidate, and what
+// this line used to say -- is NOT a folder pictogram at all: the device probe
+// logged it at 250x350, and the screenshot showed it rendering as an empty
+// light-grey rectangle. It is COVER-ART-SHAPED PLACEHOLDER ART (a 5:7 book
+// cover, the same aspect as every cover slot on Nickel's own shelves), which
+// is presumably what "folder" means to whoever named it -- the artwork behind
+// a Nickel COLLECTION, not a filesystem folder. Do not reach for it again on
+// the strength of its filename. There is no folder pictogram anywhere in
+// Nickel's 373 :/images/... resources; this was swept, not assumed.
+//
+// THE GENERAL LESSON, because it cost a device cycle: the resource NAME did
+// not predict its CONTENT, and the dimensions this file's own probe logs were
+// the tell -- 250x350 next to the other two at 50x50 and 80x80 already said
+// "this is not an icon" before the screenshot confirmed it, and that log line
+// was read past the first time. Judge a resource by the dimensions the probe
+// reports, never by what it is called.
+//
+// The replacement is Nickel's own RIGHT-ARROW glyph, on the owner's reasoning
+// that a right arrow conventionally means "drills down" -- which is exactly
+// what tapping a folder row does here. It is also the one candidate with prior
+// art in Nickel itself for THIS use: the firmware contains the literal
+// `<img src=":/images/menu/label_arrow_right.png">` (one hit, alongside
+// showSearchOptions()), i.e. Nickel embeds this same resource in rich text in
+// a label, bare and at its intrinsic size, the same construct nf_icon_markup
+// builds below. Its dimensions are still UNMEASURED here, which is why it
+// stays in the probe list: if it turns out to load at some awkward size, that
+// is for the owner to judge from the probe log and the next screenshot, NOT
+// for this file to silently compensate for.
+#define NF_ICON_FOLDER_RES ":/images/menu/label_arrow_right.png"
 #define NF_ICON_BOOK_RES   ":/images/home/main_nav_books.png"
 #define NF_ICON_COMIC_RES  ":/images/reading/reading_image_view.png"
 
@@ -487,6 +520,14 @@ static void nf_browser_back(void *mwc, N3Dialog *dialog) {
 // row pitch near 100px, so 40 cannot be what pushes the 12th item off the
 // screen. Raise it from the dimensions nf_probe_icon_resources logs, once a
 // screenshot shows how these actually render.
+//
+// MEASURED on the device 2026-09-04, from that probe: the book icon is 50x50
+// and the comic icon 80x80, so 40 is a modest downscale for both rather than
+// an upscale, and both rendered correctly at it. Left at 40 anyway -- the
+// arrow above is newly swapped in and its own dimensions are still unlogged,
+// so there is nothing yet to tune all three against together. The number this
+// constant is worth revisiting from is the NEXT probe log, with the arrow in
+// it.
 #define NF_ICON_PX 40
 
 // Probed ONCE, lazily, on first use. A plain file-scope bool rather than a
@@ -567,6 +608,127 @@ static QString nf_icon_markup(nf_icon_kind kind) {
                .arg(QString::fromLatin1(res)).arg(NF_ICON_PX);
 }
 
+// --- row label elision -------------------------------------------------
+//
+// Long labels ran off the right edge of the panel, and what fell off it was
+// the part that told two rows apart. The measured case, from the reference
+// card's root:
+//
+//   steven l. kent - the ultimate history of video games, volume 1 - 2001.kepub.epub
+//   steven l. kent - the ultimate history of video games, volume 2 - 2021.kepub.epub
+//
+// rendered as TWO VISUALLY IDENTICAL ROWS: everything on screen was the shared
+// prefix, and "volume 1 - 2001" versus "volume 2 - 2021" was past the edge.
+//
+// nf_strip_common (nffmt.cc) did not save them, and correctly so: stripping
+// the common run leaves "1 - 2001" and "2 - 2021", which contain no letter,
+// and its letter guard rejects that whole set rather than hand a reader a
+// column of bare numbers. That guard is deliberate and separately recorded --
+// it is not what gets changed here.
+//
+// So the fix is Qt::ElideMiddle, which keeps the head AND the tail.
+// Qt::ElideRight would be actively useless on exactly this case: it removes
+// precisely the characters that distinguish the two rows, i.e. it produces the
+// same two identical rows the panel already showed, only with an ellipsis on
+// them. ElideMiddle is the only mode that keeps enough of both ends for the
+// pair above to read as two different books.
+//
+// Qt picks the ellipsis itself -- U+2026 when the row's own font can render
+// it, "..." otherwise (QTextEngine's elidedText) -- so there is nothing to
+// choose here and no glyph to risk on this panel; whichever it uses is one the
+// font already has.
+
+// The panel's own visible width, MEASURED and already recorded in CLAUDE.md:
+// the framebuffer is padded to 1280x1792 against a visible panel of 1264x1680,
+// which is why this is 1264 and specifically not 1280 -- 16 px of that
+// framebuffer is off the glass, and treating it as usable would elide 16 px
+// too late on every row.
+#define NF_PANEL_VISIBLE_WIDTH_PX 1264
+
+// The floor below which a QWidget's own width() is read as "not laid out yet"
+// rather than as a measurement. DERIVED, not picked: Qt gives a top-level
+// widget that has never been shown or sized a default 640x480, and this
+// panel's real width is 1264 (above), so 800 sits between the two with ~160 px
+// of margin below and ~460 above -- there is no plausible real width for a
+// full-screen N3Dialog on this device anywhere near it. This matters on the
+// FIRST listing specifically: nf_browser_go builds the root screen BEFORE
+// nf_browser_show calls pushView (see the call order there), so on that one
+// pass the dialog genuinely has not been sized to the screen yet and its
+// width() is that Qt default, not a truth about this panel.
+#define NF_WIDTH_PLAUSIBLE_MIN_PX 800
+
+// Width in px available to ONE row, icon and suffix not yet deducted (the row
+// loop does both, per row, because both vary per row).
+//
+// Two paths, and *measured tells the caller which one it got so the log line
+// can say so: a silently wrong width would either elide text that fits or fail
+// to elide text that does not, and on a screenshot both of those look like
+// "the elision is broken" with no way to tell them apart.
+//
+// The dialog, not the content widget, is what gets read: `content` is built
+// fresh on every navigation and handed to setContent at the very END of
+// nf_browser_go, so at row-build time it has never been laid out and its
+// width() is always the Qt default -- it can never be the measured path. The
+// dialog IS laid out on every navigation after the first.
+//
+// What this still cannot subtract is N3Dialog's own content-area inset, which
+// is Nickel's chrome and not readable from here; the layout margins below are
+// ours and are queried rather than guessed. So this is an OVER-estimate by
+// however wide that inset is, which shows up as a little residual clipping
+// rather than as over-eager elision -- deliberately that way round, and one
+// for the screenshot to settle rather than for this file to pad by a guess.
+//
+// The measured path can also over-report for a second reason worth naming:
+// if Nickel sizes its own top-level widgets to the PADDED framebuffer (1280)
+// rather than to the visible panel (1264), width() hands back 16 px that are
+// not on the glass. That is exactly why the log line below prints the raw
+// width() as well as the number actually used -- the two together say which
+// of the two the firmware thinks the screen is, which is a device measurement
+// nobody has taken yet, not something to pre-compensate for here.
+static int nf_row_width_px(N3Dialog *dialog, QLayout *layout, bool *measured, int *rawDialogWidth) {
+    int w = reinterpret_cast<QWidget*>(dialog)->width();
+    *rawDialogWidth = w;
+    *measured = (w >= NF_WIDTH_PLAUSIBLE_MIN_PX);
+    if (!*measured)
+        w = NF_PANEL_VISIBLE_WIDTH_PX;
+
+    QMargins m = layout->contentsMargins();
+    w -= m.left() + m.right();
+
+    // A deliberate floor, not dead code: QFontMetrics::elidedText with a
+    // width at or below the ellipsis' own width returns the ellipsis alone (or
+    // nothing), i.e. a screen of rows reading "..." and no names at all. No
+    // path above can currently produce a number that low -- both branches
+    // start from at least 800 -- but this is the one place where a bad width
+    // erases the entire listing rather than degrading it, so the floor is
+    // cheap insurance worth keeping.
+    if (w < 200)
+        w = 200;
+    return w;
+}
+
+// The px this row's LEADING icon markup costs, so the name can be elided to
+// what is actually left. Without this the elision is off by the icon on every
+// single row.
+//
+// The two text badges are measured exactly -- they are text, in this row's own
+// font, so QFontMetrics answers precisely. The image icons are ESTIMATED at
+// NF_ICON_PX, i.e. their forced height used as a stand-in for their rendered
+// width: <img height=N> with no width scales by the resource's own aspect
+// ratio, and those aspect ratios are exactly what is not yet known for the
+// arrow (nf_probe_icon_resources logs them; the book and comic icons measured
+// square, 50x50 and 80x80, for which this stand-in is exact). Square or
+// taller-than-wide makes it an over-estimate, which errs toward eliding a few
+// characters early rather than toward running off the edge again.
+static int nf_icon_width_px(nf_icon_kind kind, QFontMetrics const &fm) {
+    switch (kind) {
+        case NF_ICON_PDF:     return fm.width(QStringLiteral("[PDF] "));
+        case NF_ICON_UNKNOWN: return fm.width(QStringLiteral("[ ? ] "));
+        // Image icons plus nf_icon_markup's own trailing &nbsp; separator.
+        default:              return NF_ICON_PX + fm.width(QLatin1Char(' '));
+    }
+}
+
 // Builds a fresh content widget (rows for `path`'s own directory listing)
 // and swaps it into the ALREADY-EXISTING `dialog` via N3Dialog::setContent
 // -- this is the whole navigation model (nfview.h): one N3Dialog for the
@@ -627,6 +789,27 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
 
     QWidget *content = new QWidget();
     QVBoxLayout *layout = new QVBoxLayout(content);
+
+    // The width every item row's label is elided against -- see
+    // nf_row_width_px for both paths and why the dialog is what gets read.
+    //
+    // Logged ONCE PER NAVIGATION rather than once per process (the way
+    // nf_probe_icon_resources is) precisely BECAUSE the answer changes: the
+    // first listing is built before pushView has sized the dialog, so it is
+    // always the fallback, and a once-per-process log would therefore only
+    // ever record the fallback and never the real measurement. One line per
+    // navigation is still one line, not one per row, and the transition from
+    // fallback to measured is visible in the log rather than invisible.
+    bool widthMeasured   = false;
+    int  rawDialogWidth  = 0;
+    int  rowWidth        = nf_row_width_px(dialog, layout, &widthMeasured, &rawDialogWidth);
+    QMargins layoutMargins = layout->contentsMargins();
+    nh_log("browser: row width %d px -- %s (N3Dialog::width() read back %d, our layout margins %d+%d, panel fallback %d)",
+           rowWidth,
+           widthMeasured ? "MEASURED from the dialog"
+                         : "FALLBACK, the dialog is not laid out yet",
+           rawDialogWidth, layoutMargins.left(), layoutMargins.right(),
+           NF_PANEL_VISIBLE_WIDTH_PX);
 
     // Row 0: a GUARANTEED exit, independent of N3Dialog's own backTapped()
     // signal (wired once, in nf_browser_show, to this exact same
@@ -881,93 +1064,150 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
         TouchLabel__ctor(row, content, 0);
 
         // Labels are OURS -- nf_strip_common (nffmt.cc) already did the
-        // work; this only adds a leading icon (nf_icon_markup, above) and a
+        // work; this only adds a leading icon (nf_icon_markup, above), a
         // per-row suffix that nf_build_listing does not itself carry an
-        // opinion about:
-        //   - a folder gets a trailing "/" as well as the folder icon. KEPT
-        //     rather than replaced by the icon, even though the two now say
-        //     the same thing: the icon depends on Nickel's resource table
-        //     resolving from inside this library, which nobody has confirmed
-        //     yet -- that is the whole reason nf_probe_icon_resources exists
-        //     -- and if it does not resolve, this one plain ASCII character
-        //     is the only folder/file marker left. Same reasoning as the
-        //     [not in library] text below: the text carries the meaning and
-        //     the picture is the addition, never the other way round. A
-        //     folder never carries a progress marker either --
-        //     there is no Volume for one, so r.percentRead/r.finished are
-        //     always -1/false for it (nf_build_listing, nflist.cc: metadata
-        //     is never fetched for a directory row).
-        //   - a file with NO library row gets its reason spelled out in
-        //     the label TEXT itself, not left to colour/style alone: this
-        //     panel gives four grey levels, and "slightly lighter" reads
-        //     as "the same", not "different" (CLAUDE.md's task brief).
-        //     The reference card's own example is exactly one row --
-        //     Fullmetal Alchemist v26, a truncated file Nickel's own
-        //     import rejected (NOTES.md) -- and it must render as clearly
-        //     wrong, not silently vanish and leave a reader wondering
-        //     where volume 26 went.
-        //   - a file WITH a library row gets a progress marker: spec's own
-        //     wording is a percentage for in-progress books, a marker for
-        //     finished, and NOTHING for unread. "Finished" takes priority
-        //     over any number sitting in percentRead -- a re-read that
-        //     stopped partway through leaves a lower value there, and the
-        //     word is the more informative answer regardless of what that
-        //     number is.
-        //     0% and -1 (unknown, including a firmware that moved the
-        //     +140 offset -- nf_volume_exists's own guard) both render as
-        //     nothing, deliberately: Nickel's own
-        //     BookWidget::getPercentReadString clamps display to [1,99]
-        //     for the same reason an untouched book's own stored
-        //     percentage is 0, not a real progress value (NOTES.md).
-        //     r.finished itself is DERIVED (nf_build_listing, nflist.cc)
-        //     from r.readState, whose primary source is
-        //     Content::getReadStatus() -- measured 0 = not started, 1 = in
-        //     progress, 2 = finished (NOTES.md) -- with Content::isFinished()
-        //     demoted to the cross-check it always was, because a bool cannot
-        //     carry three states and the read-state filters need all three
-        //     (nf_volume_exists, nfnickel.cc, has the full account of that
-        //     reversal). This comment named isFinished() as the source until
-        //     that change landed; it is corrected here rather than in that
-        //     task's own diff because this whole region was left alone on
-        //     purpose to keep the two changes from colliding.
+        // opinion about, and the middle-elision that keeps a long name from
+        // running off the right edge of the panel (see the row-label elision
+        // block above for why the middle and not the right).
         //
-        // HTML-ESCAPED FIRST, before one character of markup joins it, and
-        // the ORDER is the whole point: r.label is a filename off the card,
-        // and names on this card contain "&" (as well as brackets, quotes and
-        // apostrophes). Escape after appending the markup and the escaping
-        // eats our own tags instead, turning every icon into visible source
-        // text. This project has the exact precedent for getting that order
-        // wrong -- nf_strip_common's letter guard once ran AFTER the
-        // extension was re-appended, which made it pass vacuously (nffmt.cc)
-        // -- so it is spelled out rather than left to be re-derived.
-        QString label = r.label.toHtmlEscaped();
-        // The suffixes are OUR OWN literals plus one int (r.percentRead), so
-        // appending them after the escape is safe -- and it has to be that
-        // way round, because their separator is now the literal markup
-        // "&nbsp;&nbsp;": rich text collapses runs of whitespace, so the two
-        // plain spaces this used to use would render as one.
+        // The suffix, built in TWO forms before either one is used: the
+        // markup that actually gets appended, and a plain-text twin whose
+        // only job is to be MEASURED (nf_row_width_px's own comment, and the
+        // elision below). The twin exists because the suffixes are what the
+        // row MEANS -- "[not in library]" on Fullmetal Alchemist v26 is the
+        // whole point of that row -- so they must never be what elision
+        // spends its budget on: the name is elided to what is left AFTER the
+        // suffix is paid for, so the suffix survives by construction rather
+        // than by hoping the name was short enough.
+        //
+        // The separator is the literal markup "&nbsp;&nbsp;" in the appended
+        // form and two plain spaces in the measured one: rich text collapses
+        // runs of whitespace (which is why the markup form cannot just use
+        // spaces), and QFontMetrics measures plain text (which is why the
+        // measured form cannot just use the entities).
+        QString suffixMarkup;
+        QString suffixPlain;
         if (r.isDir) {
-            label += QLatin1Char('/');
+            // A folder gets a trailing "/" as well as the folder icon. KEPT
+            // rather than replaced by the icon, even though the two now say
+            // the same thing: the icon depends on Nickel's resource table
+            // resolving from inside this library -- that is the whole reason
+            // nf_probe_icon_resources exists -- and if it does not resolve,
+            // this one plain ASCII character is the only folder/file marker
+            // left. Same reasoning as the [not in library] text below: the
+            // text carries the meaning and the picture is the addition, never
+            // the other way round. A folder never carries a progress marker
+            // either -- there is no Volume for one, so r.percentRead/
+            // r.finished are always -1/false for it (nf_build_listing,
+            // nflist.cc: metadata is never fetched for a directory row).
+            suffixMarkup = QStringLiteral("/");
+            suffixPlain  = QStringLiteral("/");
         } else if (!r.hasRow) {
-            label += QStringLiteral("&nbsp;&nbsp;[not in library]");
+            // A file with NO library row gets its reason spelled out in the
+            // label TEXT itself, not left to colour/style alone: this panel
+            // gives four grey levels, and "slightly lighter" reads as "the
+            // same", not "different" (CLAUDE.md's task brief). The reference
+            // card's own example is exactly one row -- Fullmetal Alchemist
+            // v26, a truncated file Nickel's own import rejected (NOTES.md)
+            // -- and it must render as clearly wrong, not silently vanish and
+            // leave a reader wondering where volume 26 went. Which is also
+            // why it must not be elided away: see the suffix budget above.
+            suffixMarkup = QStringLiteral("&nbsp;&nbsp;[not in library]");
+            suffixPlain  = QStringLiteral("  [not in library]");
         } else if (r.finished) {
-            label += QStringLiteral("&nbsp;&nbsp;[finished]");
+            // A file WITH a library row gets a progress marker: spec's own
+            // wording is a percentage for in-progress books, a marker for
+            // finished, and NOTHING for unread. "Finished" takes priority
+            // over any number sitting in percentRead -- a re-read that
+            // stopped partway through leaves a lower value there, and the
+            // word is the more informative answer regardless of what that
+            // number is.
+            //
+            // r.finished itself is DERIVED (nf_build_listing, nflist.cc) from
+            // r.readState, whose primary source is Content::getReadStatus()
+            // -- measured 0 = not started, 1 = in progress, 2 = finished
+            // (NOTES.md) -- with Content::isFinished() demoted to the
+            // cross-check it always was, because a bool cannot carry three
+            // states and the read-state filters need all three
+            // (nf_volume_exists, nfnickel.cc, has the full account).
+            suffixMarkup = QStringLiteral("&nbsp;&nbsp;[finished]");
+            suffixPlain  = QStringLiteral("  [finished]");
         } else if (r.percentRead > 0) {
-            label += QStringLiteral("&nbsp;&nbsp;(%1%)").arg(r.percentRead);
+            // 0% and -1 (unknown, including a firmware that moved the +140
+            // offset -- nf_volume_exists's own guard) both render as nothing,
+            // deliberately: Nickel's own BookWidget::getPercentReadString
+            // clamps display to [1,99] for the same reason an untouched
+            // book's own stored percentage is 0, not a real progress value
+            // (NOTES.md).
+            suffixMarkup = QStringLiteral("&nbsp;&nbsp;(%1%)").arg(r.percentRead);
+            suffixPlain  = QStringLiteral("  (%1%)").arg(r.percentRead);
         }
 
         QLabel *rowLabel = reinterpret_cast<QLabel*>(row);
+
+        // The icon is keyed off r.name, the on-disk name -- NOT r.label,
+        // which nf_strip_common may have stripped the extension clean off
+        // (it removes a common one deliberately, nffmt.cc), leaving nothing
+        // for nf_icon_kind_for to read.
+        nf_icon_kind kind = nf_icon_kind_for(r.name, r.isDir);
+
+        // THE ROW'S OWN FONT, read back off the widget Nickel's own
+        // TouchLabel constructor just finished initialising -- not a
+        // default-constructed QFont, and not the application font, either of
+        // which would measure text in a size this row does not render in. The
+        // one caveat, recorded rather than papered over: TouchLabel derives
+        // from FontSizeAdjustingLabel, which may adjust its own point size
+        // when text is set, i.e. AFTER this read. There is no way to ask it
+        // for the post-adjustment font before giving it the text, so this
+        // measures the pre-adjustment one; a screenshot is what says whether
+        // that gap matters at all on this panel.
+        QFontMetrics fm(rowLabel->font());
+
+        // The name's own budget: the row, less the leading icon, less the
+        // suffix that must survive. Floored for the same reason
+        // nf_row_width_px floors its own result -- elidedText at or below the
+        // ellipsis' width yields the ellipsis alone, which would erase the
+        // name entirely. 60 px is roughly a few characters at this panel's
+        // row font, so the floor degrades a pathological row to "a stub plus
+        // its suffix" rather than to "no name at all".
+        int nameWidth = rowWidth - nf_icon_width_px(kind, fm) - fm.width(suffixPlain);
+        if (nameWidth < 60)
+            nameWidth = 60;
+
+        // ELIDED FIRST, THEN ESCAPED, THEN the markup joins it, and every
+        // step of that order is load-bearing:
+        //
+        //   - Elide before escape, because escaping turns one "&" into five
+        //     characters ("&amp;") that Qt would then both measure and elide
+        //     as five. Names on this card do contain "&", so eliding the
+        //     escaped form would cut those rows in the wrong place and could
+        //     even split an entity in half, emitting "&am" into the markup.
+        //   - Elide before the markup is appended, because elidedText knows
+        //     nothing about tags: given the <img> the icon adds, it would
+        //     happily cut through the middle of the tag itself.
+        //   - Escape before the markup is appended, because r.label is a
+        //     filename off the card. Escape afterwards instead and the
+        //     escaping eats our OWN tags, turning every icon into visible
+        //     source text.
+        //
+        // This project has the exact precedent for getting an ordering like
+        // this wrong -- nf_strip_common's letter guard once ran AFTER the
+        // extension was re-appended, which made it pass vacuously (nffmt.cc)
+        // -- so it is spelled out rather than left to be re-derived.
+        //
+        // The suffixes are appended LAST and are safe to append after the
+        // escape because they are OUR OWN literals plus one int
+        // (r.percentRead), never card data.
+        QString label = fm.elidedText(r.label, Qt::ElideMiddle, nameWidth).toHtmlEscaped();
+        label += suffixMarkup;
+
         // Set EXPLICITLY rather than left at Qt::AutoText, which decides
         // text-vs-rich-text by INSPECTING THE STRING (Qt::mightBeRichText).
         // Nothing about how a row renders may depend on what a book happens
         // to be called: a name containing something tag-shaped would
         // otherwise flip the mode, in either direction, for that one row.
         rowLabel->setTextFormat(Qt::RichText);
-        // The icon is keyed off r.name, the on-disk name -- NOT r.label,
-        // which nf_strip_common may have stripped the extension clean off
-        // (it removes a common one deliberately, nffmt.cc), leaving nothing
-        // for nf_icon_kind_for to read.
-        rowLabel->setText(nf_icon_markup(nf_icon_kind_for(r.name, r.isDir)) + label);
+        rowLabel->setText(nf_icon_markup(kind) + label);
 
         if (!r.isDir && !r.hasRow) {
             // A SECONDARY visual cue, best-effort and UNVERIFIED on this
