@@ -43,17 +43,23 @@
 #include "nfnickel.h"
 #include "nflist.h"
 
+#include <QBrush>
 #include <QDateTime>
 #include <QDir>
 #include <QFileInfo>
 #include <QFileInfoList>
+#include <QFont>
 #include <QFontMetrics>
 #include <QImage>
 #include <QLabel>
 #include <QLayout>
 #include <QMargins>
 #include <QObject>
+#include <QPainter>
+#include <QPen>
+#include <QPointF>
 #include <QPushButton>
+#include <QRectF>
 #include <QString>
 #include <QVBoxLayout>
 #include <QVector>
@@ -455,157 +461,478 @@ static void nf_browser_back(void *mwc, N3Dialog *dialog) {
 // -- a FILE, and the reason this feature exists -- was read as a folder for
 // exactly that reason. A LEADING marker cannot be elided away.
 //
-// The images are NICKEL'S OWN Qt resources, not ours. This library runs inside
-// Nickel's process, so Nickel's compiled-in resources are already registered
-// and resolve from our code for free: no new assets, no rcc, nothing shipped,
-// no archaeology. rcc is specifically NOT an option here even if we wanted our
-// own artwork -- it registers a bundle from a FILE-SCOPE STATIC INITIALISER,
-// the exact construct that once boot-looped this mod into NickelHook's SHARED
-// failsafe, which can uninstall the owner's OTHER mods (nfnickel.cc's own
-// QByteArray account, and nf_browser_active_dialog's comment above).
+// THE ICONS ARE OURS, DRAWN BY THIS FILE. They used to be Nickel's own Qt
+// resources, borrowed out of the process we are injected into -- free, but
+// never a SET. Their device-measured dimensions are the whole argument:
 //
-// All three paths are present in 4.38.23684 as :/-prefixed literals in
-// Nickel's own code (`strings libnickel.so.1.0.0 | grep -F :/images/`, one hit
-// each). That they are present is NOT the same claim as that they RESOLVE from
-// this library, which is what nf_probe_icon_resources below exists to settle
-// on the device rather than leave to inference.
+//   :/images/menu/label_arrow_right.png     15x26   folder rows
+//   :/images/home/main_nav_books.png        50x50   .epub / .kepub.epub
+//   :/images/reading/reading_image_view.png 80x80   .cbz / .cbr
+//   (nothing at all)                                .pdf, unknown
 //
-// THE FOLDER ROW HAS NO FOLDER PICTOGRAM, and this is measured, not a
-// preference. `:/images/widgets/folder.png` -- the obvious candidate, and what
-// this line used to say -- is NOT a folder pictogram at all: the device probe
-// logged it at 250x350, and the screenshot showed it rendering as an empty
-// light-grey rectangle. It is COVER-ART-SHAPED PLACEHOLDER ART (a 5:7 book
-// cover, the same aspect as every cover slot on Nickel's own shelves), which
-// is presumably what "folder" means to whoever named it -- the artwork behind
-// a Nickel COLLECTION, not a filesystem folder. Do not reach for it again on
-// the strength of its filename. There is no folder pictogram anywhere in
-// Nickel's 373 :/images/... resources; this was swept, not assumed.
+// Three aspect ratios, three visual weights, and two kinds with no art
+// anywhere in Nickel's 373 :/images/... resources (swept, not assumed), which
+// is why .pdf and unknown fell back to "[PDF]" and "[ ? ]" text badges. The
+// owner asked for "icons for folders and different known file types"; the
+// right arrow in particular was only ever a STOPGAP, picked because Nickel
+// ships no folder pictogram at all, not because a right arrow is what was
+// wanted. A folder icon was the original request and is now what a folder row
+// gets.
 //
-// THE GENERAL LESSON, because it cost a device cycle: the resource NAME did
-// not predict its CONTENT, and the dimensions this file's own probe logs were
-// the tell -- 250x350 next to the other two at 50x50 and 80x80 already said
-// "this is not an icon" before the screenshot confirmed it, and that log line
-// was read past the first time. Judge a resource by the dimensions the probe
-// reports, never by what it is called.
+// Two findings from the borrowed-resource era are worth keeping, because both
+// cost a device cycle:
+//   - `:/images/widgets/folder.png`, the obvious folder candidate, is NOT a
+//     folder pictogram: the probe logged it at 250x350 and the screenshot
+//     showed an empty light-grey rectangle -- COVER-ART-SHAPED PLACEHOLDER
+//     art (5:7, the aspect of every cover slot on Nickel's own shelves),
+//     i.e. presumably the artwork behind a Nickel COLLECTION. The resource
+//     NAME did not predict its CONTENT.
+//   - The DIMENSIONS were the tell, and were read past the first time: 250x350
+//     next to 50x50 and 80x80 already said "this is not an icon" before the
+//     screenshot confirmed it. Which is why the generator below still logs a
+//     width and height per icon even though we drew them and therefore
+//     already "know" -- what it logs is what the FILE says when read back,
+//     not what we intended.
 //
-// The replacement is Nickel's own RIGHT-ARROW glyph, on the owner's reasoning
-// that a right arrow conventionally means "drills down" -- which is exactly
-// what tapping a folder row does here. It is also the one candidate with prior
-// art in Nickel itself for THIS use: the firmware contains the literal
-// `<img src=":/images/menu/label_arrow_right.png">` (one hit, alongside
-// showSearchOptions()), i.e. Nickel embeds this same resource in rich text in
-// a label, bare and at its intrinsic size, the same construct nf_icon_markup
-// builds below. Its dimensions are still UNMEASURED here, which is why it
-// stays in the probe list: if it turns out to load at some awkward size, that
-// is for the owner to judge from the probe log and the next screenshot, NOT
-// for this file to silently compensate for.
-#define NF_ICON_FOLDER_RES ":/images/menu/label_arrow_right.png"
-#define NF_ICON_BOOK_RES   ":/images/home/main_nav_books.png"
-#define NF_ICON_COMIC_RES  ":/images/reading/reading_image_view.png"
+// HOW OUR OWN ART REACHES A QLabel, since the two obvious routes are closed:
+//   - A QPixmap/QImage we drew cannot be handed to the row's RICH TEXT.
+//     QLabel exposes no public QTextDocument, so QTextDocument::addResource
+//     -- the documented way to bind a name to an in-memory image -- is
+//     unreachable from outside the widget.
+//   - rcc (a compiled-in :/ bundle of our own) is ruled out outright: it
+//     registers its bundle from a FILE-SCOPE STATIC INITIALISER, the exact
+//     construct that once boot-looped this mod into NickelHook's SHARED
+//     failsafe, which can uninstall the owner's OTHER mods (nfnickel.cc's own
+//     QByteArray account, and nf_browser_active_dialog's comment above).
+// What IS reachable is a FILE PATH: QTextDocument::loadResource opens a local
+// file for an <img src> it cannot otherwise resolve. So each icon is painted
+// into a QImage and written out as a PNG, and the row markup points at it by
+// absolute path.
+//
+// WHY /tmp, AND NOTHING ON THE CARD -- two of CLAUDE.md's hard constraints,
+// not a convenience:
+//   - /tmp is TMPFS, so writing there never opens a file handle on
+//     /mnt/onboard. A handle held there across a USB session risks corrupting
+//     the owner's card, which is why this project's own trigger files live on
+//     /tmp too. Nothing here ever writes to the user's card.
+//   - tmpfs CLEARS ON REBOOT, and that is the feature rather than the cost:
+//     the icons are regenerated every time Nickel starts, so a changed
+//     drawing can never be shadowed by a stale PNG from an older build, and
+//     the install stays exactly one .so the owner deletes to uninstall.
+//     Nothing is shipped and nothing has to be cleaned up.
+// They are also rewritten UNCONDITIONALLY rather than reused when already
+// present, for that same staleness reason: tools/restart-nickel.sh restarts
+// Nickel without clearing tmpfs, so "the file is there" is not evidence it
+// came from this build.
+#define NF_ICON_DIR "/tmp/nfolders-icons"
 
-// A path no resource has, probed alongside the three real ones. Without it,
-// "the real one loaded" is not evidence of anything -- CLAUDE.md's "a negative
-// control is what makes a check non-vacuous", the same discipline as the
-// isValid=false ContentID that made rung 1's isValid=true mean something.
-// Confirmed absent from the firmware by the same grep that found the three
-// above (zero hits).
-#define NF_ICON_CONTROL_RES ":/images/widgets/nfolders_does_not_exist.png"
+// A path this file NEVER writes, loaded alongside the five real ones. Without
+// it, "the icon loaded back" is not evidence of anything -- CLAUDE.md's "a
+// negative control is what makes a check non-vacuous", the same discipline as
+// the isValid=false ContentID that made rung 1's isValid=true mean something.
+// The previous, resource-based probe's control caught nothing, and that was
+// the point: it is what established that Nickel's resources were reachable
+// from this library at all rather than that four lines had been printed.
+#define NF_ICON_FILE_CONTROL NF_ICON_DIR "/nfolders-never-written.png"
 
-// Rendered height in px, forced on every <img> rather than left at whatever
-// size the resource happens to be. UNMEASURED and deliberately conservative:
-// these are Nickel's own chrome images at whatever size Nickel's own screens
-// wanted them, and an icon taller than the row's text would grow the row and
-// eat into a page budget that is already spoken for -- NF_ITEMS_PER_PAGE
-// (above) is keyed to a MEASURED 17-row page on a 1680px-visible panel, i.e. a
-// row pitch near 100px, so 40 cannot be what pushes the 12th item off the
-// screen. Raise it from the dimensions nf_probe_icon_resources logs, once a
-// screenshot shows how these actually render.
+// Every icon is square and every icon is this size -- the consistency that
+// the borrowed set (15x26 / 50x50 / 80x80) could not have.
 //
-// MEASURED on the device 2026-09-04, from that probe: the book icon is 50x50
-// and the comic icon 80x80, so 40 is a modest downscale for both rather than
-// an upscale, and both rendered correctly at it. Left at 40 anyway -- the
-// arrow above is newly swapped in and its own dimensions are still unlogged,
-// so there is nothing yet to tune all three against together. The number this
-// constant is worth revisiting from is the NEXT probe log, with the arrow in
-// it.
+// 40 is the SAFE BUDGET, not an aesthetic pick: the panel's measured capacity
+// is 17 rows on 1680 visible px, NF_ITEMS_PER_PAGE is keyed to that, and every
+// px of row height risks it. 40 was already the forced <img> height of the
+// borrowed set and the device did NOT grow rows at it, which is the whole
+// reason it is reused here rather than raised. Do not raise it without a
+// screenshot that counts rows.
 #define NF_ICON_PX 40
 
-// Probed ONCE, lazily, on first use. A plain file-scope bool rather than a
-// function-local static for TWO reasons, both load-bearing here: a
-// function-local static of non-POD type compiles to a __cxa_guard_acquire/
-// release pair, i.e. libstdc++ runtime, which CLAUDE.md forbids outright; and
-// a POD bool lives in .bss with no constructor to race NickelHook's own
-// nh_init ordering, the same discipline as every other file-scope datum in
-// this file. Every caller runs on the GUI thread (a tap handler, or the
-// trigger that opens the screen), so there is no thread to race either.
-static bool nf_icons_probed = false;
+// Odd, so a stroke centred on a half-pixel coordinate covers whole pixels
+// (see nf_icon_draw). 3 px at 40 px is deliberately heavy: a 40 px icon drawn
+// with hairlines is muddy after this panel's own dithering, and
+// distinguishability at 40 px matters far more here than detail does.
+#define NF_ICON_STROKE_PX 3
 
-// QImage, not QPixmap: the open question is whether Nickel's RESOURCE TABLE
-// and the PNG decoder are reachable from this library at all, and QImage
-// answers exactly that with no QGuiApplication/platform dependency of its own
-// to confuse a null result with. It is also the type Qt's own rich-text image
-// handler loads through (QTextImageHandler, which is what actually renders the
-// <img> below), so a null here is a null there.
+// One row per icon kind. POD only, with constant initialisers -- string
+// literal addresses and integers, no constructor to run -- so this lives in
+// .data with nothing that could race NickelHook's nh_init the way a
+// file-scope QString/QByteArray would (nfnickel.cc's own account of that
+// crash). `nm libnfolders.so | grep GLOBAL__sub_I` must stay empty.
 //
-// Logged rather than acted on: there is nothing useful to do about a missing
-// resource except tell whoever reads the log, and the row's TEXT carries the
-// meaning regardless (see the label comment in the row loop). If the icons
-// simply do not appear on the panel, these four lines are the only thing that
-// can tell "no icon" apart from "the resource system is unreachable from a
-// plugin" -- symptoms that are otherwise identical.
-static void nf_probe_icon_resources(void) {
-    if (nf_icons_probed)
-        return;
-    nf_icons_probed = true;
+// `kind` is stored rather than implied by the row's POSITION, and looked up
+// by search (nf_icon_entry): reordering nf_icon_kind in nffmt.h, or inserting
+// an enumerator, then silently shifts every icon by one if the table is
+// indexed positionally, and a WRONG icon is exactly the defect this feature
+// exists to end. A kind with no row here degrades to its text badge, the same
+// as a kind whose PNG failed to write.
+//
+// `ok`, `w` and `h` are filled in by nf_icons_generate from the file READ
+// BACK, never from what was drawn.
+struct nf_icon_file {
+    int         kind;    // an nf_icon_kind, held as int so this stays POD-plain
+    char const *path;
+    bool        ok;      // written AND loaded back -- the only thing that
+                         // licenses emitting an <img> for this kind
+    int         w;
+    int         h;
+};
 
-    char const *const paths[] = {
-        NF_ICON_FOLDER_RES, NF_ICON_BOOK_RES, NF_ICON_COMIC_RES, NULL,
-    };
-    for (int i = 0; paths[i]; i++) {
-        QImage img(QString::fromLatin1(paths[i]));
-        nh_log("icons: '%s' -> %s %dx%d", paths[i],
-               img.isNull() ? "NULL, did not load" : "loaded",
-               img.width(), img.height());
+static nf_icon_file nf_icon_files[] = {
+    { NF_ICON_FOLDER,  NF_ICON_DIR "/folder.png",  false, 0, 0 },
+    { NF_ICON_BOOK,    NF_ICON_DIR "/book.png",    false, 0, 0 },
+    { NF_ICON_COMIC,   NF_ICON_DIR "/comic.png",   false, 0, 0 },
+    { NF_ICON_PDF,     NF_ICON_DIR "/pdf.png",     false, 0, 0 },
+    { NF_ICON_UNKNOWN, NF_ICON_DIR "/unknown.png", false, 0, 0 },
+};
+
+#define NF_ICON_FILE_COUNT ((int)(sizeof nf_icon_files / sizeof nf_icon_files[0]))
+
+static nf_icon_file *nf_icon_entry(nf_icon_kind kind) {
+    for (int i = 0; i < NF_ICON_FILE_COUNT; i++)
+        if (nf_icon_files[i].kind == (int)kind)
+            return &nf_icon_files[i];
+    return NULL;
+}
+
+// Generated ONCE, lazily, on first use. A plain file-scope bool rather than a
+// function-local static for TWO reasons, both load-bearing: a function-local
+// static of non-POD type compiles to a __cxa_guard_acquire/release pair, i.e.
+// libstdc++ runtime, which CLAUDE.md forbids outright; and a POD bool lives
+// in .bss with no constructor to race NickelHook's own nh_init ordering, the
+// same discipline as every other file-scope datum in this file. Every caller
+// runs on the GUI THREAD (a row build, reached from a tap handler or from the
+// trigger that opens the screen), which is both where Nickel's UI may be
+// touched from and the only place this needs to be correct -- so there is no
+// thread to race either, and no need for a guard even if one were allowed.
+static bool nf_icons_generated = false;
+
+// Draws one icon into a fresh NF_ICON_PX-square QImage. Pure QPainter on a
+// QImage: no libnickel, no window, no platform plugin, nothing that has to be
+// on-screen -- which is also why this is the one part of the icon work that
+// could not have been host-tested anyway (the mapping that CAN be is
+// nf_icon_kind_for, in nffmt.cc, with its own tests).
+//
+// THE SHAPE LANGUAGE, so the five read as one set: a 3 px black outline
+// silhouette plus exactly ONE solid black accent each, on transparency. No
+// grey fills anywhere. koboy's measurements on this exact panel
+// (../koboy/CLAUDE.md, ../koboy/TESTED.md) are why: four-level content is
+// what smears under the fast waveforms and genuinely two-valued content does
+// not, and four grey levels is all this panel has to spend in the first place
+// -- so the set spends none of them. What that finding does NOT forbid is
+// antialiasing, which is enabled below; it was measured against a 60 fps
+// emulator repainting the whole screen through DU, not against a static list
+// Nickel repaints once, and at ~300 ppi the aliasing on the folder tab's
+// diagonal and the comic mountain is coarse enough to see. So: antialiased
+// EDGES, every fill strictly black or fully transparent, and every stroke
+// 3 px wide, so no shape depends on a partially covered pixel to be visible.
+static QImage nf_icon_draw(nf_icon_kind kind) {
+    // ARGB32 and a fully TRANSPARENT ground, not white: the row background is
+    // Nickel's, not ours, and a white tile would show as a visible box around
+    // every icon the moment Nickel draws a row on anything but pure white (a
+    // tap highlight, a themed list). Transparency costs nothing -- PNG
+    // carries alpha and Qt's own rich-text image handler composites it.
+    QImage img(NF_ICON_PX, NF_ICON_PX, QImage::Format_ARGB32);
+    if (img.isNull())
+        return img;
+    img.fill(Qt::transparent);
+
+    QPainter p(&img);
+    p.setRenderHint(QPainter::Antialiasing, true);
+
+    // HALF-PIXEL coordinates throughout, with the odd NF_ICON_STROKE_PX: a
+    // 3 px pen centred on x=8.5 covers exactly 7..10, where the same pen
+    // centred on x=8 covers 6.5..9.5 and leaves two half-intensity columns.
+    // On a reflective panel that is the difference between a crisp line and a
+    // smudged one, and it is the reason every number below ends in .5.
+    QPen pen(Qt::black);
+    pen.setWidth(NF_ICON_STROKE_PX);
+    pen.setJoinStyle(Qt::MiterJoin);
+    pen.setCapStyle(Qt::FlatCap);
+
+    switch (kind) {
+        case NF_ICON_FOLDER: {
+            // The classic folder: a body with a raised TAB on the left, the
+            // tab filled solid as this icon's one black accent. Outlined
+            // rather than filled solid throughout so it carries the same
+            // visual weight as the four file icons beside it.
+            QPointF body[6] = {
+                QPointF( 3.5, 34.5), QPointF( 3.5,  7.5), QPointF(15.5,  7.5),
+                QPointF(19.5, 12.5), QPointF(36.5, 12.5), QPointF(36.5, 34.5),
+            };
+            // The tab's own BOTTOM edge lands on y=13.0, an integer, and
+            // not on the body's 12.5 like every other coordinate here: for
+            // x below 19.5 that edge is EXPOSED (the body outline runs
+            // vertically at x=3.5 there, not along y=12.5), so a half-pixel
+            // bottom left a visible grey seam under the tab -- caught on a
+            // host render before it ever reached the panel. Half-pixels are
+            // for STROKE centres; an exposed FILL boundary wants an integer.
+            QPointF tab[4] = {
+                QPointF( 3.5, 13.0), QPointF( 3.5,  7.5),
+                QPointF(15.5,  7.5), QPointF(19.5, 13.0),
+            };
+            p.setPen(Qt::NoPen);
+            p.setBrush(Qt::black);
+            p.drawPolygon(tab, 4);
+            p.setPen(pen);
+            p.setBrush(Qt::NoBrush);
+            p.drawPolygon(body, 6);
+            break;
+        }
+        case NF_ICON_BOOK: {
+            // An OPEN book -- two pages leaning into a solid black gutter --
+            // and this is the one shape here that was chosen by rendering
+            // the alternatives rather than by reasoning about them. A CLOSED
+            // book (a portrait outline with a black spine bar, tried two
+            // ways) is a rectangle, and at 40 px it read as a domino or a
+            // battery, not as a book: it was also barely distinguishable
+            // from the PDF sheet below, which is the other portrait
+            // rectangle in the set. The open book's V silhouette is the only
+            // one of the four candidates that cannot be mistaken for any
+            // other icon here.
+            //
+            // One kind for .epub and .kepub.epub, intentionally: the same
+            // book format with and without Kobo's own preprocessing, which
+            // is not a distinction a reader makes (nffmt.h says the same on
+            // its own side of the boundary).
+            QPointF leftPage[4] = {
+                QPointF( 3.5, 11.5), QPointF(19.5, 15.5),
+                QPointF(19.5, 34.5), QPointF( 3.5, 30.5),
+            };
+            QPointF rightPage[4] = {
+                QPointF(36.5, 11.5), QPointF(20.5, 15.5),
+                QPointF(20.5, 34.5), QPointF(36.5, 30.5),
+            };
+            // The gutter, on integers and deliberately WIDER than the two
+            // page strokes it sits under (18..22 against 18..21 and 19..22):
+            // drawn as two coincident 3 px strokes instead, the pair
+            // antialiased against each other and rendered as a GREY bar --
+            // seen on a host render of exactly that variant. A solid fill
+            // underneath them has no seam to grey.
+            p.setPen(Qt::NoPen);
+            p.setBrush(Qt::black);
+            p.drawRect(QRectF(18.0, 14.0, 4.0, 21.0));
+            p.setPen(pen);
+            p.setBrush(Qt::NoBrush);
+            p.drawPolygon(leftPage, 4);
+            p.drawPolygon(rightPage, 4);
+            break;
+        }
+        case NF_ICON_COMIC: {
+            // ONE icon for .cbz and .cbr, intentionally: they are the same
+            // comic archive with a different compressor inside, and a reader
+            // does not distinguish them (nffmt.h says the same on its own
+            // side of the boundary). A framed picture -- mountain and sun --
+            // rather than a stack of pages: the LANDSCAPE frame is what makes
+            // it unmistakable against the PDF sheet beside it, and "the
+            // archive is full of images" is what a comic is.
+            QPointF peak[3] = { QPointF(9.0, 30.0), QPointF(19.0, 15.0), QPointF(29.0, 30.0) };
+            p.setPen(Qt::NoPen);
+            p.setBrush(Qt::black);
+            p.drawPolygon(peak, 3);
+            p.drawEllipse(QRectF(25.5, 11.5, 7.0, 7.0));
+            p.setPen(pen);
+            p.setBrush(Qt::NoBrush);
+            p.drawRect(QRectF(4.5, 8.5, 31.0, 23.0));
+            break;
+        }
+        case NF_ICON_PDF: {
+            // A document sheet with a dog-eared corner and a solid black band
+            // across the bottom. The band, not the fold, is what carries at
+            // 40 px -- the fold is 8 px of detail and is there for the
+            // silhouette. Letters were considered and rejected: "PDF" inside
+            // a 21 px band is ~6 px per glyph, which this panel's dithering
+            // turns to mush; the row's own filename still ends in ".pdf".
+            QPointF sheet[5] = {
+                QPointF(10.5,  4.5), QPointF(23.5,  4.5), QPointF(31.5, 12.5),
+                QPointF(31.5, 35.5), QPointF(10.5, 35.5),
+            };
+            QPointF fold[3] = { QPointF(23.5, 4.5), QPointF(23.5, 12.5), QPointF(31.5, 12.5) };
+            // The band's TOP edge is the only one of its four not hidden
+            // under the sheet outline, so it lands on y=25.0 rather than on
+            // a half-pixel -- same seam, same host render, same reason as
+            // the folder tab above.
+            p.setPen(Qt::NoPen);
+            p.setBrush(Qt::black);
+            p.drawRect(QRectF(10.5, 25.0, 21.0, 10.5));
+            p.setPen(pen);
+            p.setBrush(Qt::NoBrush);
+            p.drawPolygon(sheet, 5);
+            p.drawPolyline(fold, 3);
+            break;
+        }
+        case NF_ICON_UNKNOWN:
+        default: {
+            // A rounded square with a bold "?" -- the replacement for the
+            // "[ ? ]" badge, and the one icon whose accent is a GLYPH rather
+            // than a shape we drew, because "?" is the meaning and drawing an
+            // arc-and-dot by hand would be a worse question mark than the
+            // font's own. Unreachable while nf_is_book_name gates every file
+            // row on the same allowlist nf_icon_kind_for reads, and answered
+            // anyway: a format added to NF_EXTS but not to the icon map must
+            // look like a question, not like a missing icon.
+            p.setPen(pen);
+            p.setBrush(Qt::NoBrush);
+            p.drawRoundedRect(QRectF(5.5, 5.5, 29.0, 29.0), 6.0, 6.0);
+
+            QFont f = p.font();
+            f.setBold(true);
+            f.setPixelSize(24); // pixels, not points: this is a 40 px canvas,
+                                // and a point size would depend on whatever
+                                // DPI the paint device claims.
+            p.setFont(f);
+            p.setPen(Qt::black); // a plain pen -- glyphs are FILLED with the
+                                 // pen colour, so the 3 px width above would
+                                 // do nothing here but is confusing to leave.
+            p.drawText(QRectF(0.0, 0.0, (qreal)NF_ICON_PX, (qreal)NF_ICON_PX),
+                       Qt::AlignCenter, QStringLiteral("?"));
+            break;
+        }
     }
 
-    QImage control(QStringLiteral(NF_ICON_CONTROL_RES));
-    nh_log("icons: control '%s' -> %s", NF_ICON_CONTROL_RES,
-           control.isNull() ? "NULL, as required" : "LOADED -- probe is meaningless");
+    p.end();
+    return img;
+}
+
+// Draws all five, writes them under NF_ICON_DIR, and VERIFIES each one by
+// loading the written file back. Nothing here is fatal: every failure path
+// leaves that kind's `ok` false, which nf_icon_markup renders as the text
+// badge it used to render for .pdf and unknown. CLAUDE.md is explicit that
+// NickelHook's failsafe is SHARED infrastructure -- a mod that fails hard can
+// make the owner's OTHER mods uninstall themselves -- and an icon is about as
+// non-essential as this project gets.
+static void nf_icons_generate(void) {
+    if (nf_icons_generated)
+        return;
+    // Set BEFORE the work, not after: a failure below must not be retried on
+    // every row of every navigation for the rest of the session.
+    nf_icons_generated = true;
+
+    // mkpath, not mkdir: it creates NF_ICON_DIR's parents too and returns
+    // true when the directory already exists, so there is no "already there"
+    // case to special-case. It returns false if something that is NOT a
+    // directory occupies the path, which is a real (if odd) way for this to
+    // fail and is why the result is checked at all.
+    QDir dir(QStringLiteral(NF_ICON_DIR));
+    if (!dir.mkpath(QStringLiteral("."))) {
+        nh_log("icons: mkpath '%s' failed -- every row falls back to a text badge", NF_ICON_DIR);
+        return;
+    }
+
+    int ok = 0;
+    for (int i = 0; i < NF_ICON_FILE_COUNT; i++) {
+        nf_icon_file *e = &nf_icon_files[i];
+        QString path = QString::fromLatin1(e->path);
+
+        QImage img = nf_icon_draw((nf_icon_kind)e->kind);
+        if (img.isNull()) {
+            nh_log("icons: '%s' -> could not allocate the %dx%d canvas, falls back to its text badge",
+                   e->path, NF_ICON_PX, NF_ICON_PX);
+            continue;
+        }
+        // "PNG" spelled out rather than inferred from the extension: the
+        // extension route asks Qt to guess, and a guess that lands on a
+        // handler this build of Qt does not have fails with the same null
+        // result as a missing file. Qt's PNG handler is built into QtGui, but
+        // this library is loaded BY Qt's own image-format plugin scan, so
+        // "which handlers exist" is not a thing to assume from in here -- if
+        // it is missing, this is where it shows up, in one log line.
+        if (!img.save(path, "PNG")) {
+            nh_log("icons: '%s' -> QImage::save FAILED, falls back to its text badge", e->path);
+            continue;
+        }
+        // READ BACK. The point is not that save() returned true -- it is that
+        // the bytes on disk decode as an image, because decoding it is
+        // precisely what Qt's rich-text image handler will have to do from
+        // inside the QLabel, and a file that does not decode there renders as
+        // nothing at all with no diagnostic anywhere.
+        QImage back(path);
+        if (back.isNull()) {
+            nh_log("icons: '%s' -> written but does NOT load back, falls back to its text badge", e->path);
+            continue;
+        }
+        // The ACTUAL dimensions, from the file, not NF_ICON_PX assumed -- see
+        // nf_icon_width_px for why the elision below depends on this being
+        // measured rather than believed.
+        e->w  = back.width();
+        e->h  = back.height();
+        e->ok = true;
+        ok++;
+        nh_log("icons: '%s' -> wrote and loaded back %dx%d", e->path, e->w, e->h);
+    }
+
+    // The negative control, read LAST so it sits at the end of the block in
+    // the log. If this ever says LOADED, the five lines above prove nothing:
+    // something is resolving paths we never wrote, and "it loaded back" would
+    // then be a statement about that something rather than about our PNGs.
+    QImage control(QStringLiteral(NF_ICON_FILE_CONTROL));
+    nh_log("icons: control '%s' -> %s", NF_ICON_FILE_CONTROL,
+           control.isNull() ? "NULL, as required" : "LOADED -- the read-backs above prove nothing");
+
+    nh_log("icons: %d of %d drawn and verified (%dpx square, %dpx stroke, in %s)",
+           ok, NF_ICON_FILE_COUNT, NF_ICON_PX, NF_ICON_STROKE_PX, NF_ICON_DIR);
+}
+
+// The DEGRADED fallback: what a row shows when its PNG could not be written
+// or would not load back. These are the badges .pdf and unknown used before
+// this file drew its own icons, extended to the other three kinds so that
+// every kind has an answer -- a folder row losing its icon must not lose its
+// marker (it also still carries the trailing "/", which is the real one).
+//
+// Built in TWO forms in one place, so the pair can never drift: rich text
+// collapses runs of whitespace, so the markup form needs entities, while
+// QFontMetrics measures plain text, so the measured form needs real spaces.
+// The markup form is DERIVED from the plain one by substitution rather than
+// written out a second time -- "[ ? ]" is the only badge where the two differ
+// at all, and it is exactly the kind of pair that gets edited on one side.
+// All five are five characters wide, so the labels after them line up.
+static void nf_icon_badge(nf_icon_kind kind, QString *markup, QString *plain) {
+    char const *text = NULL;
+    switch (kind) {
+        case NF_ICON_FOLDER:  text = "[DIR]"; break;
+        case NF_ICON_BOOK:    text = "[EPB]"; break;
+        case NF_ICON_COMIC:   text = "[CMC]"; break;
+        case NF_ICON_PDF:     text = "[PDF]"; break;
+        case NF_ICON_UNKNOWN:
+        default:              text = "[ ? ]"; break;
+    }
+    QString t = QString::fromLatin1(text);
+    if (plain)
+        *plain = t + QLatin1Char(' ');
+    if (markup)
+        *markup = QString(t).replace(QLatin1Char(' '), QStringLiteral("&nbsp;"))
+                + QStringLiteral("&nbsp;");
 }
 
 // The leading markup for one row, separator included, so the row loop never
 // has to know which kinds render as an image and which as text.
-//
-// pdf and unknown are TEXT BADGES, not images: Nickel's resource table holds
-// no PDF icon and no generic-document icon anywhere (checked against the
-// firmware, not assumed), and borrowing an unrelated pictogram for a PDF is
-// worse than three unmistakable letters. The resulting mixed look -- images on
-// some rows, letters on others -- is accepted for this pass; the alternative
-// is drawing every row into a QPixmap ourselves, which is a bigger job than
-// the defect warrants. Both badges are five characters wide so the labels
-// after them still line up with each other.
 static QString nf_icon_markup(nf_icon_kind kind) {
-    nf_probe_icon_resources();
+    nf_icons_generate();
 
-    char const *res = NULL;
-    switch (kind) {
-        case NF_ICON_FOLDER: res = NF_ICON_FOLDER_RES; break;
-        case NF_ICON_BOOK:   res = NF_ICON_BOOK_RES;   break;
-        case NF_ICON_COMIC:  res = NF_ICON_COMIC_RES;  break;
-        case NF_ICON_PDF:    return QStringLiteral("[PDF]&nbsp;");
-        // Unreachable while nf_is_book_name gates every file row on the same
-        // allowlist nf_icon_kind_for reads (nffmt.h says so on its own side of
-        // the boundary too), and answered anyway rather than left to fall off
-        // the end: a "?" badge is what a format added to NF_EXTS but not to
-        // the icon map should look like, not a missing icon.
-        case NF_ICON_UNKNOWN:
-        default:             return QStringLiteral("[&nbsp;?&nbsp;]&nbsp;");
+    nf_icon_file const *e = nf_icon_entry(kind);
+    if (e && e->ok) {
+        // "file://" + an absolute path, NOT the bare path. Both can work:
+        // QTextDocument::loadResource has a last-resort branch that stamps a
+        // file scheme onto a scheme-less relative URL when the document's own
+        // base URL is empty. But that branch depends on the document's base
+        // URL staying empty, which is a QLabel internal we do not own, and
+        // an explicit scheme needs none of it -- QUrl::toLocalFile() answers
+        // directly. There is no reason to route this through a fallback.
+        //
+        // WIDTH AND HEIGHT are the dimensions read back off the FILE
+        // (nf_icons_generate), so the <img> box is a number this code
+        // measured rather than one it assumed -- and it is the same number
+        // nf_icon_width_px charges the elision below, which is the only way
+        // those two can agree.
+        //
+        // &nbsp; rather than a plain space for the separator, here and in the
+        // badges above: this string is rich text by the time QLabel sees it,
+        // and HTML collapses runs of whitespace.
+        return QStringLiteral("<img src=\"file://%1\" width=\"%2\" height=\"%3\">&nbsp;")
+                   .arg(QString::fromLatin1(e->path)).arg(e->w).arg(e->h);
     }
-    // &nbsp; rather than a plain space for the separator, here and in the two
-    // badges above: this string is rich text by the time QLabel sees it, and
-    // HTML collapses runs of whitespace.
-    return QStringLiteral("<img src=\"%1\" height=\"%2\">&nbsp;")
-               .arg(QString::fromLatin1(res)).arg(NF_ICON_PX);
+
+    QString badge;
+    nf_icon_badge(kind, &badge, NULL);
+    return badge;
 }
 
 // --- row label elision -------------------------------------------------
@@ -711,22 +1038,28 @@ static int nf_row_width_px(N3Dialog *dialog, QLayout *layout, bool *measured, in
 // what is actually left. Without this the elision is off by the icon on every
 // single row.
 //
-// The two text badges are measured exactly -- they are text, in this row's own
-// font, so QFontMetrics answers precisely. The image icons are ESTIMATED at
-// NF_ICON_PX, i.e. their forced height used as a stand-in for their rendered
-// width: <img height=N> with no width scales by the resource's own aspect
-// ratio, and those aspect ratios are exactly what is not yet known for the
-// arrow (nf_probe_icon_resources logs them; the book and comic icons measured
-// square, 50x50 and 80x80, for which this stand-in is exact). Square or
-// taller-than-wide makes it an over-estimate, which errs toward eliding a few
-// characters early rather than toward running off the edge again.
+// The image icons report their ACTUAL width, read back off the PNG this file
+// wrote (nf_icons_generate), and no longer NF_ICON_PX standing in for it. The
+// two happen to be equal today -- every icon in the set is drawn square at
+// NF_ICON_PX -- and the point is that nothing here DEPENDS on that: change a
+// shape's canvas and the elision follows it, with no second place to remember
+// to update. That stand-in was measurably wrong before this set existed: the
+// borrowed folder arrow was 15x26, so at height=40 it rendered ~23 px wide
+// and this function charged 40, over-reserving ~17 px on every folder row.
+//
+// The two-form badge (nf_icon_badge) is measured EXACTLY, in this row's own
+// font, because it is text -- which is also why the plain form exists at all.
 static int nf_icon_width_px(nf_icon_kind kind, QFontMetrics const &fm) {
-    switch (kind) {
-        case NF_ICON_PDF:     return fm.width(QStringLiteral("[PDF] "));
-        case NF_ICON_UNKNOWN: return fm.width(QStringLiteral("[ ? ] "));
-        // Image icons plus nf_icon_markup's own trailing &nbsp; separator.
-        default:              return NF_ICON_PX + fm.width(QLatin1Char(' '));
-    }
+    nf_icons_generate();
+
+    nf_icon_file const *e = nf_icon_entry(kind);
+    if (e && e->ok)
+        // Plus nf_icon_markup's own trailing &nbsp; separator.
+        return e->w + fm.width(QLatin1Char(' '));
+
+    QString badge;
+    nf_icon_badge(kind, NULL, &badge);
+    return fm.width(badge);
 }
 
 // Builds a fresh content widget (rows for `path`'s own directory listing)
@@ -794,7 +1127,7 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
     // nf_row_width_px for both paths and why the dialog is what gets read.
     //
     // Logged ONCE PER NAVIGATION rather than once per process (the way
-    // nf_probe_icon_resources is) precisely BECAUSE the answer changes: the
+    // nf_icons_generate is) precisely BECAUSE the answer changes: the
     // first listing is built before pushView has sized the dialog, so it is
     // always the fallback, and a once-per-process log would therefore only
     // ever record the fallback and never the real measurement. One line per
@@ -1090,11 +1423,16 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
         if (r.isDir) {
             // A folder gets a trailing "/" as well as the folder icon. KEPT
             // rather than replaced by the icon, even though the two now say
-            // the same thing: the icon depends on Nickel's resource table
-            // resolving from inside this library -- that is the whole reason
-            // nf_probe_icon_resources exists -- and if it does not resolve,
-            // this one plain ASCII character is the only folder/file marker
-            // left. Same reasoning as the [not in library] text below: the
+            // the same thing: the icon depends on a PNG this file drew,
+            // wrote to /tmp and loaded back -- that is the whole reason
+            // nf_icons_generate verifies rather than assumes -- and if any
+            // step of that failed, this one plain ASCII character is the
+            // only folder/file marker left that does not depend on it (the
+            // "[DIR]" badge nf_icon_badge falls back to depends on nothing
+            // either, but both together is the point: a folder row must
+            // never be mistakable for a file row, which is the defect this
+            // whole icon feature exists to end).
+            // Same reasoning as the [not in library] text below: the
             // text carries the meaning and the picture is the addition, never
             // the other way round. A folder never carries a progress marker
             // either -- there is no Volume for one, so r.percentRead/
