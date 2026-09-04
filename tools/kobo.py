@@ -223,21 +223,76 @@ def main():
         text, _ = do_ssh(sys.argv[2])
         print(text)
     elif verb == "push":
-        text, code = do_scp(sys.argv[2], "root@%s:%s" % (config()["host"], sys.argv[3]))
+        # `scp` writes the destination with O_TRUNC: same inode, truncated
+        # and rewritten in place. Nickel keeps libnfolders.so memory-mapped
+        # for as long as it runs, so an in-place rewrite invalidates pages
+        # out from under a live mapping -- the next access to a page Nickel
+        # had not already faulted in raises SIGBUS. This is a HYPOTHESIS,
+        # not a measurement: on 2026-09-03 the owner pushed, then interacted
+        # with the device (opened NickelMenu) before rebooting, and the
+        # device restarted itself; the crash log is a RAM ring buffer and
+        # the backtrace was gone by the time anyone looked. It fits, but
+        # nothing pinned SIGBUS specifically. The fix holds regardless of
+        # which failure mode it was, so it is applied on the hypothesis.
+        #
+        # Fix: scp to a temp name, then `mv` it over the real path on the
+        # device. `mv` within one filesystem is `rename(2)`, which swaps
+        # the directory entry to a NEW inode atomically -- Nickel's existing
+        # mapping still points at the OLD inode, which stays valid and
+        # unmodified until Nickel is next restarted. This is exactly the
+        # semantics wanted: the running process keeps working off the old
+        # library, and the new one is only picked up on the next load.
+        #
+        # The temp name has to be a sibling of the destination, NOT under
+        # /tmp -- /tmp is tmpfs, a different filesystem from
+        # /usr/local/Kobo, and `mv` across filesystems falls back to a copy
+        # (open/write/unlink), which is exactly the non-atomic overwrite
+        # this is trying to avoid.
+        dst_dir, dst_base = sys.argv[3].rsplit("/", 1) if "/" in sys.argv[3] else (".", sys.argv[3])
+        tmp = "%s/%s.tmp-%d" % (dst_dir, dst_base, os.getpid())
+        text, code = do_scp(sys.argv[2], "root@%s:%s" % (config()["host"], tmp))
         print(text)
         if code != 0:
-            # Observed: `scp: /usr/local/Kobo/imageformats/libnfolders.so:
+            # Observed shape (before this fix, for the old direct-overwrite
+            # push): `scp: /usr/local/Kobo/imageformats/libnfolders.so:
             # Read-only file system`, printed to `text` above, and the OLD
             # code still exited 0 -- so the push "succeeded," the next
             # reboot ran whatever .so was already on the device, and
             # whatever was learned from testing it was about stale code.
             # scp's own exit status is what actually says whether the file
             # landed; trust it, not the absence of a caught exception.
-            sys.exit("push failed (scp exit %s)" % code)
+            # /usr/local/Kobo has been observed read-only at least once, so
+            # a failure to even create the temp file lands here too -- fail
+            # loudly rather than silently falling back to overwriting dst.
+            do_ssh("rm -f %s" % tmp)  # best-effort; scp may have left a partial file
+            sys.exit("push failed: could not stage %s (scp exit %s)" % (tmp, code))
+        # chmod before the rename: the mode has to be right the instant the
+        # new inode becomes visible at dst, and scp does not reliably
+        # preserve it. The library is pushed 0755 (rwxr-xr-x); mirror
+        # whatever mode dst already has if that is ever not what's wanted.
+        text, code = do_ssh(
+            "chmod 755 %s && mv -f %s %s" % (tmp, tmp, sys.argv[3]))
+        if text.strip():
+            print(text)
+        if code != 0:
+            # The rename didn't happen (or the chmod before it didn't) --
+            # dst is untouched, which is the point, but the temp file must
+            # not be left behind: a stray *.tmp-<pid> sitting in
+            # imageformats/ is a file Qt may try to load as a plugin.
+            do_ssh("rm -f %s" % tmp)
+            sys.exit("push failed: could not install %s over %s (exit %s): %s"
+                      % (tmp, sys.argv[3], code, text.strip()))
     elif verb == "pull":
         # Same failure shape as push (silent partial/failed transfer,
         # exit 0), fixed the same way -- pull just runs less often, so it
         # had not yet been caught misreporting on a device session.
+        #
+        # NOT given push's atomic-rename treatment: the O_TRUNC hazard is
+        # about overwriting a file a RUNNING PROCESS has mapped, and pull's
+        # destination is a path on this dev host (e.g. libnickel.so.1.0.0,
+        # staged for offline disassembly), which nothing here has mapped.
+        # Worst case on a failed pull is a truncated local file, caught by
+        # the exit-code check below same as always.
         text, code = do_scp("root@%s:%s" % (config()["host"], sys.argv[2]), sys.argv[3])
         print(text)
         if code != 0:

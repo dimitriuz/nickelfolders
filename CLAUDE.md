@@ -161,6 +161,19 @@ see `DEVICE.local.md`.
   is the fast path. `KoboRoot.tgz` into `/mnt/onboard/.kobo/` is the route a
   *user* takes (Nickel extracts and deletes it on boot); it costs the same
   reboot, so prefer the direct push while developing.
+- **Don't interact with the device between a push and the restart that picks
+  it up.** `push` now lands the new file via `scp` to a temp name followed by
+  an atomic `mv`, specifically so Nickel's live mapping of the *old*
+  `libnfolders.so` is never rewritten in place — but until Nickel actually
+  restarts, it is still running off that old inode, and nothing has told it
+  to let go. The one time this went wrong (2026-09-03, before the atomic
+  push existed): a push, then poking NickelMenu before the reboot, then the
+  device restarted itself. The RAM ring-buffer log was gone by the time
+  anyone looked, so what actually killed Nickel is a HYPOTHESIS, not a
+  measurement — `scp`'s old in-place `O_TRUNC` overwrite invalidating pages
+  of a mapping Nickel still had open, raising SIGBUS on next fault, fits and
+  is the reason for the fix above, but nothing pinned it beyond that. Treat
+  push-then-reboot as one uninterrupted unit regardless.
 - **`/tmp` is tmpfs and clears on reboot.** Anything staged there — including
   `tools/nftest.sh` — has to be re-pushed after every reboot. This has already
   wasted a cycle.
