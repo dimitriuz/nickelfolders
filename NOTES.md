@@ -2541,3 +2541,76 @@ steven l. kent - the ultimate history of video games, volume 2 - 2021.kepub.epub
 `steven l. kent - the ult...lume 2 - 2021.kepub.epub`. They elide at
 DIFFERENT points, which is correct rather than sloppy: the first carries a
 ` (52%)` suffix and so has less room for its name. Nothing clips.
+
+## Task 14: device results for the two date sort keys
+
+Verified on hardware 2026-09-04, firmware 4.38.23684, Nickel PID 9079,
+unchanged across the run with no crash traces. That mattered more here than
+usual: `___DateLastRead` at `Volume::d()+40` is a **`QByteArray`, i.e. a
+pointer**, unlike the `___PercentRead` int at `+140` that was already
+shipping — so a wrong offset would have been DEREFERENCED rather than
+merely read as a nonsense number. It did not crash, and the five
+independent sightings that established `+40` (against three for `+140`)
+held up.
+
+### The open question is answered: `DateAdded` IS populated for sideloaded rows
+
+This was the one thing that could have made the whole feature silently
+fake, and it could only be answered on-device:
+
+```
+dates: raw keys added='2026-07-18T20:11:18Z' lastRead='2026-09-03T10:13:04Z'
+       (empty means no date in the row)
+       for contentId 'file:///mnt/onboard/steven l. kent - the ultimate
+       history of video games, volume 1 - 2001.kepub.epub'
+```
+
+Both keys are populated, in ISO-8601, for a **sideloaded** book. So sorting
+on them is real. Had `added` come back empty, every row would have received
+an identical key and a stable sort would have silently reproduced name
+order — no error, no log line, and a feature that looks like it works. The
+raw-bytes line exists solely to make that case detectable.
+
+The `lastRead` value is also a sanity check in its own right:
+`2026-09-03T10:13:04Z` is the previous day's rung-1 session, and that book
+sits at 52%.
+
+### The non-vacuous control, and why this folder
+
+`sort: read v` (descending) in `books/Comics/English/Fullmetal Alchemist
+(v01-v27) (2005-2011) (Digital)`, 27 entries:
+
+```
+v10 (2006)  (1%)      <- has reading progress
+v02 (2005)
+v03 (2005)
+v27 (2011)
+v26 (2011)  [not in library]
+v25 (2011)
+v24 (2011)
+... v19
+```
+
+**Exactly three rows precede a uniform block**, and they are the three with
+reading history. The remaining 24 have no `___DateLastRead`, so they tie and
+fall back to input order — which was name-ascending, hence the reversed
+`v27 -> v19` run under a descending sort. Ties falling back to input order
+is the stable sort behaving as designed, not a defect.
+
+Why this is the control the `___SyncTime` trap demands: both of Nickel's
+date sorts fall back to `___SyncTime` for sideloaded content, so for a
+never-opened sideloaded book **the two keys coincide exactly**. A folder of
+never-opened books would have shown "recently added" and "recently read" in
+identical order and proved nothing. This folder was chosen because the
+read-state arithmetic (Task 13) had already established it holds **3
+in-progress books** — so the prediction was not merely "the order will
+differ" but *which rows will move*, which is a far stronger claim to test.
+
+And the two measurements agree independently: Task 13's filter arithmetic
+said 3 in progress; this sort floats exactly 3 rows. Neither was derived
+from the other.
+
+Negative control satisfied by construction: name-ascending starts `v01`,
+name-descending starts `v27`, and neither puts `v10` first. So the observed
+order cannot be name order in disguise, which was the specific failure mode
+this check was designed to exclude.
