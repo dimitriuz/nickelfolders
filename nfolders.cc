@@ -1,5 +1,5 @@
 // NickelFolders -- rungs 1 and 2, plus the first milestone of our own
-// controller and view.
+// interactive screen.
 //
 // Rung 1's whole job was answering whether an injected mod can hand an
 // arbitrary ContentID to Nickel's stock reader and have the book open the
@@ -11,13 +11,15 @@
 // mod hooks nothing. Both are proven on hardware but the borrowed controller
 // cannot show folders, our own label-shortening, or a greyed "not in the
 // library" row (it renders every row from a Volume's own metadata) -- so a
-// new milestone (nfview.cc) builds a deliberately trivial screen of our
-// OWN, on our OWN compiler-generated controller class, to prove that shim on
-// hardware before anything real rides on it.
+// new milestone (nfview.cc) builds a deliberately trivial screen of our OWN
+// out of Nickel's OWN dialog chrome and tappable row widget
+// (N3DialogFactory/N3Dialog/TouchLabel -- NOTES.md, "Task 8: touch input
+// archaeology"), to prove taps and back navigation on hardware before
+// anything real rides on it.
 //
 // The libnickel call sequences live in nfnickel.cc (book-opening, and the
 // data-source chain rung 2's screen needs), nfbrowser.cc (constructing and
-// pushing the BORROWED controller), and nfview.cc (the shim controller and
+// pushing the BORROWED controller), and nfview.cc (the native-dialog screen and
 // its own trivial view), along with the inotify watch machinery
 // (nfnickel.cc). This file is left with the three trigger protocols and the
 // NickelHook glue.
@@ -215,7 +217,7 @@ static void nf_on_trigger_view() {
         close(fd);
     unlink(NF_TRIGGER_VIEW);
 
-    nh_log("trigger: showing the shim controller's native view");
+    nh_log("trigger: showing the native-dialog view");
     nf_browser_show();
 }
 
@@ -231,13 +233,10 @@ static int nf_init() {
         nh_log("init: a libnickel symbol did not resolve; book-opening is inert until this is fixed");
     if (!nf_browser_resolve())
         nh_log("init: a libnickel symbol did not resolve; the browser screen is inert until this is fixed");
-    // A third, independent gate (nfnickel.h/.cc), for the shim controller
-    // (nfview.cc) only -- logged here the same way as the two above, but
-    // this is ONLY the symbol-resolution check: the deeper runtime
-    // write-pattern proof (nf_view_layout_check, nfview.cc) runs lazily,
-    // the first time nf_browser_show() is actually called, not here.
-    if (!nf_view_resolve())
-        nh_log("init: a libnickel symbol did not resolve; the shim controller is inert until this is fixed");
+    // A fourth, independent gate (nfnickel.h/.cc), for the native-dialog
+    // route (nfview.cc) only.
+    if (!nf_native_view_resolve())
+        nh_log("init: a libnickel symbol did not resolve; the native-dialog view is inert until this is fixed");
 
     // All three trigger files live directly in /tmp, so the second and
     // third nf_watch_init calls below reuse the first's inotify
@@ -263,14 +262,14 @@ static int nf_init() {
 
     bool viewReady = nf_watch_init(NF_TRIGGER_VIEW, &nf_on_trigger_view) == 0;
     if (!viewReady)
-        nh_log("init: native-view-trigger watch is not usable; the shim controller is inert (see 'watch:' lines above for why)");
+        nh_log("init: native-view-trigger watch is not usable; the native-dialog view is inert (see 'watch:' lines above for why)");
 
     if (openReady)
         nh_log("init: ready, echo a ContentID into %s", NF_TRIGGER);
     if (showReady)
         nh_log("init: ready, touch %s to show the browser screen", NF_TRIGGER_SHOW);
     if (viewReady)
-        nh_log("init: ready, touch %s to show the shim controller's native view", NF_TRIGGER_VIEW);
+        nh_log("init: ready, touch %s to show the native-dialog view", NF_TRIGGER_VIEW);
     return 0;
 }
 

@@ -62,37 +62,25 @@ static Device        *(*Device__getCurrentDevice)(void);
 static QString const *(*Device__getDbName)(Device const *_this);
 
 // NOT static, unlike everything below this point -- nfbrowser.cc calls
-// these directly to construct and push the real controller, the same way
-// it used to call AbstractController__ctor directly before this rung
-// replaced that plan. nfnickel.h has the full rationale for each, including
-// NF_BROWSER_USE_ARTICLE_LIST -- the device-run finding that made
-// ArticleListLibraryController the one actually used, with
-// QuickAccessLibraryController kept resolved only for comparison.
+// these directly to construct and push the real controller. nfnickel.h has
+// the full rationale for each, including NF_BROWSER_USE_ARTICLE_LIST -- the
+// device-run finding that made ArticleListLibraryController the one
+// actually used, with QuickAccessLibraryController kept resolved only for
+// comparison.
 void  *(*MainWindowController__sharedInstance)(void);
 void   (*MainWindowController__push)(MainWindowController *_this, void *controller, bool animate);
 void   (*QuickAccessLibraryController__ctor)(void *_this, void const *source);
 void   (*ArticleListLibraryController__ctor)(void *_this, void const *source);
 
-// The shim controller's nine raw AbstractController symbols -- see
-// nfnickel.h's own comment on each for what they are and why they are
-// still resolved by name rather than assumed. NOT static, same reason as
-// the four above: nfview.cc calls all nine directly.
-void   (*AbstractController__ctor)(void *_this);
-void   (*AbstractController__dtor1)(void *_this);
-void   (*AbstractController__size)(void *sretQSize, void const *_this);
-void   (*AbstractController__viewWillAppear)(void *_this);
-void   (*AbstractController__viewWillDisappear)(void *_this);
-void   (*AbstractController__viewWillBeDestroyed)(void *_this);
-int    (*AbstractController__allowedOrientations)(void const *_this);
-int    (*AbstractController__navSection)(void const *_this);
-// _ZTV18AbstractController itself -- a DATA symbol (`nm -D` type D), not a
-// function pointer, unlike every other entry in this table. See
-// nfnickel.h's own comment for why nf_view_layout_check() (nfview.cc)
-// needs it: reading the LIVE vtable's own slots is what turns "these six
-// symbols resolved" into "these six symbols are at the SLOT this shim
-// assumes," the non-vacuous check a firmware with a shifted vtable
-// (a virtual inserted or removed before size()) needs to be caught by.
-void   *AbstractController__vtable;
+// The native-dialog route's own symbols (nfnickel.h has the full derivation
+// for each) -- NOT static, same reason as the four above: nfview.cc calls
+// all of them directly.
+void   (*MainWindowController__pushView)(MainWindowController *_this, QWidget *view);
+void   (*MainWindowController__popView)(MainWindowController *_this, QWidget *view);
+N3Dialog *(*N3DialogFactory__getDialog)(QWidget *content, bool fullScreenIdk);
+void   (*N3Dialog__setTitle)(N3Dialog *_this, QString const &title);
+void   (*N3Dialog__enableBackButton)(N3Dialog *_this, bool enable);
+void   (*TouchLabel__ctor)(TouchLabel *_this, QWidget *parent, QFlags<Qt::WindowType> flags);
 
 // Nickel's classes stay opaque, same discipline as Volume/ReadBookActionProxy
 // above: these are the four classes the rung 2 data-source chain constructs,
@@ -163,15 +151,12 @@ struct nh_dlsym NFNickelDlsym[] = {
     {.name = "_ZN20MainWindowController4pushEP18AbstractControllerb", .out = nh_symoutptr(MainWindowController__push), .desc = "MainWindowController::push",           .optional = true},
     {.name = "_ZN28QuickAccessLibraryControllerC1E14QSharedPointerI17LibraryDataSourceI6VolumeEE", .out = nh_symoutptr(QuickAccessLibraryController__ctor), .desc = "QuickAccessLibraryController::QuickAccessLibraryController", .optional = true},
     {.name = "_ZN28ArticleListLibraryControllerC1E14QSharedPointerI17LibraryDataSourceI6VolumeEE", .out = nh_symoutptr(ArticleListLibraryController__ctor), .desc = "ArticleListLibraryController::ArticleListLibraryController", .optional = true},
-    {.name = "_ZN18AbstractControllerC2Ev",                  .out = nh_symoutptr(AbstractController__ctor),        .desc = "AbstractController::AbstractController (base object ctor)", .optional = true},
-    {.name = "_ZN18AbstractControllerD1Ev",                  .out = nh_symoutptr(AbstractController__dtor1),       .desc = "AbstractController::~AbstractController (complete object dtor)", .optional = true},
-    {.name = "_ZN18AbstractController4sizeEv",               .out = nh_symoutptr(AbstractController__size),        .desc = "AbstractController::size",               .optional = true},
-    {.name = "_ZN18AbstractController14viewWillAppearEv",    .out = nh_symoutptr(AbstractController__viewWillAppear), .desc = "AbstractController::viewWillAppear",  .optional = true},
-    {.name = "_ZN18AbstractController17viewWillDisappearEv", .out = nh_symoutptr(AbstractController__viewWillDisappear), .desc = "AbstractController::viewWillDisappear", .optional = true},
-    {.name = "_ZN18AbstractController19viewWillBeDestroyedEv", .out = nh_symoutptr(AbstractController__viewWillBeDestroyed), .desc = "AbstractController::viewWillBeDestroyed", .optional = true},
-    {.name = "_ZNK18AbstractController19allowedOrientationsEv", .out = nh_symoutptr(AbstractController__allowedOrientations), .desc = "AbstractController::allowedOrientations", .optional = true},
-    {.name = "_ZNK18AbstractController10navSectionEv",       .out = nh_symoutptr(AbstractController__navSection),  .desc = "AbstractController::navSection",         .optional = true},
-    {.name = "_ZTV18AbstractController",                     .out = nh_symoutptr(AbstractController__vtable),      .desc = "AbstractController's own vtable (data symbol)", .optional = true},
+    {.name = "_ZN20MainWindowController8pushViewEP7QWidget", .out = nh_symoutptr(MainWindowController__pushView), .desc = "MainWindowController::pushView",         .optional = true},
+    {.name = "_ZN20MainWindowController7popViewEP7QWidget",  .out = nh_symoutptr(MainWindowController__popView),   .desc = "MainWindowController::popView",          .optional = true},
+    {.name = "_ZN15N3DialogFactory9getDialogEP7QWidgetb",    .out = nh_symoutptr(N3DialogFactory__getDialog),      .desc = "N3DialogFactory::getDialog",             .optional = true},
+    {.name = "_ZN8N3Dialog8setTitleERK7QString",              .out = nh_symoutptr(N3Dialog__setTitle),              .desc = "N3Dialog::setTitle",                     .optional = true},
+    {.name = "_ZN8N3Dialog16enableBackButtonEb",              .out = nh_symoutptr(N3Dialog__enableBackButton),      .desc = "N3Dialog::enableBackButton",             .optional = true},
+    {.name = "_ZN10TouchLabelC1EP7QWidget6QFlagsIN2Qt10WindowTypeEE", .out = nh_symoutptr(TouchLabel__ctor),       .desc = "TouchLabel::TouchLabel",                 .optional = true},
     {.name = "_ZN7QVectorI6VolumeE6appendERKS0_",             .out = nh_symoutptr(QVectorVolume__append),           .desc = "QVector<Volume>::append",                .optional = true},
     {.name = "_ZN7QVectorI6VolumeED1Ev",                      .out = nh_symoutptr(QVectorVolume__dtor),             .desc = "QVector<Volume>::~QVector",              .optional = true},
     {.name = "_ZN20InMemoryDataProviderI6VolumeEC1ERK7QVectorIS0_E", .out = nh_symoutptr(InMemoryDataProvider__ctor), .desc = "InMemoryDataProvider<Volume>::InMemoryDataProvider", .optional = true},
@@ -216,30 +201,18 @@ bool nf_browser_resolve(void) {
 #endif
 }
 
-// A fourth independent gate, for the shim controller (nfview.cc) only --
-// see nfnickel.h's comment on AbstractController__ctor/__dtor1/the six
-// forwarded slots/__vtable for why this stays disjoint from the other
-// three (nf_nickel_resolve, nf_browser_resolve) and why ALL NINE symbols
-// gate together rather than degrading slot-by-slot: the six forwarded
-// slots are not optional-to-behaviour the way most .optional entries in
-// this project are (nfnickel.h's own comment has the full argument --
-// size() falling back to a placeholder can lay the view out to nothing),
-// and __vtable is what makes the real, non-vacuous runtime check possible
-// at all. This checks only that the SYMBOLS resolved; it does not run the
-// deeper runtime write-pattern/vtable-slot check (nf_view_layout_check,
-// nfview.cc) -- that needs to call through the ctor and read through
-// __vtable, which this function deliberately does not do, matching
-// nf_nickel_resolve/nf_browser_resolve's own pattern of being a cheap,
-// side-effect-free predicate nf_init can log at boot.
-bool nf_view_resolve(void) {
-    return AbstractController__ctor && AbstractController__dtor1 &&
-           AbstractController__size &&
-           AbstractController__viewWillAppear &&
-           AbstractController__viewWillDisappear &&
-           AbstractController__viewWillBeDestroyed &&
-           AbstractController__allowedOrientations &&
-           AbstractController__navSection &&
-           AbstractController__vtable;
+// A fourth independent gate, for the native-dialog route (nfview.cc) only
+// -- see nfnickel.h's own comment on each of these six for what they are.
+// Kept disjoint from the other three (nf_nickel_resolve, nf_browser_resolve)
+// for the same reason those two stay disjoint from each other: a firmware
+// that renames, say, TouchLabel's constructor must not also disable
+// book-opening or the borrowed-controller browser screen. A cheap,
+// side-effect-free predicate nf_init can log at boot, matching
+// nf_nickel_resolve/nf_browser_resolve's own pattern.
+bool nf_native_view_resolve(void) {
+    return MainWindowController__sharedInstance && MainWindowController__pushView &&
+           MainWindowController__popView && N3DialogFactory__getDialog &&
+           N3Dialog__setTitle && N3Dialog__enableBackButton && TouchLabel__ctor;
 }
 
 // dbName is a Repository cache-partition key. Device::calcDbName compares the

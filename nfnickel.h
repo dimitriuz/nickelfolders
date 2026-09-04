@@ -8,6 +8,7 @@
 
 #include <QString>
 #include <QStringList>
+#include <QWidget> // TouchLabel's parent parameter, and QFlags<Qt::WindowType> (qnamespace.h, pulled in transitively) for its ctor's own signature
 
 #include <NickelHook.h>
 
@@ -66,26 +67,18 @@ bool nf_open_book_staged(QString const& contentId, QString const& dbName, int st
 // house rule ("Nickel's classes stay opaque") -- typedef + explicitly
 // written call signatures, never a real C++ class.
 //
-// AbstractController USED to be typedef'd void here too, for exactly the
-// same reason -- but nfview.cc's shim controller now needs a REAL class
-// literally NAMED AbstractController, at global scope, so that
-// MainWindowController::push's internal `__dynamic_cast(controller,
-// &_ZTI18AbstractController, &_ZTI7QObject, -2)` cross-cast finds a
-// matching type NAME in our object's own RTTI (Itanium ABI: the src_type
-// lookup is a `type_info::operator==`, which falls back to a byte-for-byte
-// `strcmp` of the mangled name when pointer identity fails across DSOs --
-// see nfview.cc's own header comment for the full derivation, and the
-// review that caught this: a shim class named anything else compiles,
-// links, and pushes, but the cast returns NULL, `topController()` stays
-// NULL, and Nickel never calls QObject::setParent on it either). That real
-// class can only live where it is actually defined (nfview.cc), so this
-// header no longer names a type here at all: every opaque use below that
-// used to say `AbstractController*` now says `void*` -- these call sites
-// (MainWindowController::push, QuickAccessLibraryController__ctor,
-// ArticleListLibraryController__ctor) never dereferenced an
-// AbstractController* as anything but an opaque address anyway, so nothing
-// about the ACTUAL signature changes, only the type NAME this header uses
-// to spell it.
+// AbstractController was, briefly, typedef'd as a REAL, compiler-generated
+// C++ class here instead of void (nfview.cc's now-deleted shim), the
+// project's one SANCTIONED exception to this rule -- needed because
+// MainWindowController::push(AbstractController*, bool) performs a genuine
+// Itanium ABI cross-cast whose src_type lookup is a mangled-NAME comparison,
+// which only a real, compiler-generated RTTI hierarchy can satisfy. Task 8's
+// touch-input archaeology (NOTES.md) replaced that whole route:
+// N3DialogFactory::getDialog + MainWindowController::pushView (below) needs
+// no controller, no cross-cast, and no class sharing a Nickel name at all --
+// so the exception is retired along with the code it excused, and every
+// opaque use below is a plain `void*`/typedef, same as everywhere else in
+// this project.
 typedef void MainWindowController;
 
 // MainWindowController::sharedInstance() -- a lazily-constructed singleton
@@ -149,158 +142,85 @@ extern void (*QuickAccessLibraryController__ctor)(void *_this, void const *sourc
 // state, only `QObject::QObject` and its own field writes. No title
 // string, no extra QSharedPointer, no singleton read or write. `_this` is
 // `void*` for the same reason as QuickAccessLibraryController__ctor,
-// above -- see this header's own comment on why AbstractController is no
-// longer a type name declared here.
+// above -- neither ever dereferences its controller as anything but an
+// opaque address.
 extern void (*ArticleListLibraryController__ctor)(void *_this, void const *source /* QSharedPointer<LibraryDataSource<Volume> > const& */);
 
-// --- the shim controller's two raw AbstractController symbols -------------
+// --- the native-dialog route: N3Dialog, TouchLabel, MainWindowController's
+// pushView/popView ----------------------------------------------------------
 //
-// nfview.cc builds our OWN controller and view -- a SANCTIONED, narrow
-// exception to "Nickel's classes stay opaque" (see nfview.cc's own header
-// comment for the full argument and the three mitigations it carries). The
-// two symbols below are still resolved and called the project's usual way
-// -- an opaque, explicitly-written call signature, never a redeclared
-// method -- it is only nfview.cc's shim CLASS that is real C++, not these.
+// Task 8 (NOTES.md, "touch input archaeology, and a measured route to a
+// custom interactive screen") replaced the AbstractController shim with
+// this: Nickel's OWN dialog chrome and OWN tappable row widget, reached the
+// project's usual way -- opaque typedef, explicit call signature, every
+// entry .optional and NULL-gated. No cross-cast, no fabricated RTTI, no
+// class of ours sharing a Nickel name.
+
+typedef void N3Dialog;
+
+// N3DialogFactory::getDialog(QWidget *content, bool) -- STATIC (r0=content,
+// r1=bool, no `this`; NOTES.md, 0xead698, every PLT stub resolved). Builds a
+// FRESH N3Dialog with its own `operator new(68)` (measured at this exact
+// call site, confirmed independently for this task against the local
+// libnickel.so.1.0.0 -- we never allocate an N3Dialog ourselves), calls
+// N3Dialog::setContent(content) -- which REPARENTS content into the
+// dialog's own layout and calls content->show() -- and wires the dialog's
+// closeTapped() signal to MainWindowController::closeActiveN3Dialogs().
+// Returns the new N3Dialog* in r0, not by value.
 //
-// AbstractController::AbstractController(), the "base object constructor"
-// (C2Ev) variant -- what Nickel's OWN derived-controller code calls when
-// building an AbstractController AS A BASE SUBOBJECT (NOTES.md: `blx
-// 6a3708 -> _ZN18AbstractControllerC2Ev`, PasswordController/
-// HelpDialogController). C1Ev aliases the IDENTICAL address (0xad1334 on
-// 4.38.23684, confirmed nm -D --defined-only), so either name resolves the
-// same function; C2Ev is used because it is what real Nickel code calls for
-// this exact purpose. Measured to call nothing and write exactly 3 words --
-// this[+0]=vptr, this[+4]=0, this[+8]=0 (NOTES.md, "sizeof(AbstractController)
-// == 12 bytes") -- but resolved and called anyway, never assumed a no-op:
-// nf_view_layout_check() (nfview.cc) verifies those exact writes at RUNTIME,
-// against THIS firmware build, every time nf_browser_show() is first called,
-// rather than trusting this comment to still be true.
-extern void (*AbstractController__ctor)(void *_this);
+// What the `bool` means is NOT established (NOTES.md): it is forwarded
+// verbatim into N3Dialog's own constructor and never otherwise examined
+// inside getDialog. `true` is what NickelHardcover (MIT,
+// codeberg.org/StrayRose/NickelHardcover) passes, unexplained there too --
+// followed here as working prior art, not as an understood value.
+extern N3Dialog *(*N3DialogFactory__getDialog)(QWidget *content, bool fullScreenIdk);
+extern void      (*N3Dialog__setTitle)(N3Dialog *_this, QString const &title);
+extern void      (*N3Dialog__enableBackButton)(N3Dialog *_this, bool enable);
 
-// AbstractController::~AbstractController(), the COMPLETE OBJECT destructor
-// (D1Ev, 0xad1358 on 4.38.23684) -- deliberately NOT the deleting destructor
-// (D0Ev, 0xad1398), which additionally calls operator delete on `this` and
-// would double-free memory nfview.cc's shim manages itself (one
-// ::operator new(...) block backing the WHOLE shim object, not just its
-// AbstractController-shaped base).
+// MainWindowController::pushView(QWidget*) -- 0xea968c (NOTES.md). Distinct
+// from MainWindowController::push(AbstractController*, bool), above: this
+// sets NO objectName, does NOT touch the controller stack
+// (MainWindowController+60) at all, and just does `stack->addWidget(v);
+// stack->setCurrentWidget(v)` after closing any open touch menus -- which
+// is exactly why this route needs no controller and no cross-cast: nothing
+// here ever asks the pushed widget to BE one.
 //
-// Unlike the ctor above, this IS NOT a no-op -- disassembled for this task,
-// exactly per "resolve the real destructors by name too -- do not rely on
-// the zero slots" the earlier, abandoned hand-copied-vtable plan found
-// (NOTES.md, "The paragraph above was wrong, and the mistake is left in on
-// purpose"). D1Ev reads this[+4] (nfview.cc's nf_weak_d), atomically
-// decrements its first word (an ldrex/strex CAS loop -- the weakref
-// QBasicAtomicInt), and if that reaches zero, calls `operator delete` on it
-// (`blx 672404`, resolved with tools/plt.sh to `_ZdlPv`) -- EXACTLY
-// QWeakPointer<T>::~QWeakPointer()'s own documented logic
-// (qsharedpointer_impl.h: "if (d && !d->weakref.deref()) delete d"). So
-// this symbol is not merely defensive insurance -- it is the ONLY correct
-// way to tear down the this[+4]/this[+8] pair nf_load_view() (nfview.cc)
-// builds, and nfview.cc's own destructor calls it exactly once, never
-// duplicating the decrement/delete by hand when this resolved (doing both
-// would double-decrement, and potentially double-free, the same weakref).
-extern void (*AbstractController__dtor1)(void *_this);
+// popView(QWidget*) -- 0xea91e0 -- is the exact counterpart:
+// setVisible(false), deleteLater(), stack->removeWidget(v). It DESTROYS the
+// widget, so nothing pushed this way may be touched again after a pop.
+// N3Dialog's own backTapped() signal is not pre-wired to this (only
+// closeTapped() is, to closeActiveN3Dialogs() -- see getDialog above) --
+// wiring backTapped() to a popView call is this file's own job (nfview.cc).
+extern void (*MainWindowController__pushView)(MainWindowController *_this, QWidget *view);
+extern void (*MainWindowController__popView)(MainWindowController *_this, QWidget *view);
 
-// --- the shim controller's six OTHER AbstractController symbols -----------
+// TouchLabel -- the row widget this route uses for every tap target.
+// Opaque per house rule: `void`, not a redeclaration of TouchLabel's own
+// class. 132 bytes measured (NOTES.md, cross-checked against multiple
+// `operator new` call sites, not merely this constructor's own writes) at
+// `_ZN10TouchLabelC1EP7QWidget6QFlagsIN2Qt10WindowTypeEE`, 0xbbae3c on
+// 4.38.23684 -- confirmed present at that exact address against the local
+// libnickel.so.1.0.0 for this task. NickelHardcover calloc(1,128)s this
+// exact class on this exact firmware -- a live 4-byte heap overflow there,
+// per NOTES.md -- which is the concrete argument for re-measuring rather
+// than trusting even a working, shipped mod's own number: nfview.cc
+// allocates 256, not 132 and not 128.
 //
-// A compiler-generated shim (nfview.cc) means the COMPILER emits the
-// vtable, not a copy of Nickel's own -- so every slot AbstractController's
-// vtable carries is now OURS, and a slot this shim does not forward is
-// behaviour a real derived controller had that this one silently drops,
-// not a harmless placeholder. This is the direct consequence of moving off
-// the "hand-copy Nickel's vtable, only slot 8 is ours" plan the original
-// rung-2 attempt used: that plan got these six for free BY COPYING;
-// nothing here copies anything, so nothing here is free. Each was
-// disassembled independently for this task -- resolved by exact address
-// with `nm -D --defined-only`, then read instruction-by-instruction, per
-// CLAUDE.md's "Method: adding a new libnickel call" ("do not infer a
-// calling convention from the name" -- VolumeManager::getById's missing
-// `this` is what guessing here has cost before, NOTES.md).
-//
-// AbstractController::size() -- 0xad12ec. Writes QSize(-1,-1) -- Qt's own
-// "invalid size" sentinel, confirmed against this ARM sysroot's qsize.h
-// ("Q_DECL_CONSTEXPR inline QSize::QSize() : wd(-1), ht(-1) {}") -- through
-// r0, with `this` (r1) loaded but never dereferenced. r0 is a HIDDEN
-// RETURN BUFFER, not `this` doing double duty: this[+0]/this[+4] are the
-// vptr and the QWeakPointer `d` field this shim's own layout depends on
-// (NFAbstractControllerShim, nfview.cc), and a write there would corrupt
-// every controller of this shape on its very first size() call, which no
-// real base-class accessor would do. QSize has user-declared constructors
-// (qsize.h), which is what makes the ARM C++ ABI classify it as "not POD
-// for the purposes of calls" and return it indirectly regardless of its
-// 8-byte size -- stated here as the REASON the measurement makes sense,
-// not as the basis for the signature: the signature below is written from
-// the disassembly, the same discipline as VolumeManager::getById's own
-// hidden-buffer signature (nfnickel.cc).
-extern void (*AbstractController__size)(void *sretQSize, void const *_this);
+// Self-registers for Nickel's own tap-gesture pipeline INSIDE this
+// constructor (TouchLabel::initialize(), 0xbba540, NOTES.md) -- the entire
+// reason this route uses TouchLabel rather than a bare QWidget/QPushButton:
+// constructing one is the whole opt-in, nothing else to call.
+typedef void TouchLabel;
+extern void (*TouchLabel__ctor)(TouchLabel *_this, QWidget *parent, QFlags<Qt::WindowType> flags);
 
-// AbstractController::viewWillAppear/viewWillDisappear/viewWillBeDestroyed
-// -- 0xad1300, 0xad130c, 0xad1318. Measured, all three: a bare prologue
-// and epilogue with NOTHING between them -- true no-ops in the BASE
-// implementation, on THIS firmware. Forwarded anyway, not left as inert
-// stubs matching that measurement: a firmware where these stop being
-// no-ops would silently start dropping behaviour again if this shim
-// assumed today's measurement holds forever.
-extern void (*AbstractController__viewWillAppear)(void *_this);
-extern void (*AbstractController__viewWillDisappear)(void *_this);
-extern void (*AbstractController__viewWillBeDestroyed)(void *_this);
-
-// AbstractController::allowedOrientations() const -- 0xad1324. `this`
-// loaded, never dereferenced; unconditionally returns the constant 5 in
-// r0. A plain SCALAR return -- unlike size(), no hidden buffer: an `int`
-// has no constructor to trip the "not POD for calls" ARM ABI rule above,
-// so it returns the ordinary way (this in r0/r1 slot per the calling
-// convention, result in r0).
-extern int (*AbstractController__allowedOrientations)(void const *_this);
-
-// AbstractController::navSection() const -- 0xad15b0 (a WEAK symbol,
-// unlike every other symbol in this file -- confirmed with `nm -D`, not
-// significant to how it is called, just noted because it was unexpected).
-// Same shape as allowedOrientations(): `this` loaded, unused, constant 0
-// returned in r0.
-extern int (*AbstractController__navSection)(void const *_this);
-
-// _ZTV18AbstractController itself -- 0x163ff70 on 4.38.23684, `nm -D` type
-// D (a DATA symbol, the only one this whole project resolves by name --
-// every other entry, here and in every other dlsym table, is a function).
-// dlsym works identically for data and function symbols, so this resolves
-// the SAME way as the nine function pointers above; what differs is only
-// how nfview.cc's nf_view_layout_check() USES it: reading the LIVE
-// vtable's own slots is what turns "these six symbols individually
-// resolved" into "these six symbols sit at the SLOT this shim's vtable
-// layout assumes" -- a firmware that shifted the slot order (inserted or
-// removed a virtual before size(), say) would still resolve all six
-// symbols individually by name, so the six dlsym entries ALONE cannot
-// catch that; comparing each against the live table's own slot can.
-// Points at the START of the vtable's Itanium ABI header (offset-to-top
-// word) -- NOT the "address point" (the vptr value every
-// AbstractController-shaped object actually stores at +0), which is this
-// address PLUS 8 (two header words) -- nf_view_layout_check() applies
-// that same +8 adjustment the real constructor's own disassembly does
-// (NOTES.md: `adds r3, #8` after loading this exact symbol).
-extern void *AbstractController__vtable;
-
-// True once every AbstractController symbol this shim needs has resolved
-// -- the original two (ctor, dtor1), the six forwarded slots, AND the
-// vtable data symbol above (nine total). Deliberately ONE gate, not nine
-// independent ones: none of these is "nice to have" the way most
-// .optional entries in this project are -- a firmware missing just
-// size(), for instance, would silently fall back to a default-constructed
-// QSize(-1,-1) everywhere Nickel expects a real size, which can lay a
-// view out to nothing -- indistinguishable, on a screenshot, from "the
-// screen never appeared," which is exactly the kind of wrong-place
-// hunting this gate exists to prevent. So nf_browser_show() (nfview.cc)
-// refuses to push AT ALL if any of these nine is missing, rather than
-// pushing a controller with some slots silently reverted to placeholder
-// behaviour, or skipping the vtable-slot cross-check that is this file's
-// real runtime layout mitigation (see nf_view_layout_check(), nfview.cc).
-//
-// A THIRD, independent gate from nf_nickel_resolve()/nf_browser_resolve()
-// (book-opening; the borrowed-controller route) -- a firmware that breaks
-// just one of these three features does not silently disable the other
-// two. See nf_browser_resolve()'s own comment for why this independence is
-// deliberate, not merely convenient.
-bool nf_view_resolve(void);
+// True once every symbol this route needs has resolved -- a FOURTH,
+// independent gate from nf_nickel_resolve()/nf_browser_resolve() (the same
+// independence those two already keep from each other): a firmware that
+// renames one of these six does not disable book-opening or the borrowed-
+// controller browser screen, and vice versa. nf_browser_show() (nfview.cc)
+// refuses to build anything at all if this is false, rather than pushing a
+// half-wired dialog with some calls silently skipped.
+bool nf_native_view_resolve(void);
 
 // QSharedPointer<T>'s complete runtime layout, for every T, per Qt 5.2's
 // public qsharedpointer_impl.h: a value pointer, then an
