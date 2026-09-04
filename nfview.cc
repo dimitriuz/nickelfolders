@@ -88,17 +88,43 @@
 // every ContentID this file builds starts with.
 #define NF_ROOT "/mnt/onboard"
 
-// The largest directory measured on the reference card is 27 entries
-// (NOTES.md, the Fullmetal Alchemist volume run). Whether a plain
-// QVBoxLayout with no scroll area actually fits that many TouchLabel rows
-// on this panel's real pixel height is UNTESTED -- this cap is a
-// deliberately conservative judgement call, not a measurement, so that a
-// directory this large shows a visible "...and N more" line instead of
-// silently overflowing off the bottom of the screen. Real scrolling (a
-// QScrollArea, or a windowed view into `rows`) is a follow-up, not
-// attempted here -- see the task report's device checklist for what
-// confirming or replacing this number needs.
-#define NF_MAX_VISIBLE_ROWS 15
+// Items shown per page. MEASURED-CONSERVATIVE rather than a fresh
+// measurement: the one screenshot on file (NOTES.md, 2026-09-03) shows 15
+// item rows plus BACK plus the truncation notice this constant used to
+// gate (now removed, see below) fitting on this panel WITH CLEAR BLANK
+// SPACE still below them -- so this panel's real capacity reads closer to
+// ~20 rows than 15. 18 leaves headroom for BACK plus the extra chrome a
+// page can now carry -- the position indicator, PREV PAGE, and NEXT PAGE
+// rows below, up to all three at once on a middle page of a multi-page
+// listing (BACK + indicator + PREV + 18 items + NEXT = 22 rows, the worst
+// case; a first or last page drops one of PREV/NEXT, and a single-page
+// listing -- the common case, 27 being the largest measured -- drops all
+// three). Trivially raised once an actual full page -- not just 15 fixed
+// rows -- has been seen on hardware; see the task report's device
+// checklist.
+#define NF_ITEMS_PER_PAGE 18
+
+// PAGINATION, not scrolling -- a deliberate choice, not a shortcut, and
+// the reasoning is load-bearing enough to spell out here so nobody
+// "upgrades" this to a QScrollArea later and quietly loses touch input.
+// NOTES.md's "Task 8: touch input archaeology" is why: Nickel does not
+// deliver QMouseEvents at all, it recognises gestures itself, through
+// machinery that needs THREE things registered per widget -- a
+// grabGesture() call against a registration-time token, an event()
+// override that routes touch/gesture events (QWidget::event() does
+// neither), and RTTI-based GestureDelegate dispatch -- and this project
+// has all three proven on hardware for exactly one gesture: TouchLabel's
+// own tap, which self-registers in its own constructor. A QScrollArea's
+// viewport is a bare QWidget with none of that wired up for a drag/pan; it
+// would render correctly and then sit there as dead to a finger as the
+// original AbstractController shim's QPushButton did (this file's own
+// header comment, and NOTES.md) -- except SILENTLY, because a tall static
+// list simply looks scrollable where a dead button at least looked like a
+// button. Paging instead reuses the one gesture already proven end to end:
+// a tap on a TouchLabel. Do not replace this with a QScrollArea without
+// first doing the same grabGesture/event()/GestureDelegate archaeology
+// Task 8 did for tapping -- this comment is that archaeology's citation,
+// not a substitute for redoing it if scrolling is ever attempted.
 
 // Two independent pieces of file-scope, mutable browser state, and BOTH are
 // POD for the same load-bearing reason nf_watch_targets/nf_watch_dir
@@ -136,6 +162,21 @@ static void *nf_browser_active_dialog = NULL;
 // file's own code from another thread -- every callback here runs on the
 // GUI thread, same as nf_on_trigger_view that calls nf_browser_show).
 static char nf_browser_cwd[PATH_MAX];
+
+// The page currently shown within nf_browser_cwd's own listing (0-based).
+// Same file-scope POD discipline as the two statics above -- a plain `int`
+// is .bss-initialised, same as a `void*`/`char[]`, with no constructor to
+// race NickelHook's own init ordering (see nf_browser_active_dialog's own
+// comment for the full account of why that race matters here). Reset to 0
+// by nf_browser_go itself whenever its `resetPage` argument is true --
+// every descend, every BACK/ascend step, and the initial root call all
+// pass true, because all three move nf_browser_cwd to a DIFFERENT
+// directory, whose page 0 has no relationship to whatever page the
+// previous directory happened to be showing. The PREV/NEXT PAGE rows are
+// the one caller that passes false: they change the page WITHIN the same
+// directory nf_browser_cwd already names, so resetting here would make
+// NEXT PAGE always land back on page 0.
+static int nf_browser_page = 0;
 
 // --- construction ------------------------------------------------------
 
@@ -215,7 +256,7 @@ static QVector<nf_entry> nf_browser_scan_dir(QString const &path) {
     return entries;
 }
 
-static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path);
+static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool resetPage);
 
 // Shared by the guaranteed BACK row and N3Dialog's own backTapped() signal
 // -- same "one function, not two forks to audit for drift" reasoning as
@@ -249,7 +290,7 @@ static void nf_browser_back(void *mwc, N3Dialog *dialog) {
         parent = QStringLiteral(NF_ROOT);
 
     nh_log("browser: BACK -- up from '%s' to '%s'", qPrintable(cwd), qPrintable(parent));
-    nf_browser_go(mwc, dialog, parent);
+    nf_browser_go(mwc, dialog, parent, true); // ascend -- a different directory, page resets
 }
 
 // Builds a fresh content widget (rows for `path`'s own directory listing)
@@ -259,12 +300,20 @@ static void nf_browser_back(void *mwc, N3Dialog *dialog) {
 // dialog pushed per level. setContent itself deleteLater()s whatever
 // content was there before (nfnickel.h), so the previous screen's rows and
 // their shim buttons are cleaned up by Qt, not by this function.
-static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path) {
+static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool resetPage) {
     // Recorded BEFORE anything below can fail, so BACK's own "where am I"
     // read is always this directory once this function has been entered --
     // matching every row/BACK handler being wired only after the listing
     // for THIS path has been built, never before.
     snprintf(nf_browser_cwd, sizeof nf_browser_cwd, "%s", qPrintable(path));
+
+    // See nf_browser_page's own comment: every real navigation (descend,
+    // ascend, the initial root call) passes resetPage=true here; only the
+    // PREV/NEXT PAGE rows below pass false, because they call back into
+    // this SAME function for the SAME path just to render a different
+    // slice of the same listing.
+    if (resetPage)
+        nf_browser_page = 0;
 
     QString const *db = nf_db_name();
     NFMetaCtx ctx;
@@ -274,7 +323,25 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path) {
     QVector<nf_entry> raw = nf_browser_scan_dir(path);
     QVector<nf_row> rows;
     nf_build_listing(raw, &nf_row_meta, &ctx, &rows);
-    int shown = qMin(rows.size(), static_cast<int>(NF_MAX_VISIBLE_ROWS));
+
+    // Pagination bounds. totalPages is at least 1 even for an empty listing,
+    // so "page 1/1" (below) is always a sensible thing to compute, never a
+    // divide-by-zero. nf_browser_page is clamped defensively -- it should
+    // already be in range by construction (resetPage zeroes it on every
+    // directory change, and PREV/NEXT below never step it out of range),
+    // but a stale value surviving some path this file does not currently
+    // have is a clamp, not a crash, which is cheap insurance to keep.
+    int totalPages = (rows.size() + NF_ITEMS_PER_PAGE - 1) / NF_ITEMS_PER_PAGE;
+    if (totalPages < 1)
+        totalPages = 1;
+    if (nf_browser_page >= totalPages)
+        nf_browser_page = totalPages - 1;
+    if (nf_browser_page < 0)
+        nf_browser_page = 0;
+    int startIdx = nf_browser_page * NF_ITEMS_PER_PAGE;
+    int endIdx   = qMin(startIdx + NF_ITEMS_PER_PAGE, rows.size());
+    bool hasPrev = nf_browser_page > 0;
+    bool hasNext = nf_browser_page < totalPages - 1;
 
     QWidget *content = new QWidget();
     QVBoxLayout *layout = new QVBoxLayout(content);
@@ -332,25 +399,65 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path) {
         }
     }
 
-    // Do NOT silently truncate (CLAUDE.md's task brief) -- a plain QLabel,
-    // not a TouchLabel: this line is informational only, not a tap target,
-    // so it needs none of TouchLabel's gesture machinery.
+    // Position indicator -- "page 2/2" -- a plain QLabel, not a TouchLabel:
+    // informational only, not a tap target, so it needs none of
+    // TouchLabel's gesture machinery. Shown only when there is more than
+    // one page: on a single-page listing (the common case -- 27 entries,
+    // the largest measured, is comfortably under NF_ITEMS_PER_PAGE) "page
+    // 1/1" says nothing a reader does not already know from PREV/NEXT both
+    // being absent.
     //
     // Placed HERE -- immediately after the BACK row, ABOVE the listing rows
-    // it is warning about -- not after them. Review finding L1:
-    // NF_MAX_VISIBLE_ROWS exists because whether that many TouchLabel rows
-    // actually fit this panel's real height is untested, and a notice
-    // placed after the rows is exactly what a layout that overflows the
-    // screen would clip first -- degrading exactly as silently as having
-    // no cap at all. Placed first, it is pushed off screen last, if
-    // anything is.
-    if (rows.size() > shown) {
-        QLabel *more = new QLabel(content);
-        more->setText(QStringLiteral("...and %1 more (scrolling not implemented yet)").arg(rows.size() - shown));
-        layout->addWidget(more);
+    // -- for the same reason review finding L1 placed the old truncation
+    // notice here rather than after the rows: this panel's real capacity
+    // for this many rows at once (BACK + indicator + PREV + 18 items +
+    // NEXT) is still not device-measured, only judged conservative
+    // (NF_ITEMS_PER_PAGE's own comment), so whatever gets clipped first
+    // should be the least useful row, and knowing "where I ended up" (the
+    // rows themselves) matters more than a reminder of "where I already
+    // was" (this label, and PREV below it).
+    if (totalPages > 1) {
+        QLabel *pageInfo = new QLabel(content);
+        pageInfo->setText(QStringLiteral("page %1/%2").arg(nf_browser_page + 1).arg(totalPages));
+        layout->addWidget(pageInfo);
     }
 
-    for (int i = 0; i < shown; i++) {
+    // PREV PAGE row -- a TouchLabel, same construction/shim pattern as
+    // every other tappable row in this function (see the BACK row's own
+    // comment for the allocation-size and signal-adaptor derivation, not
+    // repeated at each row). Only built when there IS a previous page --
+    // an always-present, sometimes-disabled row was rejected because this
+    // panel gives no reliable "disabled" visual state (CLAUDE.md's task
+    // brief on the four grey levels applies here too), so absence is the
+    // only unambiguous way to say "no previous page" on this hardware.
+    //
+    // `path` (this directory) is captured by value and nf_browser_go is
+    // called with resetPage=FALSE -- this is a page change WITHIN the
+    // current directory, not a navigation to a different one, so
+    // nf_browser_page must survive the rebuild this triggers.
+    if (hasPrev) {
+        void *row = calloc(1, 256); // 132 measured, 256 over-allocated -- see the BACK row's comment
+        if (row) {
+            TouchLabel__ctor(row, content, 0);
+            reinterpret_cast<QLabel*>(row)->setText(QStringLiteral("< PREV PAGE"));
+
+            QPushButton *shim = new QPushButton(content);
+            shim->setVisible(false);
+            if (!QObject::connect(reinterpret_cast<QObject*>(row), SIGNAL(tapped(bool)), shim, SLOT(click())))
+                nh_log("browser: connecting the PREV PAGE row's tapped(bool) failed -- this row will silently do nothing");
+            QObject::connect(shim, &QPushButton::clicked, [mwc, dialog, path] {
+                nf_browser_page--;
+                nh_log("browser: page -- prev, now %d in '%s'", nf_browser_page, qPrintable(path));
+                nf_browser_go(mwc, dialog, path, false);
+            });
+
+            layout->addWidget(reinterpret_cast<QWidget*>(row));
+        } else {
+            nh_log("browser: calloc(1,256) failed for the PREV PAGE row, skipping it");
+        }
+    }
+
+    for (int i = startIdx; i < endIdx; i++) {
         nf_row const &r = rows.at(i);
 
         void *row = calloc(1, 256);
@@ -419,7 +526,7 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path) {
         QObject::connect(shim, &QPushButton::clicked, [mwc, dialog, childPath, rowName, isDir, hasRow] {
             if (isDir) {
                 nh_log("browser: descending into '%s'", qPrintable(childPath));
-                nf_browser_go(mwc, dialog, childPath);
+                nf_browser_go(mwc, dialog, childPath, true); // descend -- a different directory, page resets
             } else if (hasRow) {
                 QString contentId = QStringLiteral("file://") + childPath;
                 nh_log("browser: opening '%s'", qPrintable(contentId));
@@ -438,12 +545,39 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path) {
         layout->addWidget(reinterpret_cast<QWidget*>(row));
     }
 
+    // NEXT PAGE row -- same TouchLabel/shim pattern and same "absent, not
+    // disabled" reasoning as PREV PAGE above, placed after the item rows
+    // (PREV steps back to content already seen, above; NEXT steps forward
+    // to content not yet seen, below -- top-to-bottom reading order).
+    if (hasNext) {
+        void *row = calloc(1, 256); // 132 measured, 256 over-allocated -- see the BACK row's comment
+        if (row) {
+            TouchLabel__ctor(row, content, 0);
+            reinterpret_cast<QLabel*>(row)->setText(QStringLiteral("NEXT PAGE >"));
+
+            QPushButton *shim = new QPushButton(content);
+            shim->setVisible(false);
+            if (!QObject::connect(reinterpret_cast<QObject*>(row), SIGNAL(tapped(bool)), shim, SLOT(click())))
+                nh_log("browser: connecting the NEXT PAGE row's tapped(bool) failed -- this row will silently do nothing");
+            QObject::connect(shim, &QPushButton::clicked, [mwc, dialog, path] {
+                nf_browser_page++;
+                nh_log("browser: page -- next, now %d in '%s'", nf_browser_page, qPrintable(path));
+                nf_browser_go(mwc, dialog, path, false);
+            });
+
+            layout->addWidget(reinterpret_cast<QWidget*>(row));
+        } else {
+            nh_log("browser: calloc(1,256) failed for the NEXT PAGE row, skipping it");
+        }
+    }
+
     QString title = (path == QStringLiteral(NF_ROOT))
         ? QStringLiteral("NickelFolders")
         : QFileInfo(path).fileName();
     N3Dialog__setTitle(dialog, title);
 
-    nh_log("browser: showing '%s' (%d row(s), %d shown)", qPrintable(path), rows.size(), shown);
+    nh_log("browser: showing '%s' (%d row(s), page %d/%d, %d shown)",
+           qPrintable(path), rows.size(), nf_browser_page + 1, totalPages, endIdx - startIdx);
 
     // Reparents `content` into the dialog's own layout and shows it;
     // deleteLater()s whatever content was there before (nfnickel.h) --
@@ -566,7 +700,7 @@ bool nf_browser_show(void) {
     // see nf_browser_go's own comment for why this is safe to do before
     // pushView (nothing about setContent requires the dialog to already be
     // on screen).
-    nf_browser_go(mwc, dialog, QStringLiteral(NF_ROOT));
+    nf_browser_go(mwc, dialog, QStringLiteral(NF_ROOT), true); // fresh dialog -- page 0
 
     MainWindowController__pushView(mwc, reinterpret_cast<QWidget*>(dialog));
     return true;
