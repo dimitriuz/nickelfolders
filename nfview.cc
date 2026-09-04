@@ -305,7 +305,14 @@ struct NFMetaCtx {
 static void nf_row_meta(void *ctx, QString const& name, nf_row *row) {
     NFMetaCtx const *c = static_cast<NFMetaCtx const*>(ctx);
     QString contentId = QStringLiteral("file://") + c->dirPath + QLatin1Char('/') + name;
-    row->hasRow = nf_volume_exists(contentId, c->dbName, &row->percentRead, &row->readState);
+    // One call fills hasRow, percentRead, readState AND the two raw date sort
+    // keys -- deliberately not a second lookup for the dates: they come off
+    // the same Volume, inside the same isValid() branch, before the same
+    // Volume__dtor. nf_volume_exists' own declaration (nfnickel.h) has the
+    // derivation for both keys, why neither is parsed into a QDateTime, and
+    // where an empty one sorts.
+    row->hasRow = nf_volume_exists(contentId, c->dbName, &row->percentRead, &row->readState,
+                                   &row->dateAdded, &row->dateLastRead);
 }
 
 // QDir::entryInfoList against ONE directory, never recursive -- the spec's
@@ -352,13 +359,20 @@ static QVector<nf_entry> nf_browser_scan_dir(QString const &path) {
     return entries;
 }
 
-// Cycles nf_browser_sort_key/nf_browser_sort_desc as ONE combined six-state
+// Cycles nf_browser_sort_key/nf_browser_sort_desc as ONE combined ten-state
 // sequence on a single tap -- name-ascending, name-descending, size-
-// ascending, size-descending, date-ascending, date-descending, back to
+// ascending, size-descending, date-ascending, date-descending, added-
+// ascending, added-descending, read-ascending, read-descending, back to
 // name-ascending -- rather than needing two separate rows for what the task
 // brief frames as two orthogonal choices (key, direction). Direction flips
 // first and key advances only every second tap, so a reader sees both
 // directions of whichever key they just picked before it moves on.
+//
+// The two library-date keys come AFTER name/size/date, in that order, so the
+// tap sequence the owner has already learned on hardware is unchanged and the
+// new keys are appended past the end of it rather than inserted into the
+// middle -- the same rule the read-state filters followed onto
+// nf_browser_cycle_filter below.
 static void nf_browser_cycle_sort(void) {
     if (!nf_browser_sort_desc) {
         nf_browser_sort_desc = true;
@@ -366,10 +380,12 @@ static void nf_browser_cycle_sort(void) {
     }
     nf_browser_sort_desc = false;
     switch (nf_browser_sort_key) {
-        case NF_SORT_NAME: nf_browser_sort_key = NF_SORT_SIZE; break;
-        case NF_SORT_SIZE: nf_browser_sort_key = NF_SORT_DATE; break;
-        case NF_SORT_DATE:
-        default:            nf_browser_sort_key = NF_SORT_NAME; break;
+        case NF_SORT_NAME:  nf_browser_sort_key = NF_SORT_SIZE;  break;
+        case NF_SORT_SIZE:  nf_browser_sort_key = NF_SORT_DATE;  break;
+        case NF_SORT_DATE:  nf_browser_sort_key = NF_SORT_ADDED; break;
+        case NF_SORT_ADDED: nf_browser_sort_key = NF_SORT_READ;  break;
+        case NF_SORT_READ:
+        default:            nf_browser_sort_key = NF_SORT_NAME;  break;
     }
 }
 
@@ -402,13 +418,21 @@ static void nf_browser_cycle_filter(void) {
 // file's other ASCII chrome ("<< BACK", "< PREV PAGE"). "^" reads as
 // ascending (smallest/oldest/A first, pointing at the top of the list) and
 // "v" as descending, without needing a real glyph this panel may not have.
+// "date" is the FILE's own mtime and "added"/"read" are the LIBRARY's two
+// dates; three one-word names for three genuinely different questions, all
+// short enough not to eat the row's width budget the way "date added" and
+// "date last read" would. "read" is the reading date, not the read STATE --
+// the filter row is where read state lives ("filter: finished"), and the two
+// rows are never both showing a word from the other's vocabulary.
 static QString nf_sort_row_label(void) {
     QString keyName;
     switch (nf_browser_sort_key) {
-        case NF_SORT_SIZE: keyName = QStringLiteral("size"); break;
-        case NF_SORT_DATE: keyName = QStringLiteral("date"); break;
+        case NF_SORT_SIZE:  keyName = QStringLiteral("size");  break;
+        case NF_SORT_DATE:  keyName = QStringLiteral("date");  break;
+        case NF_SORT_ADDED: keyName = QStringLiteral("added"); break;
+        case NF_SORT_READ:  keyName = QStringLiteral("read");  break;
         case NF_SORT_NAME:
-        default:            keyName = QStringLiteral("name"); break;
+        default:            keyName = QStringLiteral("name");  break;
     }
     return QStringLiteral("sort: %1 %2").arg(keyName,
         nf_browser_sort_desc ? QStringLiteral("v") : QStringLiteral("^"));

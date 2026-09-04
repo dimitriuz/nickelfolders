@@ -4,6 +4,7 @@
 #ifndef NFFMT_H
 #define NFFMT_H
 
+#include <QByteArray>
 #include <QString>
 #include <QStringList>
 #include <QVector>
@@ -72,6 +73,34 @@ struct nf_row {
     // NF_SORT_SIZE/NF_SORT_DATE while every name-sorted test kept passing.
     qint64        size;
     qint64        mtime;
+    // Nickel's OWN two date sort keys, as RAW ISO-8601 BYTES, exactly as they
+    // sit in the library row -- never parsed into a QDateTime here or
+    // anywhere else in this project. That is not laziness: Nickel itself
+    // never converts them either. Its DateAddedKey<Volume>::key tail-calls
+    // Volume::getDateAddedSortKey and compares the results with qstrcmp, and
+    // its RecentKey<Volume>::key returns max(___DateLastRead, ___SyncTime)
+    // and is compared with strcasecmp (both measured -- the date-getter
+    // archaeology, sections 5 and 6). The stored format is fixed-field
+    // ISO-8601, so byte order IS chronological order, and Nickel's own
+    // sorters rely on exactly that in two independent places. Comparing
+    // bytes therefore reproduces Nickel's ordering with no parse, no
+    // QDateTime, and -- decisively for this project -- no hidden-return-
+    // buffer (sret) libnickel call of the shape that crashed Nickel once
+    // already (CLAUDE.md, VolumeManager::getById).
+    //
+    // EMPTY means "no date known": no library row at all (the
+    // `[not in library]` case), an unresolved symbol, or raw bytes that
+    // failed nf_date_key_is_plausible below. Empty is NOT a separate
+    // ordering bucket -- nf_date_compare substitutes Nickel's own
+    // ZERO_DB_DATE_ARRAY sentinel for it, so it sorts exactly where Nickel
+    // puts a dateless row. See nf_date_compare for the full reasoning.
+    //
+    // Filled in by an nf_meta_fn (nfview.cc -> nf_volume_exists), the same
+    // way percentRead/readState are, and for the same reason: they are
+    // metadata, so the listing pipeline must fetch them BEFORE it sorts
+    // (nflist.cc, stage 3 ahead of stage 5).
+    QByteArray    dateAdded;    // Volume::getDateAddedSortKey() -- ___SyncTime for sideloaded content
+    QByteArray    dateLastRead; // ___DateLastRead, Volume::d() + 40
 
     nf_row() : isDir(false), hasRow(false), percentRead(-1),
                readState(NF_READ_UNKNOWN), finished(false), size(0), mtime(0) {}
@@ -91,17 +120,99 @@ QString nf_book_extension(QString const& name);
 // them would be unsafe -- see nffmt.cc.
 void nf_strip_common(QStringList *names);
 
-// The three sort keys v1 offers, all read straight off QFileInfo -- no new
-// libnickel call. NF_SORT_NAME is the only key v1 originally shipped with,
-// and stays the default everywhere it matters (see nf_sort_entries' and
+// The sort keys. The first three are read straight off QFileInfo -- no
+// libnickel call at all. NF_SORT_NAME is the only key v1 originally shipped
+// with, and stays the default everywhere it matters (see nf_sort_entries' and
 // nf_build_listing's own default arguments) so nothing that called either
 // function before this feature existed needs to change to keep its old
 // behaviour.
+//
+// NF_SORT_ADDED/NF_SORT_READ are METADATA keys: they read nf_row::dateAdded
+// and ::dateLastRead, which only an nf_meta_fn can fill in, so unlike the
+// first three they are meaningless on a bare nf_entry (nf_sort_entries with
+// either of them compares two empty keys for every entry and falls through to
+// the name tie-break -- documented, not a trap, because the pipeline sorts
+// ROWS). Appended AFTER the existing three so the sort row's tap cycle
+// (nfview.cc) keeps the order a reader has already learned.
+//
+// THE TRAP THAT MAKES A DEVICE CHECK VACUOUS, recorded here because this enum
+// is what a reader lands on first: BOTH of Nickel's date sorts fall back to
+// ___SyncTime for SIDELOADED content, and everything this browser lists is
+// sideloaded. Volume::getDateAddedSortKey returns ___SyncTime outright for a
+// sideloaded volume, and RecentKey<Volume>::key returns
+// max(___DateLastRead, ___SyncTime) -- so for a never-opened sideloaded book
+// THE TWO KEYS COINCIDE EXACTLY. A test folder of never-opened books shows
+// NF_SORT_ADDED and NF_SORT_READ in identical order and proves nothing at
+// all. The control that implies: a meaningful device check needs a folder
+// where AT LEAST ONE BOOK HAS ACTUALLY BEEN OPENED, and the new sort must
+// produce an order DIFFERENT from NF_SORT_NAME's and must REVERSE under
+// `descending`. Output identical to name order is a FAILURE, not a
+// coincidence -- an empty or constant key hands every row the same value and,
+// under this file's stable insertion sort, silently reproduces the name order
+// with no error anywhere.
 enum nf_sort_key {
     NF_SORT_NAME,
     NF_SORT_SIZE,
     NF_SORT_DATE,
+    NF_SORT_ADDED,
+    NF_SORT_READ,
 };
+
+// --- the two date keys, as bytes ----------------------------------------
+//
+// Nickel's own no-date sentinel, ZERO_DB_DATE_ARRAY -- measured, not
+// invented: RecentKey<Volume>::key returns constData() of a static
+// QByteArray whose GOT relocation resolves to that name, and whose string
+// sits in .rodata at 0x136b994 (the date-getter archaeology, A3). It is
+// never NULL and never empty, and it sorts before every real date
+// lexicographically, i.e. Nickel's "unknown" bucket lands FIRST ascending.
+#define NF_ZERO_DB_DATE "0000-00-00T00:00:00.000"
+
+// Orders two raw date keys the way Nickel orders them: CASE-INSENSITIVELY,
+// byte-wise, with no parse. Returns <0, 0 or >0.
+//
+// Case-insensitive because that is what Nickel does -- ReverseSorter<Volume,
+// RecentSorter<Volume> > compares two RecentKey results with strcasecmp, not
+// strcmp (measured, archaeology section 6). It matters for the 'T'/'t' date/
+// time separator and a trailing 'Z', and Nickel reaching for the
+// case-insensitive form at all is itself evidence the column is not perfectly
+// uniform.
+//
+// An EMPTY key is substituted with NF_ZERO_DB_DATE rather than being given a
+// bucket of its own. This is the whole empty-date rule, in one place:
+//
+//   * Nickel's own no-date path never yields an empty string -- it yields
+//     that sentinel -- so "empty" is a state only THIS mod can be in (a file
+//     with no library row at all, an unresolved symbol, or bytes that failed
+//     nf_date_key_is_plausible). Mapping it onto the sentinel makes our
+//     dateless rows sort exactly where Nickel's dateless rows sort, which is
+//     the only definition of "consistent" available here.
+//   * It therefore sorts BEFORE every real date ascending, and last
+//     descending. A row with no date is the OLDEST thing in the listing, not
+//     the newest -- claiming a file with no library row was just added would
+//     be an invisible wrong answer, which is what this project's percentRead
+//     and read-state guards both already refuse to produce.
+//   * A row with no library row must never vanish or crash on this path: it
+//     gets a comparable key like every other row, and its `[not in library]`
+//     suffix (nf_row_suffix) is what actually tells the reader why.
+int nf_date_compare(QByteArray const& a, QByteArray const& b);
+
+// True if `raw` is something this mod is willing to treat as a date key.
+// Accepts EMPTY (that is the honest "unknown", see nf_date_compare) or
+// anything shaped like ^\d{4}-\d\d-\d\d[Tt ] -- four digits, '-', two
+// digits, '-', two digits, then 'T', 't' or a space.
+//
+// This is the safety net a hardcoded struct offset does not otherwise have.
+// ___DateLastRead is read as a QByteArray at Volume::d() + 40 (nfnickel.cc),
+// and a renamed SYMBOL fails loudly through dlsym while a MOVED OFFSET does
+// not -- it just hands back whatever is sitting at +40 on the new layout. A
+// shifted offset lands on a title, an image id or a raw integer, none of
+// which passes this test. Same role, and the same refusal to REPAIR a failing
+// value, as the 0..100 range check on ___PercentRead (nfnickel.cc has the
+// full reasoning): a repaired value hides the layout change the check exists
+// to catch behind a plausible-looking answer, so the caller logs once and
+// treats the key as unknown instead.
+bool nf_date_key_is_plausible(QByteArray const& raw);
 
 // Sorts folders before files, then by `key` (nf_natural_compare for
 // NF_SORT_NAME, numeric for the other two) within each kind, `descending` or

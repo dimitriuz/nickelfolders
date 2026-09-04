@@ -496,6 +496,216 @@ static void test_sort_rows_matches_entry_sort_rules(void) {
     CHECK_EQ_STR(r.at(2).name, "Volume 10.cbz");
 }
 
+// --- the two library date sort keys ------------------------------------
+//
+// Everything below is pure by construction: nffmt.cc never sees a Volume, and
+// these are the only checks in this project that can run against the date
+// logic at all (every libnickel call that FETCHES the bytes is untestable
+// off-device -- CLAUDE.md).
+static nf_row dated(char const *name, char const *added, char const *lastRead) {
+    nf_row r;
+    r.name         = QString::fromUtf8(name);
+    r.label        = r.name;
+    r.isDir        = false;
+    r.hasRow       = true;
+    r.dateAdded    = QByteArray(added);
+    r.dateLastRead = QByteArray(lastRead);
+    return r;
+}
+
+// Byte order IS chronological order for fixed-field ISO-8601, which is the
+// whole reason this mod compares bytes rather than parsing -- and the reason
+// Nickel does too (qstrcmp in DateAddedKey's sorter, strcasecmp in
+// RecentSorter's).
+static void test_date_compare_orders_iso_strings_by_bytes(void) {
+    CHECK(nf_date_compare(QByteArray("2024-01-02T03:04:05.000"),
+                          QByteArray("2024-01-02T03:04:06.000")) < 0);
+    CHECK(nf_date_compare(QByteArray("2024-12-31T23:59:59.999"),
+                          QByteArray("2025-01-01T00:00:00.000")) < 0);
+    CHECK(nf_date_compare(QByteArray("2025-01-01T00:00:00.000"),
+                          QByteArray("2025-01-01T00:00:00.000")) == 0);
+    CHECK(nf_date_compare(QByteArray("2025-06-01T00:00:00.000"),
+                          QByteArray("2024-06-01T00:00:00.000")) > 0);
+}
+
+// Nickel uses strcasecmp, not strcmp, for the recent key (measured -- the
+// date-getter archaeology, section 6), and it matters at the 'T' separator.
+// NEGATIVE CONTROL: a case-SENSITIVE byte compare would answer non-zero for
+// this pair ('T' is 0x54, 't' is 0x74), so a check that only ever fed one
+// spelling of the separator would pass against the wrong implementation.
+static void test_date_compare_is_case_insensitive_like_nickel(void) {
+    CHECK(nf_date_compare(QByteArray("2024-01-02T03:04:05.000"),
+                          QByteArray("2024-01-02t03:04:05.000")) == 0);
+    // and the case difference must not swamp a real ordering difference
+    CHECK(nf_date_compare(QByteArray("2024-01-02t03:04:05.000"),
+                          QByteArray("2024-01-03T00:00:00.000")) < 0);
+}
+
+// THE EMPTY-DATE RULE. Empty is substituted with Nickel's own
+// ZERO_DB_DATE_ARRAY sentinel, so a dateless row is the OLDEST thing in the
+// listing -- never the newest, which is the invisible wrong answer.
+//
+// NEGATIVE CONTROL: an implementation that put empty LAST (or that compared
+// "" against a real date with plain strcmp, where "" is also less-than, but
+// for the wrong reason) is distinguished by the second pair below -- empty
+// must compare EQUAL to the sentinel spelled out in full, not merely less
+// than everything.
+static void test_date_compare_treats_empty_as_nickels_zero_sentinel(void) {
+    CHECK(nf_date_compare(QByteArray(), QByteArray("2024-01-02T03:04:05.000")) < 0);
+    CHECK(nf_date_compare(QByteArray("2024-01-02T03:04:05.000"), QByteArray()) > 0);
+    // empty IS the sentinel, not merely smaller than everything
+    CHECK(nf_date_compare(QByteArray(), QByteArray(NF_ZERO_DB_DATE)) == 0);
+    CHECK(nf_date_compare(QByteArray(NF_ZERO_DB_DATE),
+                          QByteArray("0001-01-01T00:00:00.000")) < 0);
+    // two unknowns tie, so the caller's name tie-break decides -- not the
+    // arbitrary order two dateless rows happened to arrive in
+    CHECK(nf_date_compare(QByteArray(), QByteArray()) == 0);
+}
+
+// The shape check that stands in for a hardcoded offset's missing dlsym
+// safety net. Accept empty (the honest unknown) and real ISO-8601 prefixes.
+static void test_date_validator_accepts_what_the_db_holds(void) {
+    CHECK(nf_date_key_is_plausible(QByteArray()));                              // no row: normal, not an error
+    CHECK(nf_date_key_is_plausible(QByteArray("2024-01-02T03:04:05.000")));
+    CHECK(nf_date_key_is_plausible(QByteArray("2024-01-02t03:04:05")));         // lowercase separator
+    CHECK(nf_date_key_is_plausible(QByteArray("2024-01-02 03:04:05")));         // SQLite's space separator
+    CHECK(nf_date_key_is_plausible(QByteArray("2024-01-02T03:04:05.000Z")));    // zone suffix
+    // Nickel's OWN sentinel must pass -- it is a real value the DB path can
+    // hand back, and rejecting it would log a layout failure for a book that
+    // simply has no date.
+    CHECK(nf_date_key_is_plausible(QByteArray(NF_ZERO_DB_DATE)));
+}
+
+// THE NEGATIVE CONTROL FOR THE VALIDATOR. Every input below is what a MOVED
+// STRUCT OFFSET actually lands on -- a title, an image id, a raw integer's
+// bytes -- and a naive "is it non-empty" or "does it contain a dash" check
+// would accept all of them and hand the sort a garbage key with nothing
+// logged. That is the failure this predicate exists to make loud.
+static void test_date_validator_rejects_what_a_moved_offset_lands_on(void) {
+    CHECK(!nf_date_key_is_plausible(QByteArray("Fullmetal Alchemist v01")));    // a title
+    CHECK(!nf_date_key_is_plausible(QByteArray("2024")));                       // too short to be a date
+    CHECK(!nf_date_key_is_plausible(QByteArray("\x2a\x00\x00\x00", 4)));        // a raw int's four bytes, NULs included
+    CHECK(!nf_date_key_is_plausible(QByteArray("file:///mnt/onboard/x.epub"))); // a ContentID
+    // shaped ALMOST right, which is the case a laxer check waves through
+    CHECK(!nf_date_key_is_plausible(QByteArray("2024/01/02T03:04:05")));        // wrong separators
+    CHECK(!nf_date_key_is_plausible(QByteArray("202-01-02T03:04:05")));         // three-digit year
+    CHECK(!nf_date_key_is_plausible(QByteArray("2024-01-02X03:04:05")));        // wrong date/time separator
+    CHECK(!nf_date_key_is_plausible(QByteArray("abcd-ef-ghT00:00:00")));        // right punctuation, no digits
+}
+
+// The sort itself, and the control the ___SyncTime collapse forces: the new
+// order must DIFFER from the name order. Names here are deliberately
+// alphabetical while the dates are reversed, so an implementation that
+// ignored the key (or read an always-empty field) would silently return
+// a/b/c and pass a weaker check.
+static void test_sort_by_added_is_not_the_name_order(void) {
+    QVector<nf_row> r;
+    r << dated("a.epub", "2024-01-01T00:00:00.000", "")
+      << dated("b.epub", "2023-01-01T00:00:00.000", "")
+      << dated("c.epub", "2022-01-01T00:00:00.000", "");
+
+    nf_sort_rows(&r, NF_SORT_ADDED, false);
+    CHECK_EQ_STR(r.at(0).name, "c.epub");   // oldest added first, ascending
+    CHECK_EQ_STR(r.at(1).name, "b.epub");
+    CHECK_EQ_STR(r.at(2).name, "a.epub");
+    // ... which is NOT the name order, the whole point of the control
+    CHECK(r.at(0).name != QString("a.epub"));
+
+    nf_sort_rows(&r, NF_SORT_ADDED, true);
+    CHECK_EQ_STR(r.at(0).name, "a.epub");   // and descending reverses it
+    CHECK_EQ_STR(r.at(2).name, "c.epub");
+}
+
+// THE CONTROL THAT CATCHES THE ONE MISTAKE THE ___SyncTime COLLAPSE HIDES.
+// For a never-opened sideloaded book both of Nickel's date keys collapse onto
+// ___SyncTime and are therefore IDENTICAL, so an implementation that wired
+// NF_SORT_READ to ::dateAdded by mistake would pass every "recently added"
+// check above and every device run over never-opened books. The rows here
+// give the two fields DELIBERATELY OPPOSITE orders, which is the only way to
+// tell the two keys apart at all.
+static void test_the_two_date_keys_read_different_fields(void) {
+    QVector<nf_row> r;
+    r << dated("a.epub", "2022-01-01T00:00:00.000", "2024-01-01T00:00:00.000")
+      << dated("b.epub", "2023-01-01T00:00:00.000", "2023-06-01T00:00:00.000")
+      << dated("c.epub", "2024-01-01T00:00:00.000", "2022-01-01T00:00:00.000");
+
+    nf_sort_rows(&r, NF_SORT_ADDED, false);
+    CHECK_EQ_STR(r.at(0).name, "a.epub");
+    CHECK_EQ_STR(r.at(2).name, "c.epub");
+
+    nf_sort_rows(&r, NF_SORT_READ, false);
+    CHECK_EQ_STR(r.at(0).name, "c.epub");   // exactly the opposite order
+    CHECK_EQ_STR(r.at(2).name, "a.epub");
+}
+
+// A file with no library row at all must not vanish, must not crash, and must
+// land where Nickel puts a dateless row: first ascending, last descending.
+static void test_sort_by_date_key_keeps_a_row_with_no_library_row(void) {
+    QVector<nf_row> r;
+    r << dated("has-a-row.epub", "2024-01-01T00:00:00.000", "2024-01-01T00:00:00.000");
+    nf_row orphan;                       // hasRow false, both keys empty -- the [not in library] case
+    orphan.name  = QString("orphan.epub");
+    orphan.label = orphan.name;
+    r << orphan;
+
+    nf_sort_rows(&r, NF_SORT_READ, false);
+    CHECK(r.size() == 2);                              // nothing dropped
+    CHECK_EQ_STR(r.at(0).name, "orphan.epub");         // no date == oldest
+    nf_sort_rows(&r, NF_SORT_READ, true);
+    CHECK(r.size() == 2);
+    CHECK_EQ_STR(r.at(1).name, "orphan.epub");         // ... and last descending
+}
+
+// Folders have no Volume, so nflist.cc never fills their date keys: every
+// folder ties under either date key and falls through to the name tie-break.
+// The 6.2 trap still applies -- folders group ahead of files in BOTH
+// directions, and a whole-list reversal would break exactly that.
+static void test_date_keys_group_folders_first_in_both_directions(void) {
+    QVector<nf_row> r;
+    r << dated("zzz-file.epub", "2024-01-01T00:00:00.000", "2024-01-01T00:00:00.000")
+      << dated("aaa-file.epub", "2022-01-01T00:00:00.000", "2022-01-01T00:00:00.000");
+    nf_row d1; d1.name = QString("aaa-folder"); d1.label = d1.name; d1.isDir = true;
+    nf_row d2; d2.name = QString("zzz-folder"); d2.label = d2.name; d2.isDir = true;
+    r << d1 << d2;
+
+    nf_sort_rows(&r, NF_SORT_ADDED, false);
+    CHECK(r.at(0).isDir);
+    CHECK(r.at(1).isDir);
+    CHECK(!r.at(2).isDir);
+    CHECK_EQ_STR(r.at(0).name, "aaa-folder");   // dateless tie -> name tie-break
+    CHECK_EQ_STR(r.at(1).name, "zzz-folder");
+
+    nf_sort_rows(&r, NF_SORT_ADDED, true);
+    CHECK(r.at(0).isDir);                       // still folders first, descending
+    CHECK(r.at(1).isDir);
+    CHECK(!r.at(2).isDir);
+    CHECK_EQ_STR(r.at(0).name, "zzz-folder");   // tie-break reverses within the kind
+}
+
+// Two rows sharing a date key -- the ___SyncTime collapse makes this the
+// COMMON case on this card, not a corner one -- must fall back to the name
+// order rather than to whatever order they arrived in.
+static void test_date_key_ties_fall_back_to_the_name_order(void) {
+    QVector<nf_row> r;
+    r << dated("Volume 10.cbz", "2024-01-01T00:00:00.000", "")
+      << dated("Volume 2.cbz",  "2024-01-01T00:00:00.000", "");
+    nf_sort_rows(&r, NF_SORT_ADDED, false);
+    CHECK_EQ_STR(r.at(0).name, "Volume 2.cbz");   // natural order, not lexicographic
+    CHECK_EQ_STR(r.at(1).name, "Volume 10.cbz");
+}
+
+// nf_sort_entries with a date-METADATA key: an nf_entry has nowhere to hold
+// one, so both keys are empty for every entry and the name tie-break decides.
+// Documented behaviour, pinned so it cannot drift into something surprising.
+static void test_entry_sort_under_a_metadata_key_falls_back_to_name(void) {
+    QVector<nf_entry> e;
+    e << ent("c.cbz", false) << ent("a.cbz", false) << ent("b.cbz", false);
+    nf_sort_entries(&e, NF_SORT_ADDED, false);
+    CHECK_EQ_STR(e.at(0).name, "a.cbz");
+    CHECK_EQ_STR(e.at(1).name, "b.cbz");
+    CHECK_EQ_STR(e.at(2).name, "c.cbz");
+}
+
 // --- row icons ----------------------------------------------------------
 //
 // The reported defect this mapping answers, from the reference card:
@@ -787,6 +997,17 @@ int main(void) {
     test_read_filter_never_hides_a_folder();
     test_the_two_filter_axes_ignore_each_other();
     test_sort_rows_matches_entry_sort_rules();
+    test_date_compare_orders_iso_strings_by_bytes();
+    test_date_compare_is_case_insensitive_like_nickel();
+    test_date_compare_treats_empty_as_nickels_zero_sentinel();
+    test_date_validator_accepts_what_the_db_holds();
+    test_date_validator_rejects_what_a_moved_offset_lands_on();
+    test_sort_by_added_is_not_the_name_order();
+    test_the_two_date_keys_read_different_fields();
+    test_sort_by_date_key_keeps_a_row_with_no_library_row();
+    test_date_keys_group_folders_first_in_both_directions();
+    test_date_key_ties_fall_back_to_the_name_order();
+    test_entry_sort_under_a_metadata_key_falls_back_to_name();
     test_hidden_dirs();
     test_icon_kind_folder_wins_over_the_extension();
     test_icon_kind_treats_both_epub_spellings_as_one();

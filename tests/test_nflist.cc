@@ -587,6 +587,124 @@ static void test_pipeline_orders_by_date_after_the_metadata_reorder(void) {
     CHECK_EQ_STR(out.at(2).name, "Oldest.epub");
 }
 
+// --- the two library date keys through the whole pipeline ---------------
+//
+// These are the checks that the metadata stage really does run BEFORE the
+// sort. Unlike size/date (which come off QFileInfo and are already on the
+// nf_entry before nf_build_listing is even called), a date key EXISTS ONLY
+// because `meta` supplied it -- so if the pipeline ever ordered before
+// fetching, the sort would see two empty keys for every row and silently
+// return the name order. That makes these the only checks in this suite that
+// can fail if the stage order regresses.
+//
+// A separate fake from fake_meta: this one supplies the date keys and nothing
+// else, so the existing fixtures keep the exact behaviour their own comments
+// document.
+//
+// THE FIXTURE IS THE CONTROL, and it is built so that neither key can pass
+// vacuously. Names sort alpha < bravo < charlie; date-added sorts
+// bravo < alpha < charlie; date-last-read sorts charlie < bravo < alpha. So
+// each key's order differs from the NAME order AND from the OTHER key's
+// order -- the three-way disagreement is what makes "sorted by the right
+// field" distinguishable from "returned the name order" and from "read the
+// other date by mistake". Get this fixture wrong in the obvious way (dates
+// ascending with the names) and both checks below pass against an
+// implementation that ignores the keys entirely.
+static void date_meta(void *ctx, QString const& name, nf_row *row) {
+    int *calls = static_cast<int *>(ctx);
+    if (calls)
+        (*calls)++;
+    row->hasRow    = true;
+    row->readState = NF_READ_NOT_STARTED;
+    if (name.startsWith(QStringLiteral("alpha"))) {
+        row->dateAdded    = QByteArray("2023-01-01T00:00:00.000");
+        row->dateLastRead = QByteArray("2024-01-01T00:00:00.000");
+    } else if (name.startsWith(QStringLiteral("bravo"))) {
+        row->dateAdded    = QByteArray("2022-01-01T00:00:00.000");
+        row->dateLastRead = QByteArray("2023-01-01T00:00:00.000");
+    } else if (name.startsWith(QStringLiteral("charlie"))) {
+        row->dateAdded    = QByteArray("2024-01-01T00:00:00.000");
+        row->dateLastRead = QByteArray("2022-01-01T00:00:00.000");
+    }
+    // anything else keeps nf_row's own empty defaults -- the "no date" case
+}
+
+// NF_SORT_ADDED, end to end. The names are alphabetical and the keys are not,
+// so a pipeline that sorted before fetching -- or one whose `meta` never
+// reached the sort -- returns a/b/c and fails here.
+static void test_pipeline_orders_by_date_added_which_only_meta_knows(void) {
+    QVector<nf_entry> e;
+    e << ent("alpha.epub", false) << ent("bravo.epub", false) << ent("charlie.epub", false);
+    QVector<nf_row> out;
+
+    nf_build_listing(e, date_meta, NULL, &out, NF_FILTER_ALL, NF_SORT_ADDED, false);
+    CHECK(out.size() == 3);
+    CHECK_EQ_STR(out.at(0).name, "bravo.epub");     // oldest added
+    CHECK_EQ_STR(out.at(1).name, "alpha.epub");
+    CHECK_EQ_STR(out.at(2).name, "charlie.epub");
+    CHECK(out.at(0).name != QString("alpha.epub")); // ... i.e. NOT the name order
+
+    nf_build_listing(e, date_meta, NULL, &out, NF_FILTER_ALL, NF_SORT_ADDED, true);
+    CHECK_EQ_STR(out.at(0).name, "charlie.epub");
+    CHECK_EQ_STR(out.at(2).name, "bravo.epub");
+}
+
+// NF_SORT_READ, end to end, and the control that tells the two keys apart:
+// this fixture's two date fields are in OPPOSITE orders, which is the only
+// way to catch a key wired to the wrong field -- on the device the two keys
+// coincide exactly for any never-opened sideloaded book (both fall back to
+// ___SyncTime), so a device run alone cannot distinguish them.
+static void test_pipeline_orders_by_date_last_read_not_by_date_added(void) {
+    QVector<nf_entry> e;
+    e << ent("alpha.epub", false) << ent("bravo.epub", false) << ent("charlie.epub", false);
+    QVector<nf_row> out;
+
+    nf_build_listing(e, date_meta, NULL, &out, NF_FILTER_ALL, NF_SORT_READ, false);
+    CHECK(out.size() == 3);
+    CHECK_EQ_STR(out.at(0).name, "charlie.epub");   // read longest ago
+    CHECK_EQ_STR(out.at(1).name, "bravo.epub");
+    CHECK_EQ_STR(out.at(2).name, "alpha.epub");
+    // Neither the name order nor the date-ADDED order (bravo/alpha/charlie),
+    // which is what makes this a check on the right FIELD and not merely on
+    // "some date sort ran".
+    CHECK(out.at(0).name != QString("alpha.epub"));
+    CHECK(out.at(0).name != QString("bravo.epub"));
+}
+
+// A file with no library row keeps its place in the listing under a date key:
+// not dropped, not crashed, and ordered as the oldest thing present (nffmt.h,
+// nf_date_compare). "zzz" is deliberately LAST in the name order, so a row
+// that merely kept its arrival position would land at the bottom instead.
+static void test_pipeline_keeps_a_dateless_row_under_a_date_key(void) {
+    QVector<nf_entry> e;
+    e << ent("alpha.epub", false) << ent("zzz-no-dates.epub", false);
+    QVector<nf_row> out;
+    nf_build_listing(e, date_meta, NULL, &out, NF_FILTER_ALL, NF_SORT_READ, false);
+    CHECK(out.size() == 2);
+    CHECK_EQ_STR(out.at(0).name, "zzz-no-dates.epub");
+    CHECK(out.at(0).dateLastRead.isEmpty());
+}
+
+// Labels are still derived LAST, over survivors only, under the new keys --
+// the invariant test_labels_match_their_rows_after_sorting pins for the old
+// ones. A label that belonged to a different row would be the worst possible
+// outcome of a stage reorder, so it is checked against the date sort too.
+static void test_labels_still_match_their_rows_under_a_date_key(void) {
+    QVector<nf_entry> e;
+    e << ent("alpha.epub", false) << ent("bravo.epub", false) << ent("charlie.epub", false);
+    QVector<nf_row> out;
+    nf_build_listing(e, date_meta, NULL, &out, NF_FILTER_ALL, NF_SORT_ADDED, false);
+    CHECK(out.size() == 3);
+    // Whether or not nf_strip_common decided it could shorten these, every
+    // label must still belong to the row it sits on -- a label shuffled
+    // relative to its row is the worst outcome a stage reorder could produce,
+    // and startsWith catches it either way ("alpha.epub" does not start with
+    // "bravo").
+    for (int i = 0; i < out.size(); i++)
+        CHECK(out.at(i).name.startsWith(out.at(i).label));
+    CHECK_EQ_STR(out.at(0).name, "bravo.epub");   // the date-added order, as above
+}
+
 int main(void) {
     test_junk_is_dropped_before_anything_else();
     test_metadata_is_fetched_for_every_row();
@@ -609,5 +727,9 @@ int main(void) {
     test_read_state_filter_can_filter_to_nothing();
     test_pipeline_orders_by_size_after_the_metadata_reorder();
     test_pipeline_orders_by_date_after_the_metadata_reorder();
+    test_pipeline_orders_by_date_added_which_only_meta_knows();
+    test_pipeline_orders_by_date_last_read_not_by_date_added();
+    test_pipeline_keeps_a_dateless_row_under_a_date_key();
+    test_labels_still_match_their_rows_under_a_date_key();
     NF_TEST_MAIN_END
 }

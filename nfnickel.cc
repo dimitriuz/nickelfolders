@@ -89,6 +89,39 @@ static bool (*Content__isFinished)(Content const *_this);
 // accessor reads +140").
 static void const *(*Volume__d_const)(Volume const *_this);
 
+// Volume::getDateAddedSortKey(Device const&) const -- NON-static, `this` in
+// r0, `Device const&` in r1, and NO hidden return buffer: it returns a
+// POINTER to a QByteArray, not a QByteArray by value. Measured (the
+// date-getter archaeology, section 5, from the full 20-instruction body and
+// all five of its PLT stubs): the sideloaded branch computes `d() + 60` into
+// r0 and `pop`s, and the Instapaper branch TAIL-CALLS Content::dateAdded(),
+// which is itself register-returning -- a tail call can only be typed that
+// way if both return in the same register.
+//
+// This is Nickel's OWN "recently added" key: its DateAddedKey<Volume>::key
+// tail-calls exactly this function (0x008355cc), having stashed
+// Device::getCurrentDevice()'s return at key+4 to pass as the r1 argument,
+// which is precisely what nf_current_device() (below) hands it here.
+//
+// Used in preference to Content::dateAdded() on measurement, not taste. For a
+// SIDELOADED volume -- which is every file this browser lists, since purchased
+// kepubs live under the .kobo dot-directory the listing hides --
+// getDateAddedSortKey answers ___SyncTime (Volume::d()+60) and never reaches
+// ___DateAdded (d()+88) at all; that field is only consulted for Instapaper
+// content. Sorting sideloaded rows by Content::dateAdded() could hand every
+// row the same empty key and, under a stable sort, silently reproduce the name
+// order with no error anywhere -- the exact invisible-wrong-answer failure
+// this file's other guards exist to refuse.
+//
+// The returned pointer aims INTO the Volume's refcounted 408-byte private
+// block, so the QByteArray is COPIED before Volume::~Volume() runs
+// (nf_volume_exists). Content::getDateLastRead() is deliberately NOT resolved
+// anywhere in this mod: it is fully derived (archaeology section 2) but it is
+// the one piece of this feature carrying the displaced-sret shape that
+// crashed Nickel on VolumeManager::getById, and reading ___DateLastRead as
+// bytes needs no new symbol at all -- see nf_volume_exists.
+static QByteArray const *(*Volume__getDateAddedSortKey)(Volume const *_this, Device const *dev);
+
 static void    (*ReadBookActionProxy__ctor)(ReadBookActionProxy *_this, QObject *parent, Volume const *v);
 static void    (*ReadBookActionProxy__onSelected)(ReadBookActionProxy *_this);
 
@@ -188,6 +221,7 @@ struct nh_dlsym NFNickelDlsym[] = {
     {.name = "_ZNK7Content13getReadStatusEv",                 .out = nh_symoutptr(Content__getReadStatus),          .desc = "Content::getReadStatus",                 .optional = true},
     {.name = "_ZNK7Content10isFinishedEv",                    .out = nh_symoutptr(Content__isFinished),             .desc = "Content::isFinished",                    .optional = true},
     {.name = "_ZNK6Volume1dEv",                               .out = nh_symoutptr(Volume__d_const),                 .desc = "Volume::d",                              .optional = true},
+    {.name = "_ZNK6Volume19getDateAddedSortKeyERK6Device",    .out = nh_symoutptr(Volume__getDateAddedSortKey),     .desc = "Volume::getDateAddedSortKey",            .optional = true},
     {.name = "_ZN19ReadBookActionProxyC1EP7QObjectRK6Volume", .out = nh_symoutptr(ReadBookActionProxy__ctor),       .desc = "ReadBookActionProxy::ReadBookActionProxy", .optional = true},
     {.name = "_ZN19ReadBookActionProxy10onSelectedEv",        .out = nh_symoutptr(ReadBookActionProxy__onSelected), .desc = "ReadBookActionProxy::onSelected",        .optional = true},
     {.name = "_ZN6Device16getCurrentDeviceEv",                .out = nh_symoutptr(Device__getCurrentDevice),        .desc = "Device::getCurrentDevice",               .optional = true},
@@ -290,6 +324,42 @@ static bool nf_percent_offset_warned = false;
 // initialised .bss, same reason as above.
 static bool nf_read_status_warned = false;
 
+// The same one-shot discipline again, once per date key. Two flags rather
+// than one for the reason the two above are also separate: the two keys fail
+// for DIFFERENT causes -- ___DateAdded comes back through a dlsym'd function
+// whose contract is checked by name, while ___DateLastRead is a hardcoded
+// struct offset with no name-resolution safety net at all -- and a shared
+// flag would let whichever fired first silence the other for the rest of the
+// run, which is exactly how a moved offset would go unnoticed behind an
+// unrelated firmware change. Plain zero-initialised .bss, no dynamic
+// initialiser (CLAUDE.md's `nm | grep GLOBAL__sub_I` must stay empty).
+static bool nf_date_added_warned     = false;
+static bool nf_date_last_read_warned = false;
+
+// Set once this run's ONE raw-bytes log line has been emitted. That line is
+// the measurement the host-only archaeology could not make: whether the
+// date-added key (___SyncTime, for sideloaded content) is actually POPULATED
+// for sideloaded rows on this card. If it is empty, a sort on it hands every
+// row the same key and -- under nffmt.cc's stable insertion sort -- silently
+// reproduces the name order, which is the failure mode nf_sort_key's own
+// comment (nffmt.h) says to read as a FAILURE rather than a coincidence.
+// Logged for the FIRST row this run only, because a 227-file sweep into the
+// RAM ring buffer would push its own head off the end (CLAUDE.md).
+static bool nf_date_bytes_logged = false;
+
+// Device::getCurrentDevice() with its NULL-check in one place. Shared by
+// nf_volume_exists (which needs the Device* as Volume::getDateAddedSortKey's
+// r1 argument -- the same one Nickel's own DateAddedKey<Volume> stashes at
+// key+4) and by nf_db_name below, rather than calling the symbol from two
+// places: every NFNickelDlsym entry is .optional, so the pointer really can
+// be NULL, and calling through a NULL function pointer is `blx` to address 0
+// inside Nickel.
+static Device *nf_current_device(void) {
+    if (!Device__getCurrentDevice)
+        return NULL;
+    return Device__getCurrentDevice();
+}
+
 // Same discipline as nf_open_book_staged (above): getById answers an
 // unknown ContentID with a default-constructed Volume rather than an
 // error, so isValid is what actually distinguishes "found it" from "no
@@ -303,9 +373,19 @@ static bool nf_read_status_warned = false;
 // is true: an invalid Volume's private data is not something any of this
 // project's archaeology says anything about reading.
 bool nf_volume_exists(QString const& contentId, QString const& dbName,
-                      int *outPercentRead, nf_read_state *outReadState) {
+                      int *outPercentRead, nf_read_state *outReadState,
+                      QByteArray *outDateAdded, QByteArray *outDateLastRead) {
     *outPercentRead = -1;
     *outReadState   = NF_READ_UNKNOWN;
+    // Cleared up front like the two above, so every out-parameter is written
+    // on every path including the negative-control one (a ContentID no book
+    // has: getById default-constructs, isValid() is false, and neither date
+    // read below is ever reached -- the row keeps its empty keys and its
+    // `[not in library]` suffix). An EMPTY key is this mod's only spelling of
+    // "no date known"; nffmt.h's nf_date_compare has where empty then sorts
+    // and why.
+    outDateAdded->clear();
+    outDateLastRead->clear();
 
     if (!nf_nickel_resolve())
         return false;
@@ -413,7 +493,158 @@ bool nf_volume_exists(QString const& contentId, QString const& dbName,
                     nf_percent_offset_warned = true;
                     nh_log("progress: percentRead offset (Volume::d()+140) read %d for '%s' -- outside 0..100, treating as unknown; this firmware may have moved the field", pct, qPrintable(contentId));
                 }
+
+                // ___DateLastRead: a QByteArray at Volume::d() + 40, read off
+                // the SAME `d` the percentage above came from -- one virtual
+                // call, two fields. This is the "recently read" sort key, and
+                // it needs NO NEW SYMBOL AT ALL, which is the whole reason it
+                // is read this way: the only getter that returns this value,
+                // Content::getDateLastRead(), returns a QDateTime BY VALUE and
+                // therefore carries the displaced sret+this shape that crashed
+                // Nickel on VolumeManager::getById (CLAUDE.md, "What the
+                // hardware overruled"). It is fully derived (the date-getter
+                // archaeology, section 2) and deliberately left unresolved.
+                //
+                // The offset is hardcoded, with the same missing safety net
+                // the +140 read above spells out -- and pinned HARDER than
+                // that one is. Five independent sightings, each in a different
+                // function: Content::getDbValues files exactly +40 under
+                // ATTRIBUTE_DATE_LAST_READ (read out of its own GOT
+                // relocation); Content::setDateLastRead writes it as a
+                // QByteArray (QArrayData::deallocate(..., 1, 4), the inlined
+                // QByteArray destructor); Content::getDateLastRead reads it;
+                // Content::isNew() qstrcmps it against +60; and Nickel's own
+                // RecentKey<Volume>::key reads literally [d()+40] rather than
+                // calling any getter, because none exists (the archaeology
+                // swept 61 const Content members and found no reader of +40).
+                // +140 rests on three such sightings and already ships.
+                //
+                // nf_date_key_is_plausible (nffmt.cc, and host-tested there)
+                // stands in for the missing safety net: a shifted offset lands
+                // on a title, an image id or a raw integer, none of which is
+                // shaped like ^\d{4}-\d\d-\d\d[Tt ]. On a failing value the
+                // key degrades to UNKNOWN (empty) and is logged once -- it is
+                // never REPAIRED, for the same reason the percentage above is
+                // never clamped into 0..100: a repaired value hides the very
+                // layout change the check exists to catch.
+                //
+                // COPIED, not pointed at. The QByteArray lives inside the
+                // Volume's refcounted 408-byte private block, which
+                // Volume__dtor(v) below drops a reference to; QByteArray's
+                // copy constructor bumps the refcount on the STRING's own
+                // data, which is independent of that block, so the copy
+                // outlives ~Volume() by construction. Compiled against the
+                // same Qt 5.2.1 the device runs (NickelTC), so this is the
+                // real copy constructor, not a layout assumption of ours.
+                //
+                // TWO guards, in this order, and the order is the point. The
+                // shape check below can only run on bytes it has already
+                // dereferenced, and a QByteArray is ONE POINTER to a
+                // heap-allocated QArrayData -- so if the offset has moved and
+                // +40 now holds, say, a small int or a bool, reading
+                // size()/constData() dereferences that value AS AN ADDRESS
+                // and segfaults Nickel. (The +140 read above cannot fail this
+                // way: an int is read directly, never followed.) So the raw
+                // word is checked FIRST -- non-NULL, 4-byte aligned, and
+                // above the lowest page Linux will map (mmap_min_addr is
+                // 4096 by default, so no legitimate heap pointer is below it)
+                // -- and only then reinterpreted. Qt never leaves this
+                // pointer NULL even for an empty QByteArray: it points at the
+                // shared null. The guard cannot catch every wrong layout, but
+                // it catches the shapes a moved offset actually produces
+                // cheaply, and it refuses rather than repairs, same as
+                // everything else in this function.
+                quintptr slot = *reinterpret_cast<quintptr const*>(static_cast<char const*>(d) + 40);
+                QByteArray const *lastRead = (slot >= 4096 && (slot & 3) == 0)
+                    ? reinterpret_cast<QByteArray const*>(static_cast<char const*>(d) + 40)
+                    : NULL;
+                if (lastRead && nf_date_key_is_plausible(*lastRead)) {
+                    *outDateLastRead = *lastRead;
+                } else if (!nf_date_last_read_warned) {
+                    nf_date_last_read_warned = true;
+                    if (!lastRead) {
+                        // The word itself, hex, before anything else -- there
+                        // is no string to print here, because the thing at +40
+                        // is not a QByteArray at all on this layout.
+                        nh_log("dates: ___DateLastRead (Volume::d()+40) holds 0x%08lx, which is not a usable QArrayData pointer -- treating as unknown, NOT dereferencing it; this firmware has moved the field. contentId '%s'",
+                               (unsigned long)slot, qPrintable(contentId));
+                    } else {
+                        // The value FIRST, the path last: nh_log truncates at
+                        // 256 bytes silently and book paths on this card run
+                        // past 230 characters (CLAUDE.md), so a load-bearing
+                        // value placed after the path is a value that never
+                        // reaches logread. Logged as HEX, and only the first
+                        // 32 bytes of it, because the whole point of this
+                        // branch is that the bytes are not a date and may not
+                        // be printable or NUL-terminated at all.
+                        nh_log("dates: ___DateLastRead (Volume::d()+40) read '%s' (hex) -- not ISO-8601-shaped, treating as unknown; this firmware may have moved the field. contentId '%s'",
+                               lastRead->left(32).toHex().constData(), qPrintable(contentId));
+                    }
+                }
             }
+        }
+
+        // ___DateAdded, via Nickel's OWN key function rather than a field of
+        // ours -- Volume::getDateAddedSortKey's declaration comment (above)
+        // has the full derivation, including why Content::dateAdded() would be
+        // the wrong field for the sideloaded content this browser lists.
+        //
+        // NOTE THE COLLAPSE THIS CREATES, and the control it implies:
+        // getDateAddedSortKey returns ___SyncTime for a sideloaded volume, and
+        // Nickel's own "recent" key is max(___DateLastRead, ___SyncTime) for
+        // the same content -- so for a sideloaded book that has NEVER BEEN
+        // OPENED the two keys coincide EXACTLY. That is Nickel's own
+        // behaviour, not a defect here, but it means a device check run over a
+        // folder of never-opened books would show "recently added" and
+        // "recently read" in identical order and prove nothing whatsoever. A
+        // non-vacuous check needs a folder where at least one book has
+        // actually been opened, and requires the new order to DIFFER from
+        // NF_SORT_NAME's and to REVERSE under `descending` (nffmt.h,
+        // nf_sort_key).
+        //
+        // Both pointers NULL-checked: the symbol is .optional like every other
+        // entry, and getDateAddedSortKey's Device argument comes from
+        // Device::getCurrentDevice(), which is .optional too. Either being
+        // absent disables THIS SORT KEY ALONE (the key stays empty, every row
+        // ties, the listing falls through to its name tie-break) and nothing
+        // else -- no failed init, because NickelHook's failsafe is SHARED with
+        // the owner's NickelMenu/NickelDBus/kfmon installs.
+        if (Volume__getDateAddedSortKey) {
+            Device *dev = nf_current_device();
+            if (dev) {
+                // Same copy-before-~Volume() rule as ___DateLastRead above:
+                // this returns a POINTER into the same private block (measured
+                // -- no sret, r0 out; archaeology section 5).
+                QByteArray const *added = Volume__getDateAddedSortKey(v, dev);
+                if (added) {
+                    if (nf_date_key_is_plausible(*added)) {
+                        *outDateAdded = *added;
+                    } else if (!nf_date_added_warned) {
+                        nf_date_added_warned = true;
+                        nh_log("dates: Volume::getDateAddedSortKey() read '%s' (hex) -- not ISO-8601-shaped, treating as unknown; the wrong symbol may have resolved. contentId '%s'",
+                               added->left(32).toHex().constData(), qPrintable(contentId));
+                    }
+                }
+            }
+        }
+
+        // The measurement, once per run. See nf_date_bytes_logged's own
+        // comment for what it answers -- specifically whether the date-added
+        // key is populated at all for sideloaded rows on this card, which the
+        // host-only archaeology could not establish and which decides whether
+        // the "recently added" sort is doing anything.
+        //
+        // Both keys BEFORE the path, per nh_log's silent 256-byte truncation.
+        // These are the POST-VALIDATION values, so an empty field here means
+        // either "the DB really holds nothing" or "the bytes failed the shape
+        // check" -- and in the second case the one-shot warning above has
+        // already named which key and printed its raw hex, so the two lines
+        // together are unambiguous.
+        if (!nf_date_bytes_logged) {
+            nf_date_bytes_logged = true;
+            nh_log("dates: raw keys added='%s' lastRead='%s' (empty means no date in the row) for contentId '%s'",
+                   outDateAdded->constData(), outDateLastRead->constData(),
+                   qPrintable(contentId));
         }
     }
 
@@ -438,9 +669,9 @@ bool nf_volume_exists(QString const& contentId, QString const& dbName,
 // and calling through a NULL function pointer is `blx` to address 0 inside
 // Nickel -- so this function guards itself rather than assuming a caller did.
 QString const *nf_db_name(void) {
-    if (!Device__getCurrentDevice || !Device__getDbName)
+    if (!Device__getDbName)
         return NULL;
-    Device *dev = Device__getCurrentDevice();
+    Device *dev = nf_current_device();   // NULL-checks Device::getCurrentDevice itself
     if (!dev)
         return NULL;
     return Device__getDbName(dev);

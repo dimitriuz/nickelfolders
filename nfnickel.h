@@ -323,8 +323,36 @@ bool nf_native_view_resolve(void);
 // still exactly one source of truth for "is this book finished" -- it just
 // moved from Content::isFinished() to Content::getReadStatus(), with
 // isFinished() kept as the cross-check it always was (nfnickel.cc).
+// *outDateAdded and *outDateLastRead receive Nickel's own two date sort keys
+// as RAW ISO-8601 BYTES -- never a QDateTime, because Nickel never converts
+// them either (nf_row::dateAdded's comment in nffmt.h has the measurement).
+// "recently added" is Volume::getDateAddedSortKey(Device const&), Nickel's own
+// key function, which answers ___SyncTime for the sideloaded content this
+// browser lists; "recently read" is the ___DateLastRead QByteArray at
+// Volume::d() + 40, read directly because no getter for it exists that does
+// not return by value. Content::getDateLastRead() is deliberately NOT resolved
+// anywhere in this mod -- it is fully derived but it is the one piece of this
+// feature carrying the displaced-sret shape that crashed Nickel on
+// VolumeManager::getById; nfnickel.cc says so at both call sites.
+//
+// Both are EMPTY -- this mod's only spelling of "no date known" -- when
+// contentId has no row, when a needed .optional symbol is NULL (that
+// degradation disables the one sort key and nothing else), or when the raw
+// bytes failed nf_date_key_is_plausible (nffmt.h), which is the safety net
+// standing in for a hardcoded offset's missing dlsym check and which logs once
+// rather than repairing the value. Empty is NOT a bucket of its own:
+// nf_date_compare substitutes Nickel's own ZERO_DB_DATE_ARRAY sentinel for it,
+// so a dateless row sorts where Nickel puts a dateless row. Like every other
+// out-parameter here, both are always written, even when this returns false.
+//
+// BOTH KEYS COINCIDE for a sideloaded book that has never been opened, because
+// both of Nickel's date sorts fall back to ___SyncTime for sideloaded content.
+// That is Nickel's behaviour, not a defect, but it defeats a naive "the two
+// sorts differ, so both work" device check -- see nfnickel.cc's own comment at
+// the getDateAddedSortKey call for the control it implies.
 bool nf_volume_exists(QString const& contentId, QString const& dbName,
-                      int *outPercentRead, nf_read_state *outReadState);
+                      int *outPercentRead, nf_read_state *outReadState,
+                      QByteArray *outDateAdded, QByteArray *outDateLastRead);
 
 // QSharedPointer<T>'s complete runtime layout, for every T, per Qt 5.2's
 // public qsharedpointer_impl.h: a value pointer, then an

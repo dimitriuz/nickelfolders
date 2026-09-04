@@ -267,15 +267,40 @@ static int nf_compare_i64(qint64 a, qint64 b) {
 // to keep in sync with this one, and "recently touched" is still a
 // defensible reading of a folder's own mtime for a reader who tapped
 // "sort: date".
-static bool nf_entry_before(nf_entry const& a, nf_entry const& b,
-                             nf_sort_key key, bool descending) {
+//
+// The two DATE-METADATA keys are the one place that breaks down, and it
+// breaks down harmlessly: there is no Volume for a folder, so nflist.cc's
+// metadata stage skips directories and every folder's dateAdded/dateLastRead
+// stays empty. All folders therefore tie under NF_SORT_ADDED/NF_SORT_READ and
+// fall through to the name tie-break below, which is the only order a folder
+// could honestly be given by a library date it does not have. Folders still
+// group ahead of files in both directions, as ever.
+//
+// Takes an nf_row, not an nf_entry, and that direction is deliberate: the two
+// date keys (NF_SORT_ADDED/NF_SORT_READ) are METADATA, so they exist only on
+// a row -- an nf_entry has nowhere to put them. Before those keys existed
+// this function took an nf_entry and nf_sort_rows adapted a row DOWN to one;
+// adapting the other way keeps the ordering RULES in exactly one place, which
+// is the property worth preserving (the alternative -- two comparators -- is
+// two copies of 6.2's "reverse the list" trap and of the tie-break, one of
+// which would eventually be edited alone). nf_sort_entries now adapts UP
+// instead, and simply sees two empty date keys under either date-metadata
+// key; see nf_sort_entries' own comment.
+static bool nf_row_before(nf_row const& a, nf_row const& b,
+                          nf_sort_key key, bool descending) {
     if (a.isDir != b.isDir)
         return a.isDir;
 
     int cmp;
     switch (key) {
-        case NF_SORT_SIZE: cmp = nf_compare_i64(a.size, b.size);   break;
-        case NF_SORT_DATE: cmp = nf_compare_i64(a.mtime, b.mtime); break;
+        case NF_SORT_SIZE:  cmp = nf_compare_i64(a.size, b.size);   break;
+        case NF_SORT_DATE:  cmp = nf_compare_i64(a.mtime, b.mtime); break;
+        // Byte comparison, never a parse -- nf_date_compare (below) and
+        // nf_row::dateAdded's own comment (nffmt.h) have why. A row whose key
+        // is empty is not skipped or floated: nf_date_compare gives it
+        // Nickel's own sentinel, so it orders as the oldest thing present.
+        case NF_SORT_ADDED: cmp = nf_date_compare(a.dateAdded, b.dateAdded);       break;
+        case NF_SORT_READ:  cmp = nf_date_compare(a.dateLastRead, b.dateLastRead); break;
         case NF_SORT_NAME:
         default:            cmp = nf_natural_compare(a.name, b.name); break;
     }
@@ -285,11 +310,33 @@ static bool nf_entry_before(nf_entry const& a, nf_entry const& b,
     return descending ? (cmp > 0) : (cmp < 0);
 }
 
+// The entry-level sort adapts UP to a row rather than restating any of the
+// rules -- see nf_row_before's own comment for why that direction inverted.
+// The copy is shallow: `name` is a refcounted QString and the two date keys
+// are refcounted QByteArrays (empty, hence shared-null, on every entry that
+// comes through here), so this is a handful of atomic increments per
+// comparison against a 27-entry worst case measured on the reference card.
+//
+// NF_SORT_ADDED/NF_SORT_READ against bare ENTRIES therefore compare two empty
+// keys for every pair and fall through to the name tie-break. That is correct
+// rather than merely harmless: an nf_entry is a raw directory entry and has no
+// library metadata to order by, so "order by a field nobody filled in" can
+// only mean "leave the name order alone". The pipeline sorts rows
+// (nf_sort_rows, via nflist.cc), which is where those two keys have values.
+static nf_row nf_row_of(nf_entry const& e) {
+    nf_row r;
+    r.name  = e.name;   // the ON-DISK name, never a label: labels are derived last, after ordering (nflist.cc)
+    r.isDir = e.isDir;
+    r.size  = e.size;
+    r.mtime = e.mtime;
+    return r;
+}
+
 void nf_sort_entries(QVector<nf_entry> *entries, nf_sort_key key, bool descending) {
     for (int i = 1; i < entries->size(); i++) {
         nf_entry cur = entries->at(i);
         int j = i - 1;
-        while (j >= 0 && nf_entry_before(cur, entries->at(j), key, descending)) {
+        while (j >= 0 && nf_row_before(nf_row_of(cur), nf_row_of(entries->at(j)), key, descending)) {
             (*entries)[j + 1] = entries->at(j);
             j--;
         }
@@ -297,34 +344,85 @@ void nf_sort_entries(QVector<nf_entry> *entries, nf_sort_key key, bool descendin
     }
 }
 
-// The row-level sort borrows nf_entry_before through a throwaway nf_entry
-// rather than restating any of it. What gets duplicated below is the
-// insertion-sort LOOP -- five self-evident lines -- and not the ordering
-// RULES, which are the part with a measured trap in them (6.2's
-// "reverse the list", and the tie-break) and stay in exactly one function.
-// The copy is shallow: an nf_row's `name` is a refcounted QString, so this is
-// two atomic increments per comparison against a 27-entry worst case measured
-// on the reference card -- cheaper than a second copy of the rules for
-// somebody to keep in sync with the first.
-static nf_entry nf_entry_of(nf_row const& r) {
-    nf_entry e;
-    e.name  = r.name;   // the ON-DISK name, never the label: labels are derived last, after ordering (nflist.cc)
-    e.isDir = r.isDir;
-    e.size  = r.size;
-    e.mtime = r.mtime;
-    return e;
-}
-
+// The insertion-sort LOOP is what is duplicated here -- five self-evident
+// lines -- and not the ordering RULES, which are the part with a measured trap
+// in them (6.2's "reverse the list", and the tie-break) and stay in exactly
+// one function.
 void nf_sort_rows(QVector<nf_row> *rows, nf_sort_key key, bool descending) {
     for (int i = 1; i < rows->size(); i++) {
         nf_row cur = rows->at(i);
         int j = i - 1;
-        while (j >= 0 && nf_entry_before(nf_entry_of(cur), nf_entry_of(rows->at(j)), key, descending)) {
+        while (j >= 0 && nf_row_before(cur, rows->at(j), key, descending)) {
             (*rows)[j + 1] = rows->at(j);
             j--;
         }
         (*rows)[j + 1] = cur;
     }
+}
+
+// --- the two date keys, as bytes ----------------------------------------
+//
+// nffmt.h carries the full derivation for both of these, including the
+// empty-date rule and why a failing value is never repaired. Kept together
+// here because they are one decision split across two functions: what a key
+// is allowed to contain, and how two of them order.
+int nf_date_compare(QByteArray const& a, QByteArray const& b) {
+    // NOT a file-scope QByteArray: a plain char array with a string-literal
+    // initialiser is POD, so it lives in .rodata with no dynamic initialiser
+    // to run -- which is what keeps `nm libnfolders.so | grep GLOBAL__sub_I`
+    // empty (CLAUDE.md). A `static QByteArray` here would be exactly the
+    // construct that boot-looped this mod once already.
+    static char const zero[] = NF_ZERO_DB_DATE;
+
+    // constData() on an empty (or null) QByteArray is a valid pointer to a
+    // '\0' in Qt's shared-null, never NULL, so the substitution below is the
+    // only reason to special-case empty -- not pointer safety.
+    char const *pa = a.isEmpty() ? zero : a.constData();
+    char const *pb = b.isEmpty() ? zero : b.constData();
+
+    // qstricmp, not strcasecmp: identical ASCII case folding, but it comes
+    // from QtCore, which this project links against on both the host and the
+    // device, and it is locale-independent by construction. Nickel's own
+    // RecentSorter uses strcasecmp (archaeology section 6) and these date
+    // strings only ever differ in case at the 'T' separator or a trailing
+    // 'Z', where ASCII folding is the whole of the question.
+    return qstricmp(pa, pb);
+}
+
+bool nf_date_key_is_plausible(QByteArray const& raw) {
+    // Empty is the honest "unknown" and must be accepted, or a file with no
+    // library row at all -- a NORMAL case on this card, not an error
+    // (CLAUDE.md: 226 of 227 files import, and the browser must say so in the
+    // row rather than hide it) -- would be logged as a layout failure on every
+    // single listing.
+    if (raw.isEmpty())
+        return true;
+
+    // ^\d{4}-\d\d-\d\d[Tt ] -- eleven characters is the shortest prefix
+    // that pins the shape; anything shorter cannot be a date and anything
+    // after the separator is not this check's business (the milliseconds and
+    // any zone suffix vary, per the archaeology's own open question 8.2, and
+    // guessing a width here would reject valid rows).
+    static int const kPrefix = 11;
+    if (raw.size() < kPrefix)
+        return false;
+
+    char const *p = raw.constData();
+    for (int i = 0; i < 4; i++)
+        if (p[i] < '0' || p[i] > '9') return false;
+    if (p[4] != '-') return false;
+    if (p[5] < '0' || p[5] > '9') return false;
+    if (p[6] < '0' || p[6] > '9') return false;
+    if (p[7] != '-') return false;
+    if (p[8] < '0' || p[8] > '9') return false;
+    if (p[9] < '0' || p[9] > '9') return false;
+    // 'T' is what QDateTime::fromString(..., Qt::ISODate) parses and what
+    // Nickel's own ZERO_DB_DATE_ARRAY sentinel spells; 't' and ' ' are the
+    // other two spellings ISO-8601 and SQLite respectively allow, accepted
+    // because rejecting a genuinely valid row would look exactly like a moved
+    // offset and send the next reader after the wrong cause.
+    if (p[10] != 'T' && p[10] != 't' && p[10] != ' ') return false;
+    return true;
 }
 
 bool nf_is_book_name(QString const& name) {
