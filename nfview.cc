@@ -46,6 +46,7 @@
 #include <QBrush>
 #include <QDateTime>
 #include <QDir>
+#include <QFile>
 #include <QFileInfo>
 #include <QFileInfoList>
 #include <QFont>
@@ -904,6 +905,10 @@ static void nf_icon_badge(nf_icon_kind kind, QString *markup, QString *plain) {
 
 // The leading markup for one row, separator included, so the row loop never
 // has to know which kinds render as an image and which as text.
+// Forward-declared: the definition sits with the elision helpers below,
+// next to the other dev-only affordance, but nf_icon_markup needs it here.
+static int nf_img_src_form(void);
+
 static QString nf_icon_markup(nf_icon_kind kind) {
     nf_icons_generate();
 
@@ -926,13 +931,56 @@ static QString nf_icon_markup(nf_icon_kind kind) {
         // &nbsp; rather than a plain space for the separator, here and in the
         // badges above: this string is rich text by the time QLabel sees it,
         // and HTML collapses runs of whitespace.
-        return QStringLiteral("<img src=\"file://%1\" width=\"%2\" height=\"%3\">&nbsp;")
-                   .arg(QString::fromLatin1(e->path)).arg(e->w).arg(e->h);
+        // DEV-ONLY, and the reason it exists is worth stating: the form
+        // above was verified on HOST Qt 5.15 and does NOT render on the
+        // device's Qt 5.2.1, where every row drew Qt's own broken-image
+        // placeholder instead. The files themselves are fine -- all five
+        // wrote and read back at 40x40 with distinct sizes, and the control
+        // path reported null -- so the fault is purely in how QTextDocument
+        // resolves an <img src> on 5.2.1, which is exactly the version skew
+        // the Makefile's two build paths are kept apart to expose.
+        //
+        // Rather than spend a rebuild AND a Nickel restart per guess at the
+        // right form, the form is selected at RUNTIME from
+        // /tmp/nfolders-imgsrc, re-read on every listing build. So a form can
+        // be tried by writing one digit over ssh and re-triggering the
+        // browser -- no rebuild, no restart, no taps from the owner. /tmp is
+        // tmpfs, so this is not a handle on /mnt/onboard (CLAUDE.md).
+        //
+        // Once one form is known good on 5.2.1 this selector should collapse
+        // to that form plus a comment recording which won and why. Leaving a
+        // dev-only branch in shipped code is not the intent.
+        QString path = QString::fromLatin1(e->path);
+        QString src;
+        switch (nf_img_src_form()) {
+            case 1:  src = path; break;                                  // plain absolute path
+            case 2:  src = QStringLiteral("file:") + path; break;         // single-slash scheme
+            case 0:
+            default: src = QStringLiteral("file://") + path; break;       // as shipped, fails on 5.2.1
+        }
+        return QStringLiteral("<img src=\"%1\" width=\"%2\" height=\"%3\">&nbsp;")
+                   .arg(src).arg(e->w).arg(e->h);
     }
 
     QString badge;
     nf_icon_badge(kind, &badge, NULL);
     return badge;
+}
+
+// DEV-ONLY: which <img src> form nf_icon_html emits, read fresh from
+// /tmp/nfolders-imgsrc on every call so a form can be tested with a
+// re-trigger rather than a rebuild-and-restart. Absent, unreadable or
+// out-of-range means form 0, i.e. exactly the behaviour that shipped.
+// See nf_icon_html for the measurement that made this necessary.
+static int nf_img_src_form(void) {
+    QFile f(QStringLiteral("/tmp/nfolders-imgsrc"));
+    if (!f.open(QIODevice::ReadOnly))
+        return 0;
+    QByteArray raw = f.readAll().trimmed();
+    f.close();
+    bool ok = false;
+    int  v  = raw.toInt(&ok);
+    return (ok && v >= 0 && v <= 2) ? v : 0;
 }
 
 // --- row label elision -------------------------------------------------
@@ -1143,6 +1191,12 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
                          : "FALLBACK, the dialog is not laid out yet",
            rawDialogWidth, layoutMargins.left(), layoutMargins.right(),
            NF_PANEL_VISIBLE_WIDTH_PX);
+
+    // DEV-ONLY, paired with nf_img_src_form: says which <img src> form these
+    // rows were built with, so a screenshot can never be misattributed to the
+    // wrong form while the selector is being narrowed down.
+    nh_log("browser: <img src> form %d (0=file://, 1=plain path, 2=file:) -- /tmp/nfolders-imgsrc",
+           nf_img_src_form());
 
     // Row 0: a GUARANTEED exit, independent of N3Dialog's own backTapped()
     // signal (wired once, in nf_browser_show, to this exact same
