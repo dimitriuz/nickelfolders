@@ -448,3 +448,39 @@ bool nf_is_hidden_dir(QString const& name) {
         return true;
     return false;
 }
+
+// --- row icons ----------------------------------------------------------
+//
+// The mapping only, not the markup: what a kind LOOKS like is Qt-resource and
+// rendering territory and lives in nfview.cc, which nothing off-device can
+// run. This half is a decision about a name, so it is testable, and it is the
+// half with the trap in it -- ".kepub.epub" also ends in ".epub", which is
+// exactly why nf_book_extension is reused here rather than re-derived (see
+// NF_EXTS' longest-match-first comment above, and nf_matches_filter, which
+// leans on the same property for NF_FILTER_EPUB).
+nf_icon_kind nf_icon_kind_for(QString const& name, bool isDir) {
+    // FIRST, before the name is even looked at. A directory named
+    // "Comics.cbz" is a directory; the reported defect this feature answers
+    // was a .cbr FILE reading as a folder, so letting an extension outvote
+    // isDir here would reintroduce the same confusion with the icon that is
+    // supposed to end it.
+    if (isDir)
+        return NF_ICON_FOLDER;
+
+    QString ext = nf_book_extension(name);
+    if (ext.compare(QStringLiteral(".epub"), Qt::CaseInsensitive) == 0
+     || ext.compare(QStringLiteral(".kepub.epub"), Qt::CaseInsensitive) == 0)
+        return NF_ICON_BOOK;
+    if (ext.compare(QStringLiteral(".cbz"), Qt::CaseInsensitive) == 0
+     || ext.compare(QStringLiteral(".cbr"), Qt::CaseInsensitive) == 0)
+        return NF_ICON_COMIC;
+    if (ext.compare(QStringLiteral(".pdf"), Qt::CaseInsensitive) == 0)
+        return NF_ICON_PDF;
+    // Everything else, including an empty extension. Unreachable for a row
+    // the current hide-junk stage produced (nf_is_book_name gates every file
+    // row on the same NF_EXTS allowlist), which is why it is worth stating
+    // that this is a real answer and not a fall-through: the allowlist and
+    // this map are separate layers, and a ".txt" added to NF_EXTS later must
+    // come out of here with a badge rather than with no icon at all.
+    return NF_ICON_UNKNOWN;
+}

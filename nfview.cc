@@ -47,6 +47,7 @@
 #include <QDir>
 #include <QFileInfo>
 #include <QFileInfoList>
+#include <QImage>
 #include <QLabel>
 #include <QObject>
 #include <QPushButton>
@@ -440,6 +441,132 @@ static void nf_browser_back(void *mwc, N3Dialog *dialog) {
     nf_browser_go(mwc, dialog, parent, true); // ascend -- a different directory, page resets
 }
 
+// --- row icons ---------------------------------------------------------
+//
+// A LEADING icon on every row. The folder/file distinction used to live only
+// in a TRAILING "/" appended to the label below, which is the worst available
+// place for it: it is the first thing lost when a long label runs off the
+// right edge, and nf_strip_common (nffmt.cc) leaves plenty of long labels.
+// The reference card's
+// "The Road - A Graphic Novel Adaptation (2024) (Digital) (phillywilly-Empire).cbr"
+// -- a FILE, and the reason this feature exists -- was read as a folder for
+// exactly that reason. A LEADING marker cannot be elided away.
+//
+// The images are NICKEL'S OWN Qt resources, not ours. This library runs inside
+// Nickel's process, so Nickel's compiled-in resources are already registered
+// and resolve from our code for free: no new assets, no rcc, nothing shipped,
+// no archaeology. rcc is specifically NOT an option here even if we wanted our
+// own artwork -- it registers a bundle from a FILE-SCOPE STATIC INITIALISER,
+// the exact construct that once boot-looped this mod into NickelHook's SHARED
+// failsafe, which can uninstall the owner's OTHER mods (nfnickel.cc's own
+// QByteArray account, and nf_browser_active_dialog's comment above).
+//
+// All three paths are present in 4.38.23684 as :/-prefixed literals in
+// Nickel's own code (`strings libnickel.so.1.0.0 | grep -F :/images/`, one hit
+// each). That they are present is NOT the same claim as that they RESOLVE from
+// this library, which is what nf_probe_icon_resources below exists to settle
+// on the device rather than leave to inference.
+#define NF_ICON_FOLDER_RES ":/images/widgets/folder.png"
+#define NF_ICON_BOOK_RES   ":/images/home/main_nav_books.png"
+#define NF_ICON_COMIC_RES  ":/images/reading/reading_image_view.png"
+
+// A path no resource has, probed alongside the three real ones. Without it,
+// "the real one loaded" is not evidence of anything -- CLAUDE.md's "a negative
+// control is what makes a check non-vacuous", the same discipline as the
+// isValid=false ContentID that made rung 1's isValid=true mean something.
+// Confirmed absent from the firmware by the same grep that found the three
+// above (zero hits).
+#define NF_ICON_CONTROL_RES ":/images/widgets/nfolders_does_not_exist.png"
+
+// Rendered height in px, forced on every <img> rather than left at whatever
+// size the resource happens to be. UNMEASURED and deliberately conservative:
+// these are Nickel's own chrome images at whatever size Nickel's own screens
+// wanted them, and an icon taller than the row's text would grow the row and
+// eat into a page budget that is already spoken for -- NF_ITEMS_PER_PAGE
+// (above) is keyed to a MEASURED 17-row page on a 1680px-visible panel, i.e. a
+// row pitch near 100px, so 40 cannot be what pushes the 12th item off the
+// screen. Raise it from the dimensions nf_probe_icon_resources logs, once a
+// screenshot shows how these actually render.
+#define NF_ICON_PX 40
+
+// Probed ONCE, lazily, on first use. A plain file-scope bool rather than a
+// function-local static for TWO reasons, both load-bearing here: a
+// function-local static of non-POD type compiles to a __cxa_guard_acquire/
+// release pair, i.e. libstdc++ runtime, which CLAUDE.md forbids outright; and
+// a POD bool lives in .bss with no constructor to race NickelHook's own
+// nh_init ordering, the same discipline as every other file-scope datum in
+// this file. Every caller runs on the GUI thread (a tap handler, or the
+// trigger that opens the screen), so there is no thread to race either.
+static bool nf_icons_probed = false;
+
+// QImage, not QPixmap: the open question is whether Nickel's RESOURCE TABLE
+// and the PNG decoder are reachable from this library at all, and QImage
+// answers exactly that with no QGuiApplication/platform dependency of its own
+// to confuse a null result with. It is also the type Qt's own rich-text image
+// handler loads through (QTextImageHandler, which is what actually renders the
+// <img> below), so a null here is a null there.
+//
+// Logged rather than acted on: there is nothing useful to do about a missing
+// resource except tell whoever reads the log, and the row's TEXT carries the
+// meaning regardless (see the label comment in the row loop). If the icons
+// simply do not appear on the panel, these four lines are the only thing that
+// can tell "no icon" apart from "the resource system is unreachable from a
+// plugin" -- symptoms that are otherwise identical.
+static void nf_probe_icon_resources(void) {
+    if (nf_icons_probed)
+        return;
+    nf_icons_probed = true;
+
+    char const *const paths[] = {
+        NF_ICON_FOLDER_RES, NF_ICON_BOOK_RES, NF_ICON_COMIC_RES, NULL,
+    };
+    for (int i = 0; paths[i]; i++) {
+        QImage img(QString::fromLatin1(paths[i]));
+        nh_log("icons: '%s' -> %s %dx%d", paths[i],
+               img.isNull() ? "NULL, did not load" : "loaded",
+               img.width(), img.height());
+    }
+
+    QImage control(QStringLiteral(NF_ICON_CONTROL_RES));
+    nh_log("icons: control '%s' -> %s", NF_ICON_CONTROL_RES,
+           control.isNull() ? "NULL, as required" : "LOADED -- probe is meaningless");
+}
+
+// The leading markup for one row, separator included, so the row loop never
+// has to know which kinds render as an image and which as text.
+//
+// pdf and unknown are TEXT BADGES, not images: Nickel's resource table holds
+// no PDF icon and no generic-document icon anywhere (checked against the
+// firmware, not assumed), and borrowing an unrelated pictogram for a PDF is
+// worse than three unmistakable letters. The resulting mixed look -- images on
+// some rows, letters on others -- is accepted for this pass; the alternative
+// is drawing every row into a QPixmap ourselves, which is a bigger job than
+// the defect warrants. Both badges are five characters wide so the labels
+// after them still line up with each other.
+static QString nf_icon_markup(nf_icon_kind kind) {
+    nf_probe_icon_resources();
+
+    char const *res = NULL;
+    switch (kind) {
+        case NF_ICON_FOLDER: res = NF_ICON_FOLDER_RES; break;
+        case NF_ICON_BOOK:   res = NF_ICON_BOOK_RES;   break;
+        case NF_ICON_COMIC:  res = NF_ICON_COMIC_RES;  break;
+        case NF_ICON_PDF:    return QStringLiteral("[PDF]&nbsp;");
+        // Unreachable while nf_is_book_name gates every file row on the same
+        // allowlist nf_icon_kind_for reads (nffmt.h says so on its own side of
+        // the boundary too), and answered anyway rather than left to fall off
+        // the end: a "?" badge is what a format added to NF_EXTS but not to
+        // the icon map should look like, not a missing icon.
+        case NF_ICON_UNKNOWN:
+        default:             return QStringLiteral("[&nbsp;?&nbsp;]&nbsp;");
+    }
+    // &nbsp; rather than a plain space for the separator, here and in the two
+    // badges above: this string is rich text by the time QLabel sees it, and
+    // HTML collapses runs of whitespace.
+    return QStringLiteral("<img src=\"%1\" height=\"%2\">&nbsp;")
+               .arg(QString::fromLatin1(res)).arg(NF_ICON_PX);
+}
+
 // Builds a fresh content widget (rows for `path`'s own directory listing)
 // and swaps it into the ALREADY-EXISTING `dialog` via N3Dialog::setContent
 // -- this is the whole navigation model (nfview.h): one N3Dialog for the
@@ -754,14 +881,22 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
         TouchLabel__ctor(row, content, 0);
 
         // Labels are OURS -- nf_strip_common (nffmt.cc) already did the
-        // work; this only adds a per-row suffix that nf_build_listing does
-        // not itself carry an opinion about:
-        //   - a folder gets a trailing "/", a plain, ASCII, e-ink-safe
-        //     affordance that this row navigates rather than opens. A
-        //     folder never carries a progress marker either -- there is
-        //     no Volume for one, so r.percentRead/r.finished are always
-        //     -1/false for it (nf_build_listing, nflist.cc: metadata is
-        //     never fetched for a directory row).
+        // work; this only adds a leading icon (nf_icon_markup, above) and a
+        // per-row suffix that nf_build_listing does not itself carry an
+        // opinion about:
+        //   - a folder gets a trailing "/" as well as the folder icon. KEPT
+        //     rather than replaced by the icon, even though the two now say
+        //     the same thing: the icon depends on Nickel's resource table
+        //     resolving from inside this library, which nobody has confirmed
+        //     yet -- that is the whole reason nf_probe_icon_resources exists
+        //     -- and if it does not resolve, this one plain ASCII character
+        //     is the only folder/file marker left. Same reasoning as the
+        //     [not in library] text below: the text carries the meaning and
+        //     the picture is the addition, never the other way round. A
+        //     folder never carries a progress marker either --
+        //     there is no Volume for one, so r.percentRead/r.finished are
+        //     always -1/false for it (nf_build_listing, nflist.cc: metadata
+        //     is never fetched for a directory row).
         //   - a file with NO library row gets its reason spelled out in
         //     the label TEXT itself, not left to colour/style alone: this
         //     panel gives four grey levels, and "slightly lighter" reads
@@ -775,26 +910,64 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
         //     wording is a percentage for in-progress books, a marker for
         //     finished, and NOTHING for unread. "Finished" takes priority
         //     over any number sitting in percentRead -- a re-read that
-        //     stopped partway through leaves a lower value there, and
-        //     Content::isFinished() (nf_volume_exists, nfnickel.cc) is the
-        //     more informative word regardless of what that number is.
+        //     stopped partway through leaves a lower value there, and the
+        //     word is the more informative answer regardless of what that
+        //     number is.
         //     0% and -1 (unknown, including a firmware that moved the
         //     +140 offset -- nf_volume_exists's own guard) both render as
         //     nothing, deliberately: Nickel's own
         //     BookWidget::getPercentReadString clamps display to [1,99]
         //     for the same reason an untouched book's own stored
         //     percentage is 0, not a real progress value (NOTES.md).
-        QString label = r.label;
+        //     r.finished itself is DERIVED (nf_build_listing, nflist.cc)
+        //     from r.readState, whose primary source is
+        //     Content::getReadStatus() -- measured 0 = not started, 1 = in
+        //     progress, 2 = finished (NOTES.md) -- with Content::isFinished()
+        //     demoted to the cross-check it always was, because a bool cannot
+        //     carry three states and the read-state filters need all three
+        //     (nf_volume_exists, nfnickel.cc, has the full account of that
+        //     reversal). This comment named isFinished() as the source until
+        //     that change landed; it is corrected here rather than in that
+        //     task's own diff because this whole region was left alone on
+        //     purpose to keep the two changes from colliding.
+        //
+        // HTML-ESCAPED FIRST, before one character of markup joins it, and
+        // the ORDER is the whole point: r.label is a filename off the card,
+        // and names on this card contain "&" (as well as brackets, quotes and
+        // apostrophes). Escape after appending the markup and the escaping
+        // eats our own tags instead, turning every icon into visible source
+        // text. This project has the exact precedent for getting that order
+        // wrong -- nf_strip_common's letter guard once ran AFTER the
+        // extension was re-appended, which made it pass vacuously (nffmt.cc)
+        // -- so it is spelled out rather than left to be re-derived.
+        QString label = r.label.toHtmlEscaped();
+        // The suffixes are OUR OWN literals plus one int (r.percentRead), so
+        // appending them after the escape is safe -- and it has to be that
+        // way round, because their separator is now the literal markup
+        // "&nbsp;&nbsp;": rich text collapses runs of whitespace, so the two
+        // plain spaces this used to use would render as one.
         if (r.isDir) {
             label += QLatin1Char('/');
         } else if (!r.hasRow) {
-            label += QStringLiteral("  [not in library]");
+            label += QStringLiteral("&nbsp;&nbsp;[not in library]");
         } else if (r.finished) {
-            label += QStringLiteral("  [finished]");
+            label += QStringLiteral("&nbsp;&nbsp;[finished]");
         } else if (r.percentRead > 0) {
-            label += QStringLiteral("  (%1%)").arg(r.percentRead);
+            label += QStringLiteral("&nbsp;&nbsp;(%1%)").arg(r.percentRead);
         }
-        reinterpret_cast<QLabel*>(row)->setText(label);
+
+        QLabel *rowLabel = reinterpret_cast<QLabel*>(row);
+        // Set EXPLICITLY rather than left at Qt::AutoText, which decides
+        // text-vs-rich-text by INSPECTING THE STRING (Qt::mightBeRichText).
+        // Nothing about how a row renders may depend on what a book happens
+        // to be called: a name containing something tag-shaped would
+        // otherwise flip the mode, in either direction, for that one row.
+        rowLabel->setTextFormat(Qt::RichText);
+        // The icon is keyed off r.name, the on-disk name -- NOT r.label,
+        // which nf_strip_common may have stripped the extension clean off
+        // (it removes a common one deliberately, nffmt.cc), leaving nothing
+        // for nf_icon_kind_for to read.
+        rowLabel->setText(nf_icon_markup(nf_icon_kind_for(r.name, r.isDir)) + label);
 
         if (!r.isDir && !r.hasRow) {
             // A SECONDARY visual cue, best-effort and UNVERIFIED on this

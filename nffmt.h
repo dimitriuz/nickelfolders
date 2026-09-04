@@ -188,4 +188,44 @@ bool nf_is_book_name(QString const& name);
 // directories, so they need their own rule.
 bool nf_is_hidden_dir(QString const& name);
 
+// --- row icons ----------------------------------------------------------
+//
+// Which leading icon a row gets. PURE, and here rather than in nfview.cc for
+// the usual reason: the mapping is a decision about a NAME, so it is the one
+// part of the icon work a host test can actually run, and it is the part most
+// likely to be got wrong (see NF_EXTS' longest-match-first comment in
+// nffmt.cc -- ".kepub.epub" also ends in ".epub"). What stays in nfview.cc is
+// only the markup that turns a kind into a Qt resource path, which is
+// libnickel/Qt-rendering territory and untestable off-device by construction.
+//
+// NF_ICON_UNKNOWN is the zero value on purpose, the same reasoning as
+// nf_read_state's NF_READ_UNKNOWN and nf_row::percentRead's -1: a zeroed or
+// calloc()ed kind then reads as "we do not know", never as a confident
+// NF_ICON_FOLDER, which is the one wrong answer that would actively mislead
+// (the whole reason this feature exists is a FILE that read as a folder --
+// see the task brief).
+//
+// One kind for .epub and .kepub.epub, and one for .cbz and .cbr, because a
+// reader does not distinguish either pair: the first two are the same book
+// format with and without Kobo's own preprocessing, and the second two are
+// the same comic archive with a different compressor inside.
+enum nf_icon_kind {
+    NF_ICON_UNKNOWN,  // no known book extension -- unreachable while the
+                      // hide-junk allowlist (nf_is_book_name) gates every
+                      // file row, and kept anyway: the allowlist and this
+                      // map are separate layers, so a future ".txt" on
+                      // NF_EXTS must get a badge rather than silently no icon
+    NF_ICON_FOLDER,
+    NF_ICON_BOOK,     // .epub, .kepub.epub
+    NF_ICON_COMIC,    // .cbz, .cbr
+    NF_ICON_PDF,
+};
+
+// The icon kind for one row. `isDir` WINS over anything the name says: a
+// directory called "Comics.cbz" is still a directory, and mistaking one for
+// a file is precisely the defect this mapping exists to make impossible to
+// miss. Reuses nf_book_extension rather than re-deriving extension parsing,
+// same as nf_matches_filter does.
+nf_icon_kind nf_icon_kind_for(QString const& name, bool isDir);
+
 #endif

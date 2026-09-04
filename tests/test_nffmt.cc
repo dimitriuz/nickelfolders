@@ -496,6 +496,82 @@ static void test_sort_rows_matches_entry_sort_rules(void) {
     CHECK_EQ_STR(r.at(2).name, "Volume 10.cbz");
 }
 
+// --- row icons ----------------------------------------------------------
+//
+// The reported defect this mapping answers, from the reference card:
+// "The Road - A Graphic Novel Adaptation (2024) (Digital) (phillywilly-Empire).cbr"
+// is a FILE and read as a folder, because the only folder/file marker was a
+// trailing "/" on a long, elided label. So the one thing that must never be
+// wrong is which side of that line a name lands on.
+static void test_icon_kind_folder_wins_over_the_extension(void) {
+    // A directory that happens to be NAMED like a comic is still a directory.
+    CHECK(nf_icon_kind_for("Comics.cbz", true) == NF_ICON_FOLDER);
+    CHECK(nf_icon_kind_for("English", true)    == NF_ICON_FOLDER);
+    // ... and the measured file that started this is not a folder.
+    CHECK(nf_icon_kind_for("The Road - A Graphic Novel Adaptation (2024) (Digital) (phillywilly-Empire).cbr", false)
+              == NF_ICON_COMIC);
+}
+
+// The ordering trap NF_EXTS exists for: ".kepub.epub" also ends in ".epub",
+// and both are one format to a reader. Pinned here as well as through
+// nf_matches_filter so a regression names the icon map, not the filter.
+static void test_icon_kind_treats_both_epub_spellings_as_one(void) {
+    CHECK(nf_icon_kind_for("Dune.epub", false)       == NF_ICON_BOOK);
+    CHECK(nf_icon_kind_for("Dune.kepub.epub", false) == NF_ICON_BOOK);
+}
+
+static void test_icon_kind_treats_both_comic_archives_as_one(void) {
+    CHECK(nf_icon_kind_for("Sandman v01.cbz", false) == NF_ICON_COMIC);
+    CHECK(nf_icon_kind_for("Sandman v01.cbr", false) == NF_ICON_COMIC);
+}
+
+static void test_icon_kind_pdf_is_its_own_kind(void) {
+    // Nickel ships no PDF and no generic-document icon (task brief), so this
+    // kind is the one that renders as a text badge rather than an image. That
+    // is a rendering decision (nfview.cc); the KIND still has to be distinct,
+    // or a PDF would be badged as something it is not.
+    CHECK(nf_icon_kind_for("manual.pdf", false) == NF_ICON_PDF);
+}
+
+static void test_icon_kind_is_case_insensitive(void) {
+    // The card holds mixed-case extensions; nf_book_extension already matches
+    // case-insensitively, and this must not quietly compare case-sensitively
+    // on top of it.
+    CHECK(nf_icon_kind_for("DUNE.EPUB", false)       == NF_ICON_BOOK);
+    CHECK(nf_icon_kind_for("Sandman.CBZ", false)     == NF_ICON_COMIC);
+    CHECK(nf_icon_kind_for("Manual.PDF", false)      == NF_ICON_PDF);
+    CHECK(nf_icon_kind_for("Dune.KEpub.ePub", false) == NF_ICON_BOOK);
+}
+
+// The negative control that makes "not unknown" mean something: a name the
+// allowlist rejects must come out UNKNOWN, and every name it admits must not.
+// Without the first half, an implementation that returned NF_ICON_BOOK for
+// everything would pass every check above.
+static void test_icon_kind_agrees_with_the_allowlist(void) {
+    char const *const admitted[] = {
+        "a.epub", "a.kepub.epub", "a.cbz", "a.cbr", "a.pdf", NULL,
+    };
+    for (int i = 0; admitted[i]; i++) {
+        CHECK(nf_is_book_name(admitted[i]));
+        CHECK(nf_icon_kind_for(admitted[i], false) != NF_ICON_UNKNOWN);
+    }
+    char const *const rejected[] = {
+        "notes.txt", "cover.jpg", "README", "metadata.opf", "", NULL,
+    };
+    for (int i = 0; rejected[i]; i++) {
+        CHECK(!nf_is_book_name(rejected[i]));
+        CHECK(nf_icon_kind_for(rejected[i], false) == NF_ICON_UNKNOWN);
+    }
+}
+
+// NF_ICON_UNKNOWN is the zero value on purpose (nffmt.h): a zeroed kind must
+// read as "we do not know", never as a confident NF_ICON_FOLDER -- calling a
+// file a folder is the exact wrong answer this whole feature exists to stop.
+static void test_icon_kind_zero_value_is_unknown_not_folder(void) {
+    CHECK(NF_ICON_UNKNOWN == 0);
+    CHECK(NF_ICON_FOLDER != 0);
+}
+
 int main(void) {
     test_unpadded_volume_dirs();
     test_strip_fullmetal();
@@ -531,5 +607,12 @@ int main(void) {
     test_the_two_filter_axes_ignore_each_other();
     test_sort_rows_matches_entry_sort_rules();
     test_hidden_dirs();
+    test_icon_kind_folder_wins_over_the_extension();
+    test_icon_kind_treats_both_epub_spellings_as_one();
+    test_icon_kind_treats_both_comic_archives_as_one();
+    test_icon_kind_pdf_is_its_own_kind();
+    test_icon_kind_is_case_insensitive();
+    test_icon_kind_agrees_with_the_allowlist();
+    test_icon_kind_zero_value_is_unknown_not_folder();
     NF_TEST_MAIN_END
 }
