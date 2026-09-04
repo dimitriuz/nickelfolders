@@ -101,6 +101,24 @@ struct nf_row {
     // (nflist.cc, stage 3 ahead of stage 5).
     QByteArray    dateAdded;    // Volume::getDateAddedSortKey() -- ___SyncTime for sideloaded content
     QByteArray    dateLastRead; // ___DateLastRead, Volume::d() + 40
+    // ATTRIBUTE_IMAGE_ID, exactly as it sits in the library row: the name
+    // Nickel builds its cover filenames out of (nf_cover_path, above).
+    // RAW BYTES, and UTF-8 ones -- Content::getImageId() converts this same
+    // field with QString::fromUtf8, so it must be DECODED before it is
+    // hashed, never hashed as bytes (nf_bucket_hash's own comment has what
+    // that mistake costs).
+    //
+    // EMPTY means "no cover can be named": no library row at all, an
+    // unresolved Content::getImageIdRaw, or a row whose ImageId column is
+    // genuinely blank. Every one of those degrades to the row's type icon,
+    // silently -- a missing cover is the COMMON case (Nickel renders one
+    // only once a book has been seen in its own library views), so it must
+    // never read as an error.
+    //
+    // Filled in by an nf_meta_fn (nfview.cc -> nf_volume_exists), the same
+    // way the two date keys above are, off the same Volume, inside the same
+    // isValid() branch, and COPIED before ~Volume() runs.
+    QByteArray    imageId;
 
     nf_row() : isDir(false), hasRow(false), percentRead(-1),
                readState(NF_READ_UNKNOWN), finished(false), size(0), mtime(0) {}
@@ -338,6 +356,115 @@ enum nf_icon_kind {
 // miss. Reuses nf_book_extension rather than re-deriving extension parsing,
 // same as nf_matches_filter does.
 nf_icon_kind nf_icon_kind_for(QString const& name, bool isDir);
+
+// --- book covers --------------------------------------------------------
+//
+// Where Nickel keeps a book's already-rendered cover JPEG, and how to name
+// it. This is the whole cover feature except the one libnickel call that
+// hands over the ImageId (Content::getImageIdRaw, nfnickel.h) and the
+// QFile::exists that decides whether the file is really there (nfview.cc) --
+// which is deliberate: everything below is integer arithmetic and string
+// building, so it is the part `make test` can actually run, and it is also
+// the part where a silent wrong answer is most likely (see nf_bucket_hash's
+// own comment for the one that would compile, run and be wrong on every
+// row).
+//
+// Full derivation: .superpowers/sdd/v2-features/cover-path-archaeology.md.
+// The measured layout, read out of Image::fileNameForType,
+// IOUtil::getImageDataDir and IOUtil::bucketById:
+//
+//   <dir>/<h & 0xff>/<(h >> 8) & 0xff>/<ImageId> - <TYPE>.parsed
+//
+// with the two path components in plain decimal and the ImageId inserted
+// VERBATIM (Nickel memcpys it, it does not reformat it).
+
+// Measured: the ONLY reference to "../.kobo-images" in the whole firmware is
+// IOUtil::getImageDataDir, and it resolves against the device root, so on
+// this Libra 2 the directory is this literal. Hardcoded rather than obtained
+// by calling getImageDataDir, which costs an sret plus a QDir::cd on
+// /mnt/onboard PER ROW and, on the branch where the directory is missing,
+// a ScopedFSWrite + QDir::mkpath -- i.e. a WRITE to the owner's card from a
+// render loop, which CLAUDE.md's file-handle rule exists to prevent.
+// A hardcoded constant fails SAFE: a wrong directory does not exist, so the
+// row falls back to its type icon exactly as it does for a book Nickel has
+// never rendered a cover for. Wrong on any device where
+// Device::supportsHashBucketImages() is false (an older Kobo, which uses an
+// unbucketed layout) -- same failure mode, no covers rather than wrong ones.
+#define NF_COVER_IMAGE_DIR "/mnt/onboard/.kobo-images"
+
+// N3_LIBRARY_GRID, measured 149x223 by Image::sizeForType with NO device
+// predicate at all -- the reason it is the variant used here. N3_LIBRARY_FULL
+// is model-dependent (up to 1404x1872, a 2.6 MP JPEG per row) and
+// N3_LIBRARY_LIST, though it has a size in the binary, generates ZERO files
+// on this firmware.
+#define NF_COVER_TYPE "N3_LIBRARY_GRID"
+#define NF_COVER_NATIVE_W 149
+#define NF_COVER_NATIVE_H 223
+
+// The height the <img> is forced to, and therefore the row's own height
+// budget. THIS IS THE OWNER'S NUMBER, not a measurement this project made:
+// the brief states the current row height is ~76 px and chose to keep it
+// rather than grow rows, because NF_ITEMS_PER_PAGE (12, nfview.cc) is keyed
+// to a measured 17-row panel and every px of row height risks an item off
+// the page. The only row measurement on record here is weaker than that --
+// 17 rows fitting the 1680 px visible panel with margin reading as room for
+// roughly 20 (NOTES.md, Task 10) -- so a first device screenshot must COUNT
+// the item rows on a full page. If it shows fewer than 12, lower this one
+// constant; nothing else needs to change, because the width follows from it
+// (nf_cover_width_px) and the elision reserve is charged from the same
+// number that is emitted (nfview.cc).
+#define NF_COVER_H_PX 76
+
+// The four characters Image::cleanId replaces with '_', and ONLY those four:
+// '/', ':', '.' and space. Parentheses, hyphens and commas survive, measured
+// character for character off cleanId's own four QString::replace calls.
+//
+// Nickel does NOT run this over the ImageId on the way to a filename --
+// cleanId is import-time only (its three call sites are all parsers), and
+// fileNameForType inserts the ImageId verbatim -- which is the evidence that
+// the ImageId column ALREADY holds the mangled form. So this is not on the
+// primary path: nfview.cc builds the path from the raw ImageId first, and
+// only consults this if that file does not exist (see there). It is here,
+// tested, because that inference is the single assumption the whole feature
+// rests on, and because the mangling is what the test vector pins.
+QString nf_clean_image_id(QString const& id);
+
+// IOUtil::bucketById's hash, reimplemented. Returns the raw 28-bit value;
+// the two path components are its low byte and its second byte.
+//
+// THIS IS THE QT 4 ELF HASH, NOT Qt 5's qHash. Kobo froze the old algorithm
+// in IOUtil so the on-disk bucket layout survives a Qt upgrade, and Qt 5
+// replaced qHash(QString) with a seeded Murmur-derived function -- so
+// calling qHash here would compile, link, run, and compute a different
+// number for every book, giving a directory that never exists. There would
+// be no error anywhere: every row would simply fall back to its type icon,
+// which is also what a perfectly healthy device does for a book with no
+// rendered cover.
+//
+// It runs over UTF-16 CODE UNITS (the disassembly loads with ldrh and
+// QChar::unicode() is the same quantity), which is why this takes a QString
+// and not the QByteArray the ImageId arrives as. Hashing the raw UTF-8 BYTES
+// instead gives the IDENTICAL answer for every ASCII-only name and a
+// different one for anything above U+007F -- so an ASCII-only test suite
+// cannot tell the two apart. tests/test_nffmt.cc carries a Cyrillic vector
+// for exactly that reason.
+unsigned nf_bucket_hash(QString const& imageId);
+
+// The absolute path to the N3_LIBRARY_GRID cover for `imageId`, or an EMPTY
+// QString if `imageId` is empty.
+//
+// The empty case is a refusal, not an oversight: bucketById("") returns
+// "0/0" (measured -- its own empty-string branch skips the loop with h = 0),
+// so an empty ImageId would otherwise produce a plausible-looking path under
+// a real directory, which is the one input that could silently name the
+// WRONG file rather than a missing one.
+QString nf_cover_path(QString const& imageId);
+
+// The <img> width that keeps a cover at its native 149x223 aspect when
+// forced to `heightPx`. Rounded, and floored at 1 so a nonsense height can
+// never produce a zero-width box (Qt draws a 0-width <img> as nothing, which
+// would read as "no cover" while the row still paid for the height).
+int nf_cover_width_px(int heightPx);
 
 // --- the two-form label pieces ------------------------------------------
 //

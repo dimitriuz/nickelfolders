@@ -963,6 +963,198 @@ static void test_name_budget_floors_instead_of_going_negative(void) {
     CHECK(NF_NAME_MIN_PX > 0);
 }
 
+// --- book covers --------------------------------------------------------
+//
+// The one real, device-measured cover path this project has. Everything in
+// this block is pinned against it, because the whole feature is a filename
+// prediction: get any character or either bucket component wrong and the
+// prediction names a file that does not exist, the row falls back to its type
+// icon, and the browser looks exactly as healthy as it does for a book Nickel
+// has genuinely never rendered a cover for. There is no loud failure
+// available on-device, so it has to be pinned here.
+#define FMA_V25_CONTENTID \
+    "file:///mnt/onboard/books/Comics/English/" \
+    "Fullmetal Alchemist (v01-v27) (2005-2011) (Digital)/" \
+    "Fullmetal Alchemist v25 (2011) (Digital) (LostNerevarine-Empire).cbz"
+#define FMA_V25_IMAGEID \
+    "file____mnt_onboard_books_Comics_English_" \
+    "Fullmetal_Alchemist_(v01-v27)_(2005-2011)_(Digital)_" \
+    "Fullmetal_Alchemist_v25_(2011)_(Digital)_(LostNerevarine-Empire)_cbz"
+
+static void test_cover_mangling_matches_the_device_vector(void) {
+    CHECK_EQ_STR(nf_clean_image_id(QString::fromUtf8(FMA_V25_CONTENTID)),
+                 FMA_V25_IMAGEID);
+}
+
+// Image::cleanId replaces EXACTLY four characters. The survivors are the
+// interesting half: a mangler that also took '(' , ')' , '-' or ',' -- all of
+// which appear in this card's own filenames -- would produce a wrong name for
+// most of the library while still looking like a plausible mangling.
+static void test_cover_mangling_touches_only_four_characters(void) {
+    CHECK_EQ_STR(nf_clean_image_id("a/b"), "a_b");
+    CHECK_EQ_STR(nf_clean_image_id("a:b"), "a_b");
+    CHECK_EQ_STR(nf_clean_image_id("a.b"), "a_b");
+    CHECK_EQ_STR(nf_clean_image_id("a b"), "a_b");
+    CHECK_EQ_STR(nf_clean_image_id("(a-b), c"), "(a-b),_c");
+    CHECK_EQ_STR(nf_clean_image_id("a_b"), "a_b");
+    CHECK_EQ_STR(nf_clean_image_id("a\tb"), "a\tb");
+    CHECK_EQ_STR(nf_clean_image_id(""), "");
+}
+
+// What licenses nfview.cc trying the RAW ImageId first and this cleaned form
+// only as a second attempt: on an id that is already mangled -- which is what
+// the archaeology says the DB column holds -- cleaning it is a no-op, so the
+// second attempt costs nothing and can never change a path that already
+// resolved.
+static void test_cover_mangling_is_idempotent(void) {
+    QString once  = nf_clean_image_id(QString::fromUtf8(FMA_V25_CONTENTID));
+    QString twice = nf_clean_image_id(once);
+    CHECK(once == twice);
+}
+
+static void test_cover_bucket_matches_the_device_vector(void) {
+    unsigned h = nf_bucket_hash(QString::fromUtf8(FMA_V25_IMAGEID));
+    CHECK((h & 0xffu)        == 90u);
+    CHECK(((h >> 8) & 0xffu) == 174u);
+    // The mask the firmware's own `bic` applies: nothing above 28 bits ever
+    // survives the loop, so a value that does means the masking is gone.
+    CHECK(h <= 0x0fffffffu);
+}
+
+static void test_cover_path_matches_the_device_file(void) {
+    CHECK_EQ_STR(nf_cover_path(QString::fromUtf8(FMA_V25_IMAGEID)),
+                 "/mnt/onboard/.kobo-images/90/174/" FMA_V25_IMAGEID
+                 " - N3_LIBRARY_GRID.parsed");
+}
+
+// WHY A CHECK ON THE FIRST BUCKET COMPONENT ALONE WOULD BE VACUOUS, which is
+// the trap the archaeology found and the reason nfview.cc's device check has
+// to compare a whole path (or stat it) rather than a directory number.
+//
+// Three near-miss manglings of the same ContentID, all measured:
+//   nothing mangled at all          -> 26/129
+//   only ':' and '/'                -> 186/43
+//   ':' '/' and ' ' but NOT '.'     -> 90/190   <-- first component CORRECT
+// The third is the instructive one: forgetting '.' still yields 90.
+static void test_cover_bucket_rejects_the_near_miss_manglings(void) {
+    QString cid = QString::fromUtf8(FMA_V25_CONTENTID);
+
+    unsigned raw = nf_bucket_hash(cid);
+    CHECK((raw & 0xffu)        == 26u);
+    CHECK(((raw >> 8) & 0xffu) == 129u);
+
+    QString slashColon = cid;
+    slashColon.replace(QLatin1Char('/'), QLatin1Char('_'));
+    slashColon.replace(QLatin1Char(':'), QLatin1Char('_'));
+    unsigned h2 = nf_bucket_hash(slashColon);
+    CHECK((h2 & 0xffu)        == 186u);
+    CHECK(((h2 >> 8) & 0xffu) == 43u);
+
+    QString noDot = slashColon;
+    noDot.replace(QLatin1Char(' '), QLatin1Char('_'));
+    unsigned h3 = nf_bucket_hash(noDot);
+    CHECK((h3 & 0xffu)        == 90u);   // right, and the path is still wrong
+    CHECK(((h3 >> 8) & 0xffu) == 190u);
+}
+
+// THE NEGATIVE CONTROL THIS FEATURE MOST NEEDS.
+//
+// The hash runs over UTF-16 code units; the ImageId arrives as UTF-8 bytes.
+// For an ASCII-only name the two interpretations are BYTE-FOR-BYTE THE SAME
+// SEQUENCE, so every other test in this block would pass unchanged against an
+// implementation that hashed the raw bytes -- including the Fullmetal vector,
+// which is the only device-measured path there is. A card with Cyrillic
+// filenames (this one has them, under /mnt/onboard/books) would then get a
+// wrong directory for every non-ASCII book and no error anywhere.
+//
+// So this vector is the only thing in the suite that can tell the correct
+// implementation from that one. Both answers are spelled out: the code-unit
+// hash gives 6/27, the byte hash gives 198/169.
+static void test_cover_bucket_hashes_code_units_not_bytes(void) {
+    QString id = nf_clean_image_id(QString::fromUtf8(
+        "file:///mnt/onboard/books/\xd0\x9f\xd0\xb5\xd0\xbb\xd0\xb5\xd0\xb2"
+        "\xd0\xb8\xd0\xbd - \xd0\xa7\xd0\xb0\xd0\xbf\xd0\xb0\xd0\xb5\xd0\xb2"
+        " \xd0\xb8 \xd0\x9f\xd1\x83\xd1\x81\xd1\x82\xd0\xbe\xd1\x82\xd0\xb0.pdf"));
+    CHECK_EQ_STR(id, "file____mnt_onboard_books_\xd0\x9f\xd0\xb5\xd0\xbb\xd0"
+                     "\xb5\xd0\xb2\xd0\xb8\xd0\xbd_-_\xd0\xa7\xd0\xb0\xd0\xbf"
+                     "\xd0\xb0\xd0\xb5\xd0\xb2_\xd0\xb8_\xd0\x9f\xd1\x83\xd1"
+                     "\x81\xd1\x82\xd0\xbe\xd1\x82\xd0\xb0_pdf");
+
+    unsigned h = nf_bucket_hash(id);
+    CHECK((h & 0xffu)        == 6u);
+    CHECK(((h >> 8) & 0xffu) == 27u);
+
+    // The wrong answer, stated so this check cannot pass vacuously: if the
+    // implementation is ever "simplified" to hash id.toUtf8() the numbers
+    // below are what it will produce, and the two above are what it will not.
+    CHECK((h & 0xffu)        != 198u);
+    CHECK(((h >> 8) & 0xffu) != 169u);
+
+    // And the byte hash, computed here rather than asserted from a table, so
+    // the claim "these two interpretations really do differ for this string"
+    // is checked by the test itself rather than trusted.
+    QByteArray utf8 = id.toUtf8();
+    unsigned b = 0;
+    for (int i = 0; i < utf8.size(); i++) {
+        b = (unsigned)(unsigned char)utf8.at(i) + (b << 4);
+        b ^= (b & 0xf0000000u) >> 23;
+        b &= 0x0fffffffu;
+    }
+    CHECK((b & 0xffu)        == 198u);
+    CHECK(((b >> 8) & 0xffu) == 169u);
+    CHECK(b != h);
+
+    // The same construction over an ASCII id must AGREE, which is what makes
+    // the disagreement above attributable to the non-ASCII characters and not
+    // to the loop being written differently in the two places.
+    QByteArray ascii = QByteArray(FMA_V25_IMAGEID);
+    unsigned ab = 0;
+    for (int i = 0; i < ascii.size(); i++) {
+        ab = (unsigned)(unsigned char)ascii.at(i) + (ab << 4);
+        ab ^= (ab & 0xf0000000u) >> 23;
+        ab &= 0x0fffffffu;
+    }
+    CHECK(ab == nf_bucket_hash(QString::fromUtf8(FMA_V25_IMAGEID)));
+}
+
+// bucketById("") is 0/0 -- a real directory on this card -- so an empty
+// ImageId must be refused rather than turned into a plausible-looking path.
+// This is the only cover input that could name a file belonging to some other
+// book instead of naming nothing.
+static void test_cover_path_refuses_an_empty_image_id(void) {
+    CHECK(nf_cover_path(QString()).isEmpty());
+    CHECK(nf_cover_path(QString::fromUtf8("")).isEmpty());
+    CHECK(nf_bucket_hash(QString()) == 0u);   // the firmware's own empty branch
+    // A single space is NOT empty: it mangles to "_" upstream and is a
+    // perfectly nameable id, so it must still produce a path.
+    CHECK(!nf_cover_path(QString::fromUtf8(" ")).isEmpty());
+}
+
+// The ImageId goes into the filename VERBATIM (Image::fileNameForType memcpys
+// it), so nf_cover_path must not clean, trim or case-fold what it is handed --
+// that decision belongs to its caller.
+static void test_cover_path_inserts_the_id_verbatim(void) {
+    QString path = nf_cover_path(QString::fromUtf8("Raw Id: with/dots.and spaces"));
+    CHECK(path.contains(QString::fromUtf8("Raw Id: with/dots.and spaces")));
+    CHECK(path.endsWith(QString::fromUtf8(" - N3_LIBRARY_GRID.parsed")));
+    CHECK(path.startsWith(QString::fromUtf8("/mnt/onboard/.kobo-images/")));
+}
+
+static void test_cover_width_keeps_the_native_aspect(void) {
+    // The number the <img> actually gets, and the number the elision reserve
+    // is charged: 149/223 of 76 px is 50.8, rounded.
+    CHECK(nf_cover_width_px(NF_COVER_H_PX) == 51);
+    CHECK(nf_cover_width_px(NF_COVER_NATIVE_H) == NF_COVER_NATIVE_W);
+    CHECK(nf_cover_width_px(2 * NF_COVER_NATIVE_H) == 2 * NF_COVER_NATIVE_W);
+    // Never zero-width, whatever it is handed -- a 0-width <img> draws as
+    // nothing while the row still pays the height.
+    CHECK(nf_cover_width_px(0)     >= 1);
+    CHECK(nf_cover_width_px(-500)  >= 1);
+    // A cover is TALLER than it is wide; a set of constants that ever made it
+    // the other way round would be a swapped pair.
+    CHECK(nf_cover_width_px(NF_COVER_H_PX) < NF_COVER_H_PX);
+}
+
 int main(void) {
     test_unpadded_volume_dirs();
     test_strip_fullmetal();
@@ -1024,5 +1216,15 @@ int main(void) {
     test_two_form_builders_accept_a_null_output();
     test_name_budget_pays_for_the_icon_and_the_suffix_first();
     test_name_budget_floors_instead_of_going_negative();
+    test_cover_mangling_matches_the_device_vector();
+    test_cover_mangling_touches_only_four_characters();
+    test_cover_mangling_is_idempotent();
+    test_cover_bucket_matches_the_device_vector();
+    test_cover_path_matches_the_device_file();
+    test_cover_bucket_rejects_the_near_miss_manglings();
+    test_cover_bucket_hashes_code_units_not_bytes();
+    test_cover_path_refuses_an_empty_image_id();
+    test_cover_path_inserts_the_id_verbatim();
+    test_cover_width_keeps_the_native_aspect();
     NF_TEST_MAIN_END
 }

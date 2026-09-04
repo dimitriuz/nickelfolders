@@ -122,6 +122,50 @@ static void const *(*Volume__d_const)(Volume const *_this);
 // bytes needs no new symbol at all -- see nf_volume_exists.
 static QByteArray const *(*Volume__getDateAddedSortKey)(Volume const *_this, Device const *dev);
 
+// Content::getImageIdRaw() const -- NON-static, `this` in r0, and NO hidden
+// return buffer: it returns a POINTER to a QByteArray, not a QByteArray by
+// value. Measured (the cover-path archaeology, section 1, from the complete
+// eight-halfword body at 0x957618): it loads the vptr out of r0, calls vtable
+// slot 8 (Volume::d() const -- the same Volume__d_const already resolved just
+// above), does `adds r0, #36` and pops. That is BYTE-FOR-BYTE the shape of
+// Volume::getDateAddedSortKey above, which already ships and has already run
+// on hardware (NOTES.md, Task 14); only the offset differs.
+//
+// Content::d()+36 is ATTRIBUTE_IMAGE_ID, established FOUR independent ways --
+// one more than the +140 percentRead read this mod already ships on: this
+// function's own return; Content::getImageId()'s read of [d()+36] as a
+// QByteArray d-pointer (QArrayData size/offset at +4/+12) fed to
+// QString::fromUtf8_helper; Content::setImageId()'s WRITE of the same offset
+// via QVariant::toByteArray, releasing the old value with
+// QArrayData::deallocate(..., 1, 4) -- objectSize 1, i.e. a QByteArray;
+// and Content::getDbValues() inserting QVariant(QByteArray(d()+36)) under GOT
+// slot 0x16cbf00, whose relocation reads R_ARM_GLOB_DAT ATTRIBUTE_IMAGE_ID.
+// That last one's GOT arithmetic was itself validated by reproducing the
+// already-known ATTRIBUTE_DATE_LAST_READ at +40 from the adjacent pool word --
+// a sweep that could have failed visibly, which is what CLAUDE.md asks for.
+//
+// The payload is UTF-8, not Latin-1 (getImageId converts it with fromUtf8),
+// and that is load-bearing rather than trivia: nf_bucket_hash (nffmt.h) runs
+// over UTF-16 CODE UNITS, so this must be DECODED before it is hashed. Hashing
+// the bytes gives the identical answer for every ASCII name and a wrong one
+// for every Cyrillic one on this card.
+//
+// The `Raw` suffix is NOT trusted here on the strength of the naming --
+// Task 12 recorded that the convention does not hold on this class
+// (dateAdded() returns a raw reference with no suffix). Both halves of THIS
+// pair were read to their returns: getImageId() shuffles `this` to r1 and
+// takes an sret in r0, getImageIdRaw() does neither. getImageId() is
+// deliberately left unresolved -- it answers the same bytes while carrying the
+// displaced-sret shape that crashed Nickel on VolumeManager::getById.
+//
+// Not an inlining artefact: 13 call sites in this firmware, across
+// ImageProvider, ImageWorker, both parsers and the sync commands.
+//
+// The returned pointer aims INTO the Volume's refcounted 408-byte private
+// block, so the QByteArray is COPIED before Volume::~Volume() runs -- the same
+// discipline the two date keys already follow (nf_volume_exists).
+static QByteArray const *(*Content__getImageIdRaw)(Content const *_this);
+
 static void    (*ReadBookActionProxy__ctor)(ReadBookActionProxy *_this, QObject *parent, Volume const *v);
 static void    (*ReadBookActionProxy__onSelected)(ReadBookActionProxy *_this);
 
@@ -222,6 +266,7 @@ struct nh_dlsym NFNickelDlsym[] = {
     {.name = "_ZNK7Content10isFinishedEv",                    .out = nh_symoutptr(Content__isFinished),             .desc = "Content::isFinished",                    .optional = true},
     {.name = "_ZNK6Volume1dEv",                               .out = nh_symoutptr(Volume__d_const),                 .desc = "Volume::d",                              .optional = true},
     {.name = "_ZNK6Volume19getDateAddedSortKeyERK6Device",    .out = nh_symoutptr(Volume__getDateAddedSortKey),     .desc = "Volume::getDateAddedSortKey",            .optional = true},
+    {.name = "_ZNK7Content13getImageIdRawEv",                 .out = nh_symoutptr(Content__getImageIdRaw),          .desc = "Content::getImageIdRaw",                 .optional = true},
     {.name = "_ZN19ReadBookActionProxyC1EP7QObjectRK6Volume", .out = nh_symoutptr(ReadBookActionProxy__ctor),       .desc = "ReadBookActionProxy::ReadBookActionProxy", .optional = true},
     {.name = "_ZN19ReadBookActionProxy10onSelectedEv",        .out = nh_symoutptr(ReadBookActionProxy__onSelected), .desc = "ReadBookActionProxy::onSelected",        .optional = true},
     {.name = "_ZN6Device16getCurrentDeviceEv",                .out = nh_symoutptr(Device__getCurrentDevice),        .desc = "Device::getCurrentDevice",               .optional = true},
@@ -347,6 +392,34 @@ static bool nf_date_last_read_warned = false;
 // RAM ring buffer would push its own head off the end (CLAUDE.md).
 static bool nf_date_bytes_logged = false;
 
+// Set once this run's ONE raw-ImageId log line has been emitted. That line is
+// the measurement the host-only archaeology could not make, and it is the
+// single assumption the whole cover feature rests on: whether
+// ATTRIBUTE_IMAGE_ID really holds the MANGLED ContentID for every sideloaded
+// row on this card, or only for the rows that already have a rendered cover.
+// The archaeology argues it must (Image::fileNameForType memcpys the id in
+// verbatim, and Image::cleanId is import-time only, called from nothing on the
+// render path) but that is an inference from two measurements plus one measured
+// filename, not a device result. An ImageId that is neither empty nor the
+// mangled ContentID -- a server-assigned id, say -- would produce a
+// valid-looking path that never exists, and every row would fall back to its
+// type icon with nothing anywhere saying why.
+//
+// FIRST ROW OF THE RUN ONLY: a 227-file sweep into the RAM ring buffer would
+// push its own head off the end (CLAUDE.md), the same reason
+// nf_date_bytes_logged above is one-shot. Plain zero-initialised .bss, no
+// dynamic initialiser.
+static bool nf_image_id_logged = false;
+
+// And the same one-shot discipline for the SYMBOL being absent, which is a
+// different fact from the value being empty and must be distinguishable from
+// it: a missing Content::getImageIdRaw means no row anywhere gets a cover,
+// where an empty ImageId means this one row does not. Separate flag from the
+// one above for the reason the four progress/date flags are also separate --
+// a shared flag lets whichever fired first silence the other for the rest of
+// the process's life.
+static bool nf_image_id_symbol_warned = false;
+
 // Device::getCurrentDevice() with its NULL-check in one place. Shared by
 // nf_volume_exists (which needs the Device* as Volume::getDateAddedSortKey's
 // r1 argument -- the same one Nickel's own DateAddedKey<Volume> stashes at
@@ -374,7 +447,8 @@ static Device *nf_current_device(void) {
 // project's archaeology says anything about reading.
 bool nf_volume_exists(QString const& contentId, QString const& dbName,
                       int *outPercentRead, nf_read_state *outReadState,
-                      QByteArray *outDateAdded, QByteArray *outDateLastRead) {
+                      QByteArray *outDateAdded, QByteArray *outDateLastRead,
+                      QByteArray *outImageId) {
     *outPercentRead = -1;
     *outReadState   = NF_READ_UNKNOWN;
     // Cleared up front like the two above, so every out-parameter is written
@@ -386,6 +460,11 @@ bool nf_volume_exists(QString const& contentId, QString const& dbName,
     // and why.
     outDateAdded->clear();
     outDateLastRead->clear();
+    // Cleared on the same principle: EMPTY is this mod's only spelling of "no
+    // cover can be named", and it is what the negative-control ContentID (one
+    // no book has) must leave behind -- isValid() is false, the read below is
+    // never reached, and nfview.cc builds no path at all for the row.
+    outImageId->clear();
 
     if (!nf_nickel_resolve())
         return false;
@@ -626,6 +705,76 @@ bool nf_volume_exists(QString const& contentId, QString const& dbName,
                     }
                 }
             }
+        }
+
+        // ATTRIBUTE_IMAGE_ID, the name Nickel builds its cover filenames out
+        // of -- Content::getImageIdRaw's declaration comment (above) has the
+        // full derivation, including the four independent sightings that pin
+        // Content::d()+36 and why the sret sibling getImageId() is not used.
+        //
+        // Read off the SAME Volume as everything else in this branch, inside
+        // the same isValid() gate, before the same Volume__dtor -- no second
+        // getById, exactly like the two date keys.
+        //
+        // COPIED, not pointed at, for the reason spelled out at the
+        // ___DateLastRead read above: the QByteArray lives inside the
+        // refcounted private block Volume__dtor drops a reference to, while
+        // the copy holds a reference on the STRING's own data, which is
+        // independent of that block.
+        //
+        // NO SHAPE GUARD, deliberately, and the asymmetry with the date keys
+        // is the point: those two are hardcoded struct offsets read by hand,
+        // so a moved field is dereferenced by US and a plausibility check is
+        // the only safety net. This value's address is computed by NICKEL'S
+        // OWN CODE, so the pointer is right by construction on whatever layout
+        // the firmware has. And a wrong VALUE fails safe all by itself -- it
+        // names a cover file that does not exist, so the row falls back to its
+        // type icon, which is also what a perfectly healthy device does for
+        // the 11-of-27 books it has never rendered a cover for. There is no
+        // wrong image this can produce, only a missing one.
+        if (Content__getImageIdRaw) {
+            // Content is a public non-virtual base of Volume at offset 0
+            // (Volume's own _ZTI, NOTES.md), so v is the Content* `this` with
+            // no adjustment -- same as the getReadStatus/isFinished calls
+            // above.
+            QByteArray const *imageId = Content__getImageIdRaw(v);
+            if (imageId)
+                *outImageId = *imageId;
+        } else if (!nf_image_id_symbol_warned) {
+            nf_image_id_symbol_warned = true;
+            // ONE line, once, and this is the signature that separates
+            // "this firmware renamed the symbol" from "these books have no
+            // covers yet": with the symbol gone, EVERY row falls back, so the
+            // per-listing tally in nfview.cc reads 0 covers rather than a
+            // partial count.
+            nh_log("covers: Content::getImageIdRaw did not resolve -- no row will get a cover this run (rows keep their type icons); this firmware may have renamed it");
+        }
+
+        // The measurement, once per run. See nf_image_id_logged's own comment
+        // for what it answers -- specifically whether ATTRIBUTE_IMAGE_ID holds
+        // the mangled ContentID for a sideloaded row, which decides whether
+        // the whole cover path scheme is addressing real files.
+        //
+        // THE VALUE BEFORE THE PATH, and only a HEAD AND TAIL of the value:
+        // nh_log truncates at 256 bytes silently, the ImageId on this card
+        // runs past 160 characters and the ContentID past 230, so the two
+        // together cannot fit and the ContentID is the half that may be cut.
+        // The length is logged as a number precisely because the string itself
+        // is not logged whole -- head + tail + length is enough to recognise
+        // the mangled form (it must begin `file____mnt_onboard_` and end with
+        // a mangled extension, `_cbz`/`_epub`) and enough to reconstruct the
+        // rest off-device from the ContentID.
+        //
+        // Logged even when the id is EMPTY, which is the case worth seeing:
+        // len=0 for a row that isValid() said exists means the column is blank
+        // rather than the scheme being wrong.
+        if (!nf_image_id_logged) {
+            nf_image_id_logged = true;
+            nh_log("covers: imageId len=%d head='%s' tail='%s' for contentId '%s'",
+                   outImageId->size(),
+                   outImageId->left(40).constData(),
+                   outImageId->right(24).constData(),
+                   qPrintable(contentId));
         }
 
         // The measurement, once per run. See nf_date_bytes_logged's own

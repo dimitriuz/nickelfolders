@@ -46,6 +46,7 @@
 #include <QBrush>
 #include <QDateTime>
 #include <QDir>
+#include <QFile>       // QFile::exists -- a stat, never an open; see nf_cover_path_for_row
 #include <QFileInfo>
 #include <QFileInfoList>
 #include <QFont>
@@ -305,14 +306,15 @@ struct NFMetaCtx {
 static void nf_row_meta(void *ctx, QString const& name, nf_row *row) {
     NFMetaCtx const *c = static_cast<NFMetaCtx const*>(ctx);
     QString contentId = QStringLiteral("file://") + c->dirPath + QLatin1Char('/') + name;
-    // One call fills hasRow, percentRead, readState AND the two raw date sort
-    // keys -- deliberately not a second lookup for the dates: they come off
-    // the same Volume, inside the same isValid() branch, before the same
-    // Volume__dtor. nf_volume_exists' own declaration (nfnickel.h) has the
-    // derivation for both keys, why neither is parsed into a QDateTime, and
-    // where an empty one sorts.
+    // One call fills hasRow, percentRead, readState, the two raw date sort
+    // keys AND the cover ImageId -- deliberately not a second lookup for any
+    // of them: they all come off the same Volume, inside the same isValid()
+    // branch, before the same Volume__dtor. nf_volume_exists' own declaration
+    // (nfnickel.h) has the derivation for each, why the dates are not parsed
+    // into a QDateTime, where an empty one sorts, and why an empty ImageId
+    // means "no cover can be named" rather than an error.
     row->hasRow = nf_volume_exists(contentId, c->dbName, &row->percentRead, &row->readState,
-                                   &row->dateAdded, &row->dateLastRead);
+                                   &row->dateAdded, &row->dateLastRead, &row->imageId);
 }
 
 // QDir::entryInfoList against ONE directory, never recursive -- the spec's
@@ -1206,6 +1208,164 @@ static int nf_icon_width_px(nf_icon_kind kind, QFontMetrics const &fm) {
     return fm.width(badge);
 }
 
+// --- book covers -------------------------------------------------------
+//
+// A row shows the book's OWN cover where Nickel has already rendered one, in
+// place of the type icon, at the same height the type icon's row already has.
+// Everything about naming the file is pure and host-tested (nffmt.h:
+// nf_clean_image_id / nf_bucket_hash / nf_cover_path, pinned against the one
+// real device-measured path this project has); what is left here is the two
+// things that cannot be tested off-device -- the stat that decides whether
+// the file is really there, and the markup Qt 5.2.1 will actually resolve.
+//
+// COVERAGE IS PARTIAL AND THAT IS NORMAL, not a bug to be reported in the
+// row: Nickel renders a cover only once a book has been seen in one of its
+// own library views, and the reference card's Fullmetal Alchemist folder has
+// 27 volumes and 16 covers. So a missing cover falls back to the type icon
+// SILENTLY -- no placeholder, no per-row log line. A row that said "cover
+// missing" would say it eleven times out of twenty-seven on a perfectly
+// healthy device and would train the owner to ignore it. The diagnosis lives
+// in the per-listing tally instead (nf_browser_go).
+//
+// STAT, NEVER OPEN. QFile::exists is one stat and holds nothing; CLAUDE.md
+// forbids holding a file handle on /mnt/onboard for more than a few hundred
+// milliseconds, because a USB session while one is open risks corrupting the
+// owner's card. Nothing here ever WRITES to the card either -- which is one
+// of the two reasons VolumeManager::imagePathsForVolume was rejected as the
+// route (its not-found branch does ScopedFSWrite + QDir::mkpath, i.e. a write
+// to /mnt/onboard from a render loop; the other reason is 13 QDir round trips
+// per row). The full comparison of the four candidate routes is in
+// .superpowers/sdd/v2-features/cover-path-archaeology.md.
+
+// One line per run for the FIRST cover path this process computes: the bucket
+// it landed in, and whether the file was there. That is the whole scheme in
+// one line and it is reproducible off-device, which is why it logs the bucket
+// and the LENGTH rather than the path -- nh_log truncates at 256 bytes
+// silently and these paths run past 200 characters (CLAUDE.md).
+static bool nf_cover_first_logged = false;
+
+// Set if the RAW ImageId named nothing and the MANGLED form named a real file.
+// See nf_cover_path_for_row for why the second attempt exists at all. Logged
+// loudly and once, because it would mean the archaeology's central inference
+// (that the ImageId column already holds the mangled ContentID) is wrong --
+// the covers would still render, but the reason recorded everywhere in this
+// project would need correcting.
+static bool nf_cover_mangle_fallback_logged = false;
+
+// The absolute path to this row's cover, or an EMPTY QString if it has none.
+// Empty is the ordinary answer, not a failure -- see the block comment above.
+static QString nf_cover_path_for_row(nf_row const& r) {
+    // A folder has no Volume and therefore no ImageId; a file with no library
+    // row has no ImageId either, and the archaeology is explicit that no cover
+    // path should even be BUILT for one -- the row already says
+    // "[not in library]", which is the more useful thing to show.
+    if (r.isDir || !r.hasRow || r.imageId.isEmpty())
+        return QString();
+
+    // fromUtf8, not fromLatin1 and not the raw bytes: the column is UTF-8
+    // (Content::getImageId converts this same field with
+    // QString::fromUtf8_helper) and nf_bucket_hash runs over UTF-16 code
+    // units. Hashing the bytes would give the identical answer for every
+    // ASCII name on the card and a wrong one for every Cyrillic name --
+    // silently, with no error anywhere. tests/test_nffmt.cc has the vector
+    // that tells the two apart.
+    QString id   = QString::fromUtf8(r.imageId);
+    QString path = nf_cover_path(id);
+
+    bool exists = !path.isEmpty() && QFile::exists(path);
+
+    if (!nf_cover_first_logged) {
+        nf_cover_first_logged = true;
+        unsigned h = nf_bucket_hash(id);
+        nh_log("covers: imageId len=%d bucket=%u/%u type=%s exists=%d (path not logged -- nh_log truncates at 256 and this one is longer)",
+               r.imageId.size(), h & 0xffu, (h >> 8) & 0xffu, NF_COVER_TYPE, exists ? 1 : 0);
+    }
+
+    if (exists)
+        return path;
+
+    // SECOND ATTEMPT, and the only reason it exists: the archaeology's single
+    // unmeasured assumption is that ATTRIBUTE_IMAGE_ID already holds the
+    // MANGLED ContentID (Image::fileNameForType memcpys the id in verbatim,
+    // and Image::cleanId is called only from the import/parse paths). If that
+    // is wrong for some row, the raw form above names nothing and the cleaned
+    // form is what Nickel's own filename would have been. Both forms are
+    // existence-checked, so this can only ever turn a MISSING cover into a
+    // found one -- never a wrong image.
+    //
+    // It costs nothing in the expected case: an already-mangled id is
+    // unchanged by cleaning (nf_clean_image_id is idempotent, host-tested),
+    // the `!=` below is then false, and no second stat happens at all.
+    QString cleaned = nf_clean_image_id(id);
+    if (cleaned != id) {
+        QString alt = nf_cover_path(cleaned);
+        if (!alt.isEmpty() && QFile::exists(alt)) {
+            if (!nf_cover_mangle_fallback_logged) {
+                nf_cover_mangle_fallback_logged = true;
+                nh_log("covers: the RAW ImageId named no file but its MANGLED form did -- ATTRIBUTE_IMAGE_ID does NOT already hold the mangled ContentID on this firmware, contrary to the archaeology's inference; covers still render, the record needs correcting");
+            }
+            return alt;
+        }
+    }
+
+    return QString();
+}
+
+// THE ROW'S LEADING IMAGE, decided ONCE: the markup that will be emitted and
+// the width the name budget must be charged, out of one function so the two
+// can never be measured off different things.
+//
+// That is not tidiness. NOTES.md Task 13 records at length what happens when
+// a width term is measured in units the row does not render in -- rows clipped
+// their last character or two, and the cause took a full push-and-restart to
+// find, because the arithmetic and the markup were assembled in different
+// places. A cover is 51 px wide where a type icon is 40, so a reserve that
+// still charged the icon would clip every cover row by 11 px plus the
+// separator.
+static QString nf_row_leading_markup(nf_icon_kind kind, QString const& coverPath,
+                                     QFontMetrics const& fm,
+                                     int *outWidth, bool *outIsCover) {
+    if (!coverPath.isEmpty()) {
+        int w = nf_cover_width_px(NF_COVER_H_PX);
+        *outWidth   = w + fm.width(nf_nbsp());
+        *outIsCover = true;
+        // A BARE ABSOLUTE PATH, no scheme -- device-measured on this exact
+        // firmware for the icon PNGs and identical here: Qt 5.2.1 renders
+        // `<img src="/mnt/...">` and draws its own broken-image placeholder
+        // for `file:///mnt/...`. Host Qt 5.15 renders both, so the host build
+        // cannot catch a regression here (NOTES.md, Task 13). Do not "fix"
+        // this into a URL.
+        //
+        // ESCAPED, unlike the icon paths, and this is the one real difference
+        // between the two: an icon path is a literal this file wrote, while a
+        // cover path contains the BOOK'S OWN NAME off the card. Image::cleanId
+        // replaces only '/', ':', '.' and space, so a '"' or '&' in a filename
+        // survives into the ImageId and would either terminate the attribute
+        // early or be eaten as an entity. toHtmlEscaped covers exactly those
+        // characters, and Qt's own parser resolves them back when it opens the
+        // file.
+        //
+        // WIDTH AND HEIGHT ARE FORCED, and that is what keeps the 12-rows-per-
+        // page budget: an unsized <img> lays out at the JPEG's native 149x223
+        // and would nearly triple the row height, silently costing items off
+        // every page (NF_ITEMS_PER_PAGE's own comment, and NF_COVER_H_PX's in
+        // nffmt.h, for why that number is the owner's and what to do if a
+        // screenshot shows fewer than 12).
+        return QStringLiteral("<img src=\"%1\" width=\"%2\" height=\"%3\">&nbsp;")
+                   .arg(coverPath.toHtmlEscaped()).arg(w).arg(NF_COVER_H_PX);
+    }
+
+    // No cover: the type icon, exactly as before this feature existed. The
+    // kind is passed in rather than derived here because the caller has
+    // already computed it off r.name (and needs it for nothing else), and
+    // because a cover row must still HAVE a kind -- if this row's cover file
+    // ever stops existing, the fallback is a correctly-typed icon and not a
+    // question this function has to re-answer.
+    *outWidth   = nf_icon_width_px(kind, fm);
+    *outIsCover = false;
+    return nf_icon_markup(kind);
+}
+
 // Builds a fresh content widget (rows for `path`'s own directory listing)
 // and swaps it into the ALREADY-EXISTING `dialog` via N3Dialog::setContent
 // -- this is the whole navigation model (nfview.h): one N3Dialog for the
@@ -1244,6 +1404,60 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
     nf_build_listing(raw, &nf_row_meta, &ctx, &rows,
                      nf_browser_filter, nf_browser_sort_key, nf_browser_sort_desc,
                      &filteredToNothing);
+
+    // COVER PATHS, resolved for the WHOLE listing and not just for the twelve
+    // rows this page will draw. Two reasons, and the second is the important
+    // one:
+    //
+    //   - the row loop below then does no stat of its own, so what the tally
+    //     counted and what the rows render are the same decision rather than
+    //     two that could drift;
+    //   - the TALLY only means something over the whole listing. The
+    //     non-vacuous check for this feature is arithmetic, the same shape as
+    //     the read-state filters' (NOTES.md, Task 13): in the reference card's
+    //     Fullmetal Alchemist folder, 16 covers + 10 files with a library row
+    //     and no cover file + 1 file with no library row = 27 entries. A
+    //     per-page tally could never balance against a number like that, and
+    //     "some rows have covers" is an impression rather than a measurement.
+    //
+    // One stat per FILE row per navigation (folders and rows with no library
+    // row are skipped before any path is built). That is cheap next to the
+    // getById round trip each of those rows already made, and it holds no
+    // handle -- see nf_cover_path_for_row.
+    QVector<QString> coverPaths(rows.size());
+    int nCover = 0, nNoCoverFile = 0, nNoRow = 0, nDirs = 0, nBlankImageId = 0;
+    for (int i = 0; i < rows.size(); i++) {
+        nf_row const &cr = rows.at(i);
+        if (cr.isDir) {
+            nDirs++;
+            continue;
+        }
+        if (!cr.hasRow) {
+            nNoRow++;
+            continue;
+        }
+        coverPaths[i] = nf_cover_path_for_row(cr);
+        if (coverPaths.at(i).isEmpty()) {
+            nNoCoverFile++;
+            // Counted separately because it is a DIFFERENT fact: a blank
+            // ImageId means the library row itself names no image, where an
+            // empty path with a non-blank id means the JPEG has not been
+            // rendered yet. If this number ever equals nNoCoverFile for a
+            // whole card, the ImageId read is what to look at, not the path
+            // scheme.
+            if (cr.imageId.isEmpty())
+                nBlankImageId++;
+        } else {
+            nCover++;
+        }
+    }
+    // The four buckets partition the listing exactly -- nCover +
+    // nNoCoverFile + nNoRow + nDirs == rows.size() -- which is what makes
+    // this checkable at a glance instead of merely informative. The total is
+    // printed alongside them so a partition that stops adding up is visible
+    // in the same line rather than needing a second one.
+    nh_log("covers: %d shown, %d file(s) with a row but no cover file (%d of those with a blank ImageId), %d file(s) with no library row, %d folder(s) -- %d row(s) total",
+           nCover, nNoCoverFile, nBlankImageId, nNoRow, nDirs, rows.size());
 
     // Pagination bounds. totalPages is at least 1 even for an empty listing,
     // so "page 1/1" (below) is always a sensible thing to compute, never a
@@ -1613,9 +1827,16 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
         // -- pure, so both are host-tested.
         int labelInset  = nf_row_label_inset_px(rowLabel, fm);
         int textWidth   = rowWidth - labelInset; // the label's own text area
-        int iconWidth   = nf_icon_width_px(kind, fm);
+        // The leading image and the width it costs, from ONE call -- a cover
+        // is 51 px wide where a type icon is 40, and charging the wrong one
+        // is exactly the class of mismeasurement NOTES.md Task 13 records
+        // (see nf_row_leading_markup).
+        int  leadWidth = 0;
+        bool leadIsCover = false;
+        QString leading = nf_row_leading_markup(kind, coverPaths.at(i), fm,
+                                                &leadWidth, &leadIsCover);
         int suffixWidth = fm.width(suffixPlain);
-        int nameWidth   = nf_name_budget_px(textWidth, iconWidth, suffixWidth);
+        int nameWidth   = nf_name_budget_px(textWidth, leadWidth, suffixWidth);
 
         // ONE line per navigation, not per row: every term above except the
         // suffix is the same on every row of a listing, and the first row's
@@ -1624,9 +1845,14 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
         // page (i == startIdx), where the alternative -- logging every row --
         // would be 12 lines a navigation and, at nh_log's silent 256-byte
         // truncation, would push the lines that matter out of view.
+        //
+        // The leading term now NAMES which of the two it is: a cover and a
+        // type icon are different widths, so a budget line that only said
+        // "icon" could not be checked against what the row actually drew.
         if (i == startIdx)
-            nh_log("browser: name budget %d px = row %d - label inset %d - icon %d - suffix %d ('%s')",
-                   nameWidth, rowWidth, labelInset, iconWidth, suffixWidth,
+            nh_log("browser: name budget %d px = row %d - label inset %d - %s %d - suffix %d ('%s')",
+                   nameWidth, rowWidth, labelInset,
+                   leadIsCover ? "cover" : "icon", leadWidth, suffixWidth,
                    qPrintable(suffixPlain));
 
         // ELIDED FIRST, THEN ESCAPED, THEN the markup joins it, and every
@@ -1662,7 +1888,7 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
         // to be called: a name containing something tag-shaped would
         // otherwise flip the mode, in either direction, for that one row.
         rowLabel->setTextFormat(Qt::RichText);
-        rowLabel->setText(nf_icon_markup(kind) + label);
+        rowLabel->setText(leading + label);
 
         if (!r.isDir && !r.hasRow) {
             // A SECONDARY visual cue, best-effort and UNVERIFIED on this
@@ -1734,10 +1960,10 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
                        i, hintWidth, rowWidth, overflow);
             }
         } else if (overflow > 0) {
-            int corrected = nf_name_budget_px(textWidth - overflow, iconWidth, suffixWidth);
+            int corrected = nf_name_budget_px(textWidth - overflow, leadWidth, suffixWidth);
             QString reflowed = fm.elidedText(r.label, Qt::ElideMiddle, corrected).toHtmlEscaped();
             reflowed += suffixMarkup;
-            rowLabel->setText(nf_icon_markup(kind) + reflowed);
+            rowLabel->setText(leading + reflowed);
             // Logged for the FIRST row that needs it only. The terms are the
             // same on every row of a listing, so the first one names the
             // shortfall; 12 identical lines would only push it out of the log

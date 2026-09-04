@@ -345,6 +345,14 @@ bool nf_native_view_resolve(void);
 // so a dateless row sorts where Nickel puts a dateless row. Like every other
 // out-parameter here, both are always written, even when this returns false.
 //
+// *outImageId receives ATTRIBUTE_IMAGE_ID as RAW UTF-8 BYTES -- the name
+// Nickel builds its cover filenames out of (nffmt.h, nf_cover_path). It is
+// EMPTY when contentId has no row, when Content::getImageIdRaw did not
+// resolve, or when the column itself is blank; every one of those degrades
+// to the row's own type icon, silently, because a book with no rendered
+// cover is the COMMON case and not an error. Always written, same as the
+// rest.
+//
 // BOTH KEYS COINCIDE for a sideloaded book that has never been opened, because
 // both of Nickel's date sorts fall back to ___SyncTime for sideloaded content.
 // That is Nickel's behaviour, not a defect, but it defeats a naive "the two
@@ -352,7 +360,8 @@ bool nf_native_view_resolve(void);
 // the getDateAddedSortKey call for the control it implies.
 bool nf_volume_exists(QString const& contentId, QString const& dbName,
                       int *outPercentRead, nf_read_state *outReadState,
-                      QByteArray *outDateAdded, QByteArray *outDateLastRead);
+                      QByteArray *outDateAdded, QByteArray *outDateLastRead,
+                      QByteArray *outImageId);
 
 // QSharedPointer<T>'s complete runtime layout, for every T, per Qt 5.2's
 // public qsharedpointer_impl.h: a value pointer, then an

@@ -704,3 +704,79 @@ int nf_name_budget_px(int rowWidth, int iconWidth, int suffixWidth) {
         w = NF_NAME_MIN_PX;
     return w;
 }
+
+// --- book covers --------------------------------------------------------
+//
+// nffmt.h has the measured path layout and the reason each of these three
+// lives on the pure, host-tested side of the boundary rather than in
+// nfview.cc next to the QFile::exists that consumes them.
+
+QString nf_clean_image_id(QString const& id) {
+    // Image::cleanId's own four QString::replace(QChar, QChar) calls, in its
+    // own order (which cannot matter -- '_' is not one of the four searched
+    // characters, so no replacement can create work for a later one; stated
+    // because "these are order-independent" is exactly the kind of thing
+    // that is obvious until '_' joins the set).
+    QString out = id;
+    out.replace(QLatin1Char('/'), QLatin1Char('_'));
+    out.replace(QLatin1Char(':'), QLatin1Char('_'));
+    out.replace(QLatin1Char('.'), QLatin1Char('_'));
+    out.replace(QLatin1Char(' '), QLatin1Char('_'));
+    return out;
+}
+
+unsigned nf_bucket_hash(QString const& imageId) {
+    // IOUtil::bucketById's tail loop, instruction for instruction:
+    //   ldrh   -> one UTF-16 code unit
+    //   add    -> h = c + (h << 4)
+    //   and/eor-> h ^= (h & 0xf0000000) >> 23
+    //   bic    -> h &= 0x0fffffff
+    // The 16x-unrolled body above it in the firmware computes the same
+    // thing; there is no separate algorithm for long strings.
+    //
+    // `unsigned` rather than a signed int on purpose: the masks are defined
+    // on an unsigned value, and >> on a negative signed int is
+    // implementation-defined. The final mask keeps it inside 28 bits anyway,
+    // so no shift here can reach the sign bit -- but relying on that would
+    // be relying on the arithmetic to stay exactly as it is.
+    unsigned h = 0;
+    for (int i = 0; i < imageId.size(); i++) {
+        h = (unsigned)imageId.at(i).unicode() + (h << 4);
+        h ^= (h & 0xf0000000u) >> 23;
+        h &= 0x0fffffffu;
+    }
+    return h;
+}
+
+QString nf_cover_path(QString const& imageId) {
+    // The refusal, not a guard against a crash -- see nffmt.h: an empty id
+    // hashes to bucket 0/0, which is a REAL directory on this card, so the
+    // path would look entirely plausible and name a file that has nothing to
+    // do with any book.
+    if (imageId.isEmpty())
+        return QString();
+
+    unsigned h = nf_bucket_hash(imageId);
+    // Plain decimal, both components, and the ImageId inserted verbatim --
+    // Image::fileNameForType memcpys its argument in with no transform of
+    // any kind, so anything this function does to `imageId` beyond
+    // concatenation would be a divergence from Nickel's own naming.
+    return QStringLiteral(NF_COVER_IMAGE_DIR "/%1/%2/%3 - " NF_COVER_TYPE ".parsed")
+               .arg(h & 0xffu)
+               .arg((h >> 8) & 0xffu)
+               .arg(imageId);
+}
+
+int nf_cover_width_px(int heightPx) {
+    // Rounded rather than truncated: at NF_COVER_H_PX (76) the exact width
+    // is 50.8, and truncating would squeeze every cover by most of a pixel
+    // in one direction only. The +/- half is done in integers to keep this
+    // file free of anything that would pull in a maths runtime.
+    int w = (heightPx * NF_COVER_NATIVE_W + NF_COVER_NATIVE_H / 2) / NF_COVER_NATIVE_H;
+    // A zero-width <img> renders as nothing at all while the row still pays
+    // for the height, which reads as "the cover is missing" when in fact the
+    // height was nonsense. Refuse to produce that shape.
+    if (w < 1)
+        w = 1;
+    return w;
+}
