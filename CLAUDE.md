@@ -186,6 +186,54 @@ see `DEVICE.local.md`.
   you; do not re-add a piped `| tail -1` or similar around them — that is
   exactly what swallowed the error output that would have caught this sooner.
 
+### The dev-only restart path (skip the reboot)
+
+`tools/restart-nickel.sh`, installed on the device at
+`/mnt/onboard/.adds/nfolders/restart-nickel.sh`, restarts Nickel in place —
+kills it and every helper binary alongside it, tears the radio down, and
+relaunches `hindenburg`/`nickel` the way `rcS` does — so a freshly pushed
+`libnfolders.so` takes effect without the reboot that is otherwise "the unit
+of iteration" above. Wire it up with `tools/nickelmenu-nfolders.cfg`
+(appended to NickelMenu's own config, not installed by anything in this
+repo):
+
+```
+menu_item :main :NickelFolders        :cmd_spawn :quiet:/bin/touch /tmp/nfolders-native
+menu_item :main :Restart Nickel (dev) :cmd_spawn :quiet:/mnt/onboard/.adds/nfolders/restart-nickel.sh
+```
+
+**THIS IS DEV-ONLY. Do not ship the "Restart Nickel (dev)" item, and never
+run `restart-nickel.sh` over ssh.** It is gated on `PLATFORM`, `PRODUCT` and
+`NICKEL_HOME` all being set — env `rcS` exports before Nickel starts, which
+only a process spawned *from inside Nickel* (a NickelMenu item) inherits.
+An ssh shell has none of it, so the script refuses, exits non-zero, and
+leaves Nickel untouched — the same gate `../koboy/scripts/koboy.sh` uses,
+copied rather than reinvented, because **restarting Nickel from a process
+missing that environment is what corrupted this exact device once
+already**: `/mnt/onboard/.kobo/version`'s real serial was overwritten with a
+placeholder and its trailing field emptied. The corruption signature, so it
+is recognisable if it ever happens again:
+
+```
+before  N4XXXXXXXXXXX,4.1.15,4.38.23684,...,00000000-...-000000000388
+after   11:22:33:44:55:66,4.1.15,4.38.23684,...,
+```
+
+— i.e. the serial reading literally `11:22:33:44:55:66` and the field after
+the trailing comma empty. **After the first use of `restart-nickel.sh` on
+any device, check `/mnt/onboard/.kobo/version` for that signature and run
+`fbink -e` (its device-identity line should read the real model, not
+`Unknown!`)** before trusting anything else about the session. Only a
+reboot repairs it if it happens. The gate is trivially spoofable (exporting
+those three names by hand before running the script over ssh gets past it)
+— it defends against the *ordinary* ssh launch that caused the corruption
+the one time this was measured, not against someone deliberately
+impersonating Nickel's environment.
+
+The script also logs what it did to `restart-nickel.log` next to itself
+(`/mnt/onboard/.adds/nfolders/restart-nickel.log`), readable over ssh
+afterward.
+
 ### Backing out
 
 - Create `/mnt/onboard/nfolders_uninstall` and reboot — the mod deletes itself
@@ -457,6 +505,20 @@ tools/kobo.py        ssh/push/pull/screenshot/trigger/reboot/wait. Drives ssh
                      above for what each of those used to get away with.
 tools/plt.sh         PLT stub -> symbol. See "Method" above.
 tools/nftest.sh      the staged device driver, with PID-change abort
+tools/restart-nickel.sh
+                     DEV-ONLY: restarts Nickel in place so a freshly pushed
+                     libnfolders.so takes effect with no reboot -- gated on
+                     PLATFORM/PRODUCT/NICKEL_HOME so an ssh launch refuses
+                     rather than risk repeating the device corruption
+                     recorded in "Device workflow" above. Installed
+                     separately (nothing in this repo pushes it); mirrors
+                     ../koboy/scripts/koboy.sh's own gate and restart
+                     sequence rather than reinventing either.
+tools/nickelmenu-nfolders.cfg
+                     the NickelMenu config snippet that wires up both the
+                     folder-browser trigger and the dev-only restart --
+                     append to NickelMenu's own config, not installed by
+                     this repo.
 NickelHook/          submodule
 libnickel.so.1.0.0   GITIGNORED, 24 MB of Kobo's proprietary binary, staged
                      locally so the archaeology needs no re-download.
