@@ -337,9 +337,29 @@ bool nf_volume_exists(QString const& contentId, QString const& dbName,
         if (Content__getReadStatus) {
             int status     = Content__getReadStatus(v);
             *outReadState  = nf_read_state_from_status(status);
-            if (*outReadState == NF_READ_UNKNOWN && !nf_read_status_warned) {
-                nf_read_status_warned = true;
-                nh_log("progress: Content::getReadStatus() read %d for '%s' -- outside the measured 0..2, treating the read state as unknown; this firmware may have renumbered ReadingStatus", status, qPrintable(contentId));
+            if (*outReadState == NF_READ_UNKNOWN) {
+                if (!nf_read_status_warned) {
+                    nf_read_status_warned = true;
+                    nh_log("progress: Content::getReadStatus() read %d for '%s' -- outside the measured 0..2, treating the read state as unknown; this firmware may have renumbered ReadingStatus", status, qPrintable(contentId));
+                }
+                // Same degradation as the resolve-failure branch below, and
+                // for the same reason -- reached when getReadStatus() RESOLVES
+                // but answers outside 0..2, which is exactly the renumbered-
+                // enum case the warning above describes. Without this, a
+                // renumber would take the row's device-verified "[finished]"
+                // marker (nfview.cc) and all three read-state filters
+                // (nffmt.cc) down together, while isFinished() sat resolved
+                // and correct a few lines away -- a review caught that the
+                // fallback was keyed on the symbol being ABSENT rather than on
+                // the answer being unusable, which is the narrower of the two
+                // failures and not the one that firmware causes.
+                //
+                // A false isFinished() still cannot tell "not started" from
+                // "in progress", so it leaves UNKNOWN standing: recovering the
+                // one bucket a bool can prove is not the same as guessing the
+                // other two.
+                if (Content__isFinished && Content__isFinished(v))
+                    *outReadState = NF_READ_FINISHED;
             }
         } else if (Content__isFinished) {
             // getReadStatus() gone but isFinished() still resolving: degrade

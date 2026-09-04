@@ -78,6 +78,45 @@ static void test_metadata_is_fetched_for_every_row(void) {
     CHECK(calls == 27);
 }
 
+// The TYPE filter must run BEFORE the metadata fetch, and this is the only
+// check that pins it. Ordering is not cosmetic here: `meta` is a libnickel
+// round trip per file on the device (VolumeManager::getById + Volume::isValid,
+// nfnickel.cc), so filtering first is what keeps a filtered listing from
+// paying for rows nobody asked to see.
+//
+// Without a call-COUNT assertion, moving the type filter back after the
+// metadata stage would keep every other check in this file green -- the
+// surviving rows are identical either way, only the cost changes -- which is
+// exactly the kind of silent regression nflist.cc's stage comments call
+// deliberate. A review found this gap; the read-state filter cannot be pinned
+// the same way, because it NEEDS the metadata and so must run after it.
+//
+// The 4-vs-1 gap is the whole point: 1 proves the filter ran first, and the
+// negative control below proves the count moves at all, so a 1 that came from
+// a broken callback rather than from correct ordering cannot pass.
+static void test_type_filter_runs_before_the_metadata_fetch(void) {
+    QVector<nf_entry> e;
+    e << ent("Comics", true)          // folder: never looked up, never filtered
+      << ent("Volume 1.cbz", false)
+      << ent("Volume 2.cbz", false)
+      << ent("Report.pdf", false)     // the only survivor of NF_FILTER_PDF
+      << ent("Notes.epub", false);
+    QVector<nf_row> out;
+    int calls = 0;
+    nf_build_listing(e, fake_meta, &calls, &out, NF_FILTER_PDF);
+    CHECK(out.size() == 2);           // the folder, and Report.pdf
+    CHECK(calls == 1);                // NOT 4: the three non-PDFs were gone first
+
+    // Negative control. Same fixture, filter off: the count must rise to every
+    // file, proving the assertion above is measuring ordering and not a
+    // callback that simply never fires.
+    QVector<nf_row> all;
+    int allCalls = 0;
+    nf_build_listing(e, fake_meta, &allCalls, &all, NF_FILTER_ALL);
+    CHECK(all.size() == 5);
+    CHECK(allCalls == 4);             // four files, folder still not looked up
+}
+
 // Directories get no metadata lookup: there is no Volume for a folder, and
 // asking would cost 27 pointless libnickel calls on the reference card.
 static void test_directories_are_not_looked_up(void) {
@@ -552,6 +591,7 @@ int main(void) {
     test_junk_is_dropped_before_anything_else();
     test_metadata_is_fetched_for_every_row();
     test_directories_are_not_looked_up();
+    test_type_filter_runs_before_the_metadata_fetch();
     test_missing_row_is_kept_and_marked();
     test_labels_are_derived_after_filtering();
     test_labels_match_their_rows_after_sorting();
