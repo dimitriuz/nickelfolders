@@ -1665,6 +1665,16 @@ derivation in `NOTES.md`, not just the conclusion.
 
 Cross-check against the exported `Volume::fromAttributes(QHash<QString,QVariant> const&)`, which is the same ORM's other half and names its own type.
 
+**Correction (Task 11, `NOTES.md` "reading progress on folder-browser
+rows"): the cross-check found a mismatch, not agreement.** `getDbValues()`
+returns `QMap<QString,QVariant>` (four independent relocation proofs,
+`NOTES.md`); `fromAttributes` is mangled with `QHash`, not `QMap` — "the same
+ORM's other half... names its own type" is exactly backwards, since the two
+halves turn out to name *different* container types. Left as originally
+written rather than edited into looking right in hindsight, per this
+project's practice — see `NOTES.md` for the full derivation, and for why v1
+ended up using three narrower symbols instead of `getDbValues()` regardless.
+
 - [ ] **Step 2: Write the metadata callback**
 
 ```cpp

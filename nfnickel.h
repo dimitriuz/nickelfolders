@@ -275,18 +275,39 @@ bool nf_native_view_resolve(void);
 // measured discipline nf_open_book_staged already uses (getById answers an
 // unknown ContentID with a default-constructed Volume rather than an error,
 // so isValid is what actually distinguishes "found it" from "no such
-// book"), NOT Volume::getDbValues: CLAUDE.md's task brief for the folder
-// browser explicitly rules that call out for this milestone -- its calling
-// convention is unestablished archaeology, and guessing an ABI wrong is
-// exactly what VolumeManager::getById's missing `this` once cost this
-// project (a crashed Nickel, NOTES.md). So this can only ever answer
-// "does a row exist for this file", never "how far read" -- a caller
-// wanting reading progress has nothing here to call; that is a later task.
-// False (not a crash) if nf_nickel_resolve() is false, so a firmware that
-// breaks getById specifically degrades the browser to "every file shows as
-// not in the library" rather than refusing to browse at all -- consistent
-// with every other gate in this file staying independent per feature.
-bool nf_volume_exists(QString const& contentId, QString const& dbName);
+// book"). False (not a crash) if nf_nickel_resolve() is false, so a
+// firmware that breaks getById specifically degrades the browser to
+// "every file shows as not in the library" rather than refusing to browse
+// at all -- consistent with every other gate in this file staying
+// independent per feature.
+//
+// Also fills *outPercentRead and *outFinished from the SAME Volume, in the
+// SAME getById/isValid/dtor round trip -- one lookup per row, not two --
+// via Content::getReadStatus()/isFinished() and a hardcoded offset into
+// Volume::d(), NOT Volume::getDbValues(): that call is safe to invoke but
+// was rejected anyway, on its own terms, not merely as "unestablished
+// archaeology" (it is now fully derived, NOTES.md's "reading progress on
+// folder rows" section) -- its QMap return has a displaced sret+this shape
+// this project has crashed on once already (VolumeManager::getById), its
+// ReadStatus value comes back as a QVariant holding Kobo's own user type
+// so a plain toInt() silently reads 0 for every book, and its only
+// exported reader (QMap::operator[]) INSERTS on a missing key rather than
+// failing. The three narrower symbols used instead have none of those
+// traps: two are a plain (this-in, int/bool-out) convention with nothing
+// to destroy, and the offset is guarded (see nfnickel.cc) rather than
+// trusted blind.
+//
+// *outPercentRead is -1 when contentId has no row, when either resolved
+// symbol needed for it is NULL (a firmware that renames one degrades this
+// feature alone, same independence as every other gate here), or when the
+// value read back is outside 0..100 -- that last case is a hardcoded
+// struct offset's only safety net (nfnickel.cc has the full guard and why
+// clamping instead would be the wrong fix). *outFinished is false in every
+// one of those cases too. Both are always written, even when this returns
+// false, the same convention nf_build_volume_source's *outKept already
+// uses.
+bool nf_volume_exists(QString const& contentId, QString const& dbName,
+                      int *outPercentRead, bool *outFinished);
 
 // QSharedPointer<T>'s complete runtime layout, for every T, per Qt 5.2's
 // public qsharedpointer_impl.h: a value pointer, then an

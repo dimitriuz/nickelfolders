@@ -1769,3 +1769,209 @@ which shares nothing with either filename. Not implemented: it needs
 display name as an input it does not currently have, which is a real
 signature change and a real new fixture set, not a one-line fix — left for
 a future pass rather than folded into the finding that motivated it.
+
+## Task 11: reading progress on folder-browser rows
+
+`nf_row` (`nflist.h`) has carried `percentRead` and `finished` since Task 9,
+always -1/false — this task is what fills them in, from a read-only
+archaeology pass over `libnickel.so.1.0.0`, firmware 4.38.23684 (the same
+image every other measurement in this file was taken against; full derivation
+in `.superpowers/sdd/2026-09-03-nickelfolders-v1/getdbvalues-archaeology.md`).
+
+### `Volume::getDbValues()` is safe to call, and rejected anyway
+
+Earlier passes (Task 9's own comments, and the design spec/plan below) left
+this as "unestablished archaeology" v1 deliberately did not take on. It is
+now fully resolved — non-static, returns `QMap<QString,QVariant>` by value
+with the hidden sret in r0 and `this` displaced to r1 (the same displaced
+shape `VolumeManager::getById` has, for a different reason: `getById` has no
+`this` at all, this one genuinely does) — and it is **still not used**,
+because two independent things about it would have produced silent wrong
+answers rather than a loud failure:
+
+- **`ReadStatus` comes back as a `QVariant` holding Kobo's own `ReadingStatus`
+  user type**, not a plain `int` — `Content::getDbValues` constructs it with
+  `QVariant::QVariant(int typeId, void const*, uint)`, not `QVariant(int)`.
+  `QVariant::toInt()` on a user-type variant returns **0, silently** — every
+  book would render as unread and nothing would look broken. `___PercentRead`
+  IS a plain `QVariant(int)`, so this trap is specific to the read-status key.
+- **The only exported reader is `QMap::operator[]`, which INSERTS a
+  default-constructed (invalid) `QVariant` on a missing key rather than
+  failing.** There is no exported `value()`/`find()`/`constFind()` for this
+  instantiation (`nm -D` gives exactly nine weak symbols, none of them). A
+  misspelled or renamed key would not fail either — it would silently grow
+  the map by one node and hand back an invalid value indistinguishable from
+  "the field exists and is unset" without an explicit `isValid()` check.
+
+And a real, if smaller, cost even if both of those are handled correctly:
+**the caller must destroy the returned map** (`~QMap`, resolved by name;
+`_ZN4QMapI7QString8QVariantED1Ev`) or leak it — ~77 nodes × 32 bytes ≈ 2.5 kB
+plus a held reference on every `QByteArray`/`QString` value, per row, per
+directory listing (~67 kB for the 27-row Fullmetal Alchemist folder, per
+visit). `Content::getDbValues` also unconditionally serialises
+`ATTRIBUTE_EXTERNALS` through a JSON round-trip on every call — pure waste
+for a percentage and a status.
+
+None of this makes `getDbValues` unsafe — its calling convention is
+established as solidly as anything else in this file, corroborated by its
+being a `const` virtual (vtable slot 5, `_ZTV6Volume`) and by three
+independent proofs that `r1` really is `this` (dereferenced at `+4` as the
+d-pointer, passed through to `Content::getDbValues` unchanged, and a virtual
+override cannot be static). It is rejected because the narrower alternative
+below removes every one of these traps for less resolution work, not because
+the wide route is an ABI guess.
+
+### The three symbols used instead
+
+No exported accessor reads the percent-read field directly — it really is
+inlined away, as expected — but three narrower exported symbols cover the
+whole feature between them, none of which allocate or need a destructor:
+
+| Symbol | Convention | Use |
+|---|---|---|
+| `_ZNK7Content13getReadStatusEv` (`Content::getReadStatus() const`, `0x00957860`) | `this` in r0, `int` (the `ReadingStatus` enum) out in r0. No sret, no displacement — unlike `getDbValues`/`getById`. | Resolved and called as a cross-check against `isFinished()`'s own answer (below) — this project has shipped one mangled-wrong symbol before (`getDbValues` itself, with a length prefix of 12 instead of 11, an error corrected in this same task — see below), and two independently-resolved symbols disagreeing is exactly what would catch a repeat. |
+| `_ZNK7Content10isFinishedEv` (`Content::isFinished() const`, `0x0095792c`) | `this` in r0, `bool` out in r0. Its own body is `getReadStatus() == 2` (`sub r0,#2; clz r0,r0; lsrs r0,#5`), read directly off the disassembly rather than assumed. | The primary source for `nf_row::finished` — called directly rather than reimplementing "== 2" by hand, so this mod never has to hardcode Kobo's own enum value itself. |
+| `_ZNK6Volume1dEv` (`Volume::d() const`, `0x00a60d4c`) | `this` in r0, the private-data pointer out in r0. Three instructions, no calls. | Gives the pointer `nf_volume_exists` (`nfnickel.cc`) reads `+140` off, by hand, for the percentage — see below. |
+
+`Content` is a **public, non-virtual base of `Volume` at offset 0** —
+`_ZTI6Volume`'s own RTTI (`base_count = 2`, `_ZTI7Content` at
+`offset_flags = 0x02` = public, offset 0) — so a `Volume*` from `getById` is
+usable directly as the `this` for both `Content::` calls above with no
+adjustment. Read out of Nickel's own RTTI, not assumed.
+
+`ReadingStatus` values: only **2 == Finished** and **3 == Closed** are
+measured (`isFinished`/`isClosed`'s own bodies). 0 and 1 are presumed
+unread/reading from the schema's shape but no exported predicate or string
+table names which is which — not needed here, since the browser only ever
+renders "in progress" (a percentage) or "finished" (a marker), never
+distinguishes 0 from 1.
+
+### The percentage: a hardcoded offset, and the guard that exists because of it
+
+**`___PercentRead` is a plain `int` at `Volume::d() + 140`.** This is the one
+piece of this feature with no `dlsym` name-resolution safety net — a renamed
+*symbol* fails loudly (NULL, logged, `.optional`) the same as everything else
+in this project, but a *moved offset* does not fail at all; it reads whatever
+happens to sit at `+140` on the new layout and hands back a
+wrong-but-plausible-looking number.
+
+It is used anyway, on the strength of **three independent corroborations**,
+none of which is "the report says so":
+
+1. `Content::getDbValues` reads exactly `private+140` into the map's own
+   `___PercentRead` entry (`QVariant::QVariant(int)`, then `QMap::insert`).
+2. `Content::setPercentRead(QVariant const&)` (`0x0095a760`) **writes**
+   exactly the same offset, via `QVariant::toInt(bool*)`, from a totally
+   different vtable slot (9, the non-const `d()`) than `getDbValues` reads
+   through (slot 8, the const `d()`) — a differently-named function on a
+   different code path writing the same offset with the same width is the
+   independent confirmation this project's method (`CLAUDE.md`, "Method:
+   adding a new libnickel call") asks for.
+3. The **neighbouring fields are independently pinned**: `+136` is read by
+   the exported `Content::getVolumeIndex() const` and assigned from
+   `ATTRIBUTE_VOLUME_INDEX` in `getDbValues`; `+144` is read by the exported
+   `Content::getDepth() const` and assigned from `ATTRIBUTE_DEPTH` the same
+   way. Two accessors either side of `+140` agreeing with `getDbValues`' own
+   field assignments is what makes "the layout at this address is what this
+   report says" a measured claim rather than a read of one function in
+   isolation.
+
+**The guard**, in `nf_volume_exists` (`nfnickel.cc`): the value is
+range-checked to `0..100`. Outside that range, the percentage is treated as
+**unknown** (`*outPercentRead = -1`, which `nfview.cc` renders as nothing —
+same as "no row at all") — **not clamped**. Clamping a shifted-offset read
+into `0..100` would produce a plausible-looking wrong percentage and hide the
+very layout change this check exists to catch; CLAUDE.md's own "Clamps,
+guards and deliberate leaks carry a note saying they are deliberate" is why
+that reasoning is spelled out at the call site too, not just here. The first
+out-of-range value seen is logged once, loudly (`nh_log`, tagged `progress:`,
+findable with a plain `logread` grep — not filtered, per this file's own
+"do not filter the crash log" lesson), then silenced for the rest of the
+process's life via a zero-initialised file-scope `static bool` — a POD static
+with no dynamic initialiser, so `nm | grep GLOBAL__sub_I` stays empty.
+
+**What this guard would catch, and what it would not:** a firmware that moves
+`___PercentRead` to a different byte offset within the same 408-byte private
+block will, with near certainty, read garbage outside `0..100` and get
+caught. A firmware that moves it to a different offset that *coincidentally*
+still holds a plausible integer would not be caught by this check alone —
+that is the residual risk the report's own honesty section names, and nothing
+short of re-deriving the offset on that firmware closes it. This is why
+`isFinished()`/`getReadStatus()`'s own agreement (above) is a second, free,
+independent control: a book `isFinished() == true` showing a `percentRead` of
+3 would mean the offset read is wrong even though it landed in range, and
+that inconsistency is visible in the rendered row itself (a "finished" marker
+takes priority over any percentage in `nfview.cc`, so this specific
+inconsistency would not currently surface as a visible bug — logged nowhere
+today; worth adding if a firmware bump is ever suspected of having moved
+`___PercentRead` into a still-plausible neighbouring field).
+
+### Rendering (`nfview.cc`)
+
+Three states, spec's own wording ("a percentage for in-progress books, a
+marker for finished, nothing for unread"):
+
+- `r.finished` — `"  [finished]"`, checked first: a re-read that stopped
+  partway through leaves a lower number in `percentRead` than 100, and
+  `isFinished()`'s own word is more informative than whatever number happens
+  to be sitting there.
+- else `r.percentRead > 0` — `"  (NN%)"`.
+- else (0, or -1 unknown/no-row/directory) — nothing. 0% renders as nothing
+  on purpose, not as "0%": Nickel's own `BookWidget::getPercentReadString`
+  clamps its *own* display to `[1, 99]`, which is corroborating evidence that
+  an untouched book's stored percentage really is 0, not a rendered value —
+  measured independently in the archaeology report (§9), not re-derived here.
+- Folders never get a marker: metadata is never fetched for a directory row
+  (`nf_build_listing`, `nflist.cc`), so `percentRead`/`finished` are always
+  `-1`/`false` for one.
+- A row with no library row (`!hasRow`) shows `"  [not in library]"` and
+  never a progress marker — `nf_volume_exists` only fills progress inside its
+  own `isValid()` branch, so an invalid `Volume` leaves both outputs at their
+  forced `-1`/`false` defaults from the top of the function.
+
+### The `Volume` lifecycle, unchanged in shape
+
+One `getById`/`isValid`/`~Volume` round trip per row, same as before this
+task — reading progress does **not** add a second lookup. `nf_volume_exists`
+reads `Content::isFinished()`/`getReadStatus()`/`Volume::d()+140` off the
+SAME `Volume*` `getById` already produced, inside the `isValid()` branch,
+before the existing `Volume__dtor(v)` call. `CLAUDE.md`'s "Method: adding a
+new libnickel call" rung-by-rung discipline was not needed here in the
+`stage`-counter sense (nothing here is staged the way `nf_open_book_staged`
+is) because every new call added is read-only, `.optional`, individually
+NULL-gated, and additive to an already-proven round trip — there is no new
+rung where a wrong guess reaches Nickel unguarded the way `getById`'s missing
+`this` once did.
+
+### Corrected: `getDbValues` was never paired with `fromAttributes`
+
+The design spec (`docs/superpowers/specs/2026-09-03-nickelfolders-v1-design.md`,
+"§2. Data") and the plan
+(`docs/superpowers/plans/2026-09-03-nickelfolders-v1.md`, Task 9 Step 1) both
+asserted that `getDbValues()` is "the ORM's serialisation half, paired with
+the exported `Volume::fromAttributes(QHash<QString,QVariant> const&)`" — read
+as: same ORM, inverse operation, therefore probably the same container type.
+**This is wrong, and the relocation evidence says so directly, not by
+inference:** `getDbValues()` returns `QMap<QString,QVariant>` (proven four
+independent ways in the archaeology report — every store goes through
+`QMap::operator[]`/`insert`, the map is constructed from
+`QMapDataBase::shared_null`, and the cleanup path calls `QMap::~QMap`), while
+`fromAttributes` is mangled `_ZN6Volume14fromAttributesERK5QHashI7QString8QVariantE`
+— a `QHash`, not a `QMap`. Both container flavours exist as sibling vtable
+slots (`ScObject::setAttributes(QMap const&)` at slot 3,
+`ScObject::setAttributes(QHash const&)` at slot 4) — the ORM accepts either on
+the way in and always serialises to `QMap` on the way out. "getDbValues is
+the inverse of fromAttributes, so it must return a QHash" would have been a
+plausible-sounding, wrong inference from the name pairing alone; the
+mangling is what actually settles it. Left uncorrected in the spec/plan text
+itself (this project's practice — see the back-gesture and `_ZTV18Abstract
+Controller` entries above) with a note in both places pointing here, rather
+than edited to read as if it were never asserted.
+
+Also worth restating plainly, because the plan additionally got the *symbol's
+own mangling* wrong on its first draft: `_ZNK6Volume11getDbValuesEv` needs a
+length prefix of **11** (`getDbValues` is eleven characters), not 12 — the
+same class of mistake as this section's own `Content::getReadStatus`/
+`isFinished` cross-check exists to catch, just caught by hand instead, by
+checking the mangling against the identifier's own `strlen` rather than
+trusting a first guess.

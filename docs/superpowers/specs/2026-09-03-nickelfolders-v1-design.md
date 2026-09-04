@@ -123,6 +123,19 @@ serialisation half, paired with the exported
 `Volume::fromAttributes(QHash<QString,QVariant> const&)`, so it hands back
 every column keyed by name in one call.
 
+**Correction (Task 11, `NOTES.md` "reading progress on folder-browser
+rows"): this pairing is wrong.** `getDbValues()` returns
+`QMap<QString,QVariant>`, proven four independent ways off the relocations
+(every store goes through `QMap::operator[]`/`insert`, construction from
+`QMapDataBase::shared_null`, cleanup via `QMap::~QMap`); `fromAttributes`'s
+own mangling is `_ZN6Volume14fromAttributesERK5QHashI7QString8QVariantE` — a
+`QHash`, not a `QMap`. Not a matched pair by type. Left as originally
+written, per this project's practice of keeping a wrong turn visible rather
+than editing it into looking right in hindsight — see `NOTES.md` for the
+full derivation and for why v1 uses three narrower symbols
+(`Content::getReadStatus()`/`isFinished()`, `Volume::d()+140`) instead of
+`getDbValues()` regardless, on grounds unrelated to this mistake.
+
 **What this buys:** no `QSqlDatabase` connection, no handle on the 432 MB
 `KoboReader.sqlite`, no race against Nickel's cache, and no archaeology to
 discover Nickel's SQL connection name.

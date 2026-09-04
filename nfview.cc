@@ -215,17 +215,17 @@ static void nf_pop_native_view(void *mwc, N3Dialog *dialog, char const *why) {
 }
 
 // Implements nf_meta_fn (nflist.h) for the folder browser's own listing
-// pass. Deliberately does NOT reach for Volume::getDbValues -- CLAUDE.md's
-// task brief rules that out for this milestone (its calling convention is
-// unestablished archaeology, and the ABI risk of guessing it wrong is
-// exactly the class of mistake VolumeManager::getById's missing `this`
-// once cost this project: a crashed Nickel, on the first device run,
-// from code that compiled and linked cleanly -- NOTES.md). So this only
-// ever answers "does a row exist for this file" (nf_row::hasRow), via
-// nf_volume_exists (nfnickel.h, itself just getById + isValid, the same
-// discipline nf_open_book_staged already uses) -- nf_row::percentRead and
-// nf_row::finished are left at nf_build_listing's own defaults (-1,
-// false), UNCHANGED here. Reading progress is a later task, not this one.
+// pass. Deliberately does NOT reach for Volume::getDbValues -- see
+// nf_volume_exists's own declaration (nfnickel.h) for why that call was
+// rejected on its own terms (a displaced sret+this shape this project has
+// crashed on once already, a ReadStatus value that reads back as 0 through
+// the only exported unwrap path, and an operator[] that inserts rather
+// than fails) rather than merely deferred as unestablished archaeology.
+// This fills nf_row::hasRow, ::percentRead and ::finished in ONE call --
+// nf_volume_exists's own comment has the full derivation for the three
+// narrower symbols it reads instead (Content::getReadStatus()/isFinished()
+// and a guarded offset off Volume::d()) and NOTES.md's "reading progress
+// on folder rows" section has the archaeology behind them.
 struct NFMetaCtx {
     QString dirPath; // the directory `name` (below) is relative to; ABSOLUTE, no trailing slash
     QString dbName;  // this device's own getById partition key -- nf_db_name(), read once per directory, not per file
@@ -234,7 +234,7 @@ struct NFMetaCtx {
 static void nf_row_meta(void *ctx, QString const& name, nf_row *row) {
     NFMetaCtx const *c = static_cast<NFMetaCtx const*>(ctx);
     QString contentId = QStringLiteral("file://") + c->dirPath + QLatin1Char('/') + name;
-    row->hasRow = nf_volume_exists(contentId, c->dbName);
+    row->hasRow = nf_volume_exists(contentId, c->dbName, &row->percentRead, &row->finished);
 }
 
 // QDir::entryInfoList against ONE directory, never recursive -- the spec's
@@ -528,7 +528,11 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
         // work; this only adds a per-row suffix that nf_build_listing does
         // not itself carry an opinion about:
         //   - a folder gets a trailing "/", a plain, ASCII, e-ink-safe
-        //     affordance that this row navigates rather than opens.
+        //     affordance that this row navigates rather than opens. A
+        //     folder never carries a progress marker either -- there is
+        //     no Volume for one, so r.percentRead/r.finished are always
+        //     -1/false for it (nf_build_listing, nflist.cc: metadata is
+        //     never fetched for a directory row).
         //   - a file with NO library row gets its reason spelled out in
         //     the label TEXT itself, not left to colour/style alone: this
         //     panel gives four grey levels, and "slightly lighter" reads
@@ -538,11 +542,29 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
         //     import rejected (NOTES.md) -- and it must render as clearly
         //     wrong, not silently vanish and leave a reader wondering
         //     where volume 26 went.
+        //   - a file WITH a library row gets a progress marker: spec's own
+        //     wording is a percentage for in-progress books, a marker for
+        //     finished, and NOTHING for unread. "Finished" takes priority
+        //     over any number sitting in percentRead -- a re-read that
+        //     stopped partway through leaves a lower value there, and
+        //     Content::isFinished() (nf_volume_exists, nfnickel.cc) is the
+        //     more informative word regardless of what that number is.
+        //     0% and -1 (unknown, including a firmware that moved the
+        //     +140 offset -- nf_volume_exists's own guard) both render as
+        //     nothing, deliberately: Nickel's own
+        //     BookWidget::getPercentReadString clamps display to [1,99]
+        //     for the same reason an untouched book's own stored
+        //     percentage is 0, not a real progress value (NOTES.md).
         QString label = r.label;
-        if (r.isDir)
+        if (r.isDir) {
             label += QLatin1Char('/');
-        else if (!r.hasRow)
+        } else if (!r.hasRow) {
             label += QStringLiteral("  [not in library]");
+        } else if (r.finished) {
+            label += QStringLiteral("  [finished]");
+        } else if (r.percentRead > 0) {
+            label += QStringLiteral("  (%1%)").arg(r.percentRead);
+        }
         reinterpret_cast<QLabel*>(row)->setText(label);
 
         if (!r.isDir && !r.hasRow) {

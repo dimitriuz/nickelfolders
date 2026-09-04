@@ -42,14 +42,20 @@
 // Directory listing is QDir::entryInfoList against ONE directory, never
 // recursive, never held past the single Qt signal handler that runs it
 // (CLAUDE.md's /mnt/onboard file-handle constraint). Per-file metadata
-// (nf_row::hasRow) comes from VolumeManager::getById + Volume::isValid
-// (nf_volume_exists, nfnickel.h) -- NOT Volume::getDbValues, whose calling
-// convention is unresolved archaeology this milestone deliberately does not
-// take on; nf_row::percentRead is therefore always -1 here, and reading
-// progress is a later task. A file with no library row is shown, not
-// hidden, with its reason in the label text itself (not colour alone --
-// this panel gives four grey levels, and "slightly lighter" does not read
-// as "different"), and a tap on it logs why and does nothing.
+// (nf_row::hasRow, ::percentRead, ::finished) comes from VolumeManager::
+// getById + Volume::isValid + Content::getReadStatus()/isFinished() + a
+// guarded offset off Volume::d() (nf_volume_exists, nfnickel.h) -- NOT
+// Volume::getDbValues, whose calling convention IS now fully resolved
+// (NOTES.md, "reading progress on folder rows") but which was rejected on
+// its own terms even so: a displaced sret+this shape this project has
+// crashed Nickel on once already, a ReadStatus value that silently reads
+// back as 0 through the only exported unwrap path, and an operator[] that
+// inserts on a missing key rather than failing. A file with no library row
+// is shown, not hidden, with its reason in the label text itself (not
+// colour alone -- this panel gives four grey levels, and "slightly
+// lighter" does not read as "different"), and a tap on it logs why and
+// does nothing. A file WITH a row gets a percentage, a finished marker, or
+// nothing for unread -- see nfview.cc's own row-label comment.
 //
 // Tracks its one live dialog in nf_browser_active_dialog (nfview.cc,
 // file-scope POD `void*` -- a second trigger while a screen was already up

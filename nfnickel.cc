@@ -38,6 +38,10 @@
 typedef void Volume;
 typedef void ReadBookActionProxy;
 typedef void Device;
+typedef void Content; // Volume's public, non-virtual base at offset 0 (NOTES.md) --
+                      // literally the same `void` as Volume above (a typedef to
+                      // `void` names no new type), so a Volume* needs no cast to
+                      // be passed where a Content* is expected below.
 
 // getById has NEITHER of the two implicit arguments it looks like it has. It
 // returns a Volume BY VALUE, so the hidden return buffer is argument zero.
@@ -49,6 +53,34 @@ typedef void Device;
 static Volume *(*VolumeManager__getById)(void *ret, QString const *id, QString const *dbName);
 static bool    (*Volume__isValid)(Volume const *_this);
 static void    (*Volume__dtor)(Volume *_this);
+
+// Content::getReadStatus() const / Content::isFinished() const -- plain
+// (this in r0, scalar out in r0) convention, nothing to destroy (NOTES.md,
+// "reading progress on folder rows"). isFinished() is measured equivalent
+// to getReadStatus() == 2, and is what nf_volume_exists calls for the
+// finished bit -- calling Nickel's own predicate rather than reimplementing
+// "== 2" by hand means this mod never has to hardcode Kobo's own
+// ReadingStatus enum value. getReadStatus() is resolved and called too,
+// purely as a cross-check against isFinished()'s own answer -- this
+// project has shipped one mangled-wrong symbol before (getDbValues' own
+// length prefix, NOTES.md), and two independently-resolved symbols
+// disagreeing is exactly the kind of thing that would catch a repeat.
+//
+// Both are Content:: members called directly on a Volume*: Content is a
+// public, non-virtual base of Volume AT OFFSET 0 (Volume's own _ZTI,
+// NOTES.md), so no `this` adjustment is needed.
+static int  (*Content__getReadStatus)(Content const *_this);
+static bool (*Content__isFinished)(Content const *_this);
+
+// Volume::d() const -- this in r0, the private-data pointer out in r0
+// (NOTES.md). This is NOT Volume::getDbValues() -- see nf_volume_exists,
+// below, for why that call was rejected on its own terms rather than
+// merely left unresolved. The percentage itself is read out of the
+// pointer this returns, at a hardcoded +140, by hand: there is no
+// exported accessor for it to resolve instead (NOTES.md: "No exported
+// accessor reads +140").
+static void const *(*Volume__d_const)(Volume const *_this);
+
 static void    (*ReadBookActionProxy__ctor)(ReadBookActionProxy *_this, QObject *parent, Volume const *v);
 static void    (*ReadBookActionProxy__onSelected)(ReadBookActionProxy *_this);
 
@@ -145,6 +177,9 @@ struct nh_dlsym NFNickelDlsym[] = {
     {.name = "_ZN13VolumeManager7getByIdERK7QStringS2_",      .out = nh_symoutptr(VolumeManager__getById),          .desc = "VolumeManager::getById",                 .optional = true},
     {.name = "_ZNK6Volume7isValidEv",                         .out = nh_symoutptr(Volume__isValid),                 .desc = "Volume::isValid",                        .optional = true},
     {.name = "_ZN6VolumeD1Ev",                                .out = nh_symoutptr(Volume__dtor),                    .desc = "Volume::~Volume",                        .optional = true},
+    {.name = "_ZNK7Content13getReadStatusEv",                 .out = nh_symoutptr(Content__getReadStatus),          .desc = "Content::getReadStatus",                 .optional = true},
+    {.name = "_ZNK7Content10isFinishedEv",                    .out = nh_symoutptr(Content__isFinished),             .desc = "Content::isFinished",                    .optional = true},
+    {.name = "_ZNK6Volume1dEv",                               .out = nh_symoutptr(Volume__d_const),                 .desc = "Volume::d",                              .optional = true},
     {.name = "_ZN19ReadBookActionProxyC1EP7QObjectRK6Volume", .out = nh_symoutptr(ReadBookActionProxy__ctor),       .desc = "ReadBookActionProxy::ReadBookActionProxy", .optional = true},
     {.name = "_ZN19ReadBookActionProxy10onSelectedEv",        .out = nh_symoutptr(ReadBookActionProxy__onSelected), .desc = "ReadBookActionProxy::onSelected",        .optional = true},
     {.name = "_ZN6Device16getCurrentDeviceEv",                .out = nh_symoutptr(Device__getCurrentDevice),        .desc = "Device::getCurrentDevice",               .optional = true},
@@ -227,14 +262,33 @@ bool nf_native_view_resolve(void) {
            N3Dialog__setContent && TouchLabel__ctor;
 }
 
+// Set once this run's first out-of-range read of the +140 percent-read
+// offset is logged, so a firmware that has moved the field is found in
+// logread (CLAUDE.md's verification culture: "loudly enough to be
+// found") exactly once rather than once per row per directory listing
+// thereafter. Zero-initialised static storage, not a dynamic initialiser
+// -- CLAUDE.md requires `nm | grep GLOBAL__sub_I` stay empty, and a plain
+// bool with no constructor call is initialised by the loader the same as
+// any other .bss byte.
+static bool nf_percent_offset_warned = false;
+
 // Same discipline as nf_open_book_staged (above): getById answers an
 // unknown ContentID with a default-constructed Volume rather than an
 // error, so isValid is what actually distinguishes "found it" from "no
 // such book" -- and the dtor runs on the SAME path either way, since
-// getById always constructs into volbuf when it returns non-null. See
-// nfnickel.h for why this deliberately stops at isValid and never reaches
-// for Volume::getDbValues.
-bool nf_volume_exists(QString const& contentId, QString const& dbName) {
+// getById always constructs into volbuf when it returns non-null.
+//
+// Reading progress (percentRead/finished) is read from this SAME Volume,
+// not a second lookup -- nfnickel.h has the full rationale for using
+// Content::getReadStatus()/isFinished() and Volume::d()+140 rather than
+// Volume::getDbValues(). Both progress reads happen only once isValid()
+// is true: an invalid Volume's private data is not something any of this
+// project's archaeology says anything about reading.
+bool nf_volume_exists(QString const& contentId, QString const& dbName,
+                      int *outPercentRead, bool *outFinished) {
+    *outPercentRead = -1;
+    *outFinished    = false;
+
     if (!nf_nickel_resolve())
         return false;
 
@@ -250,6 +304,59 @@ bool nf_volume_exists(QString const& contentId, QString const& dbName) {
     if (!v)
         return false;
     bool valid = Volume__isValid(v);
+
+    if (valid) {
+        // Content is a public, non-virtual base of Volume AT OFFSET 0
+        // (Volume's own _ZTI, NOTES.md) -- v is usable as the Content*
+        // `this` for both calls below with no adjustment.
+        if (Content__isFinished)
+            *outFinished = Content__isFinished(v);
+
+        // Cross-check, not the primary read: see Content__getReadStatus's
+        // own declaration comment, above, for why this is resolved and
+        // called even though isFinished() alone already answers
+        // *outFinished. Logged, not asserted -- a mismatch degrades to
+        // isFinished()'s own answer, never a crash.
+        if (Content__getReadStatus && Content__isFinished) {
+            bool expectFinished = (Content__getReadStatus(v) == 2);
+            if (expectFinished != *outFinished)
+                nh_log("progress: Content::getReadStatus()/isFinished() disagree for '%s' -- one of the two resolved to the wrong symbol", qPrintable(contentId));
+        }
+
+        // ___PercentRead: a plain int at Volume::d() + 140 (NOTES.md,
+        // "reading progress on folder rows"), corroborated three ways
+        // there before being trusted here: Content::getDbValues reads
+        // exactly this offset into its own ___PercentRead map entry;
+        // Content::setPercentRead WRITES the same offset via
+        // QVariant::toInt(); and the neighbouring fields at +136/+144 are
+        // independently pinned by the exported
+        // getVolumeIndex()/getDepth() accessors matching getDbValues' own
+        // assignments there. Even so, this is a hardcoded struct offset
+        // with NONE of dlsym's name-resolution safety net: a renamed
+        // SYMBOL fails loudly (NULL, logged, .optional) but a MOVED
+        // OFFSET does not -- it just reads whatever is sitting at +140 on
+        // the new layout and hands back a wrong-but-plausible-looking
+        // int. The range check below is what stands in for that missing
+        // safety net: a shifted field will almost certainly land outside
+        // 0..100, and the deliberate choice on an out-of-range read is to
+        // treat the percentage as UNKNOWN (-1, renders nothing -- nfview.cc),
+        // NOT to clamp it into 0..100, because clamping would hide the
+        // very layout change this check exists to catch behind a
+        // plausible-looking number.
+        if (Volume__d_const) {
+            void const *d = Volume__d_const(v);
+            if (d) {
+                int pct = *reinterpret_cast<int const*>(static_cast<char const*>(d) + 140);
+                if (pct >= 0 && pct <= 100) {
+                    *outPercentRead = pct;
+                } else if (!nf_percent_offset_warned) {
+                    nf_percent_offset_warned = true;
+                    nh_log("progress: percentRead offset (Volume::d()+140) read %d for '%s' -- outside 0..100, treating as unknown; this firmware may have moved the field", pct, qPrintable(contentId));
+                }
+            }
+        }
+    }
+
     Volume__dtor(v);
     return valid;
 }
