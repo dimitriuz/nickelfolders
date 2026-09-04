@@ -13,6 +13,8 @@ compile_commands.json
 /nfnickel.o
 /nfbrowser.o
 /nfview.o
+/nflist.o
+/nffmt.o
 
 # device credentials and local scratch
 /device.local

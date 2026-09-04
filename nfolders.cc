@@ -1,4 +1,4 @@
-// NickelFolders -- rungs 1 and 2, plus the first milestone of our own
+// NickelFolders -- rungs 1 and 2, plus the folder browser built on our own
 // interactive screen.
 //
 // Rung 1's whole job was answering whether an injected mod can hand an
@@ -11,18 +11,22 @@
 // mod hooks nothing. Both are proven on hardware but the borrowed controller
 // cannot show folders, our own label-shortening, or a greyed "not in the
 // library" row (it renders every row from a Volume's own metadata) -- so a
-// new milestone (nfview.cc) builds a deliberately trivial screen of our OWN
-// out of Nickel's OWN dialog chrome and tappable row widget
-// (N3DialogFactory/N3Dialog/TouchLabel -- NOTES.md, "Task 8: touch input
-// archaeology"), to prove taps and back navigation on hardware before
-// anything real rides on it.
+// screen of our OWN, out of Nickel's OWN dialog chrome and tappable row
+// widget (N3DialogFactory/N3Dialog/TouchLabel -- NOTES.md, "Task 8: touch
+// input archaeology"), was needed, and a first milestone of it proved taps
+// and back navigation on hardware with a deliberately trivial, hardcoded
+// three-row scaffold before anything real rode on it (see NOTES.md/task-
+// dialog-view-report.md). THAT milestone is done: nfview.cc now wires
+// nflist.h/nffmt.h's pure, fully host-tested listing pipeline
+// (nf_build_listing) to the screen, rooted at /mnt/onboard, one directory
+// at a time -- the real folder browser, not the scaffold that proved the
+// route.
 //
 // The libnickel call sequences live in nfnickel.cc (book-opening, and the
 // data-source chain rung 2's screen needs), nfbrowser.cc (constructing and
-// pushing the BORROWED controller), and nfview.cc (the native-dialog screen and
-// its own trivial view), along with the inotify watch machinery
-// (nfnickel.cc). This file is left with the three trigger protocols and the
-// NickelHook glue.
+// pushing the BORROWED controller), and nfview.cc (the native-dialog folder
+// browser), along with the inotify watch machinery (nfnickel.cc). This file
+// is left with the three trigger protocols and the NickelHook glue.
 //
 // Drive it from a shell, over ssh, with Nickel up:
 //
@@ -48,9 +52,11 @@
 //
 // The native-view-trigger's content is ignored entirely -- `touch
 // /tmp/nfolders-native` is the whole protocol -- because nf_browser_show()
-// (nfview.cc) takes no arguments: this milestone's screen is a fixed,
-// hardcoded scaffold on purpose (see nfview.cc's own header comment), not
-// yet something a trigger file could parameterise.
+// (nfview.cc) takes no arguments: the folder browser it builds always
+// starts at the root, /mnt/onboard (CLAUDE.md's task brief), and there is
+// nothing else for a trigger file to parameterise. A second `touch` while a
+// screen is already up is refused, not queued -- see nf_browser_show's own
+// re-trigger guard (nfview.cc).
 
 #include "nfbrowser.h"
 #include "nfnickel.h"
@@ -275,7 +281,7 @@ static int nf_init() {
 
 static struct nh_info NFInfo = (struct nh_info){
     .name           = "NickelFolders",
-    .desc           = "SPIKE: opens a book in the stock reader by ContentID, and can push Nickel's own list controller showing books we chose.",
+    .desc           = "Opens a book in the stock reader by ContentID, can push Nickel's own list controller showing books we chose, and browses /mnt/onboard as a folder tree in a screen of our own.",
     .uninstall_flag = "/mnt/onboard/nfolders_uninstall",
     // Spelled out although it is unused: GCC 4.9's C++ frontend rejects a
     // designated initializer that SKIPS a field ("non-trivial designated

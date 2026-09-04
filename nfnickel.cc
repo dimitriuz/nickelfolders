@@ -80,6 +80,7 @@ void   (*MainWindowController__popView)(MainWindowController *_this, QWidget *vi
 N3Dialog *(*N3DialogFactory__getDialog)(QWidget *content, bool fullScreenIdk);
 void   (*N3Dialog__setTitle)(N3Dialog *_this, QString const &title);
 void   (*N3Dialog__enableBackButton)(N3Dialog *_this, bool enable);
+void   (*N3Dialog__setContent)(N3Dialog *_this, QWidget *content);
 void   (*N3Dialog__disableCloseButton)(N3Dialog *_this);
 void   (*TouchLabel__ctor)(TouchLabel *_this, QWidget *parent, QFlags<Qt::WindowType> flags);
 
@@ -157,6 +158,7 @@ struct nh_dlsym NFNickelDlsym[] = {
     {.name = "_ZN15N3DialogFactory9getDialogEP7QWidgetb",    .out = nh_symoutptr(N3DialogFactory__getDialog),      .desc = "N3DialogFactory::getDialog",             .optional = true},
     {.name = "_ZN8N3Dialog8setTitleERK7QString",              .out = nh_symoutptr(N3Dialog__setTitle),              .desc = "N3Dialog::setTitle",                     .optional = true},
     {.name = "_ZN8N3Dialog16enableBackButtonEb",              .out = nh_symoutptr(N3Dialog__enableBackButton),      .desc = "N3Dialog::enableBackButton",             .optional = true},
+    {.name = "_ZN8N3Dialog10setContentEP7QWidget",            .out = nh_symoutptr(N3Dialog__setContent),            .desc = "N3Dialog::setContent",                   .optional = true},
     {.name = "_ZN8N3Dialog18disableCloseButtonEv",            .out = nh_symoutptr(N3Dialog__disableCloseButton),    .desc = "N3Dialog::disableCloseButton",           .optional = true},
     {.name = "_ZN10TouchLabelC1EP7QWidget6QFlagsIN2Qt10WindowTypeEE", .out = nh_symoutptr(TouchLabel__ctor),       .desc = "TouchLabel::TouchLabel",                 .optional = true},
     {.name = "_ZN7QVectorI6VolumeE6appendERKS0_",             .out = nh_symoutptr(QVectorVolume__append),           .desc = "QVector<Volume>::append",                .optional = true},
@@ -204,7 +206,7 @@ bool nf_browser_resolve(void) {
 }
 
 // A third independent gate, for the native-dialog route (nfview.cc) only
-// -- see nfnickel.h's own comment on each of these seven for what they
+// -- see nfnickel.h's own comment on each of these eight for what they
 // are. Kept disjoint from the other two (nf_nickel_resolve,
 // nf_browser_resolve) for the same reason those two stay disjoint from
 // each other: a firmware that renames, say, TouchLabel's constructor must
@@ -214,10 +216,42 @@ bool nf_browser_resolve(void) {
 // N3Dialog__disableCloseButton is deliberately NOT checked here -- see its
 // own declaration comment (nfnickel.h) for why it stays a soft, NULL-gated
 // best-effort at its own call site instead of part of this hard gate.
+// N3Dialog__setContent IS checked here, unlike disableCloseButton -- see
+// its own declaration comment (nfnickel.h) for why it is load-bearing
+// rather than cosmetic: without it the folder browser can show the root
+// once and never navigate.
 bool nf_native_view_resolve(void) {
     return MainWindowController__sharedInstance && MainWindowController__pushView &&
            MainWindowController__popView && N3DialogFactory__getDialog &&
-           N3Dialog__setTitle && N3Dialog__enableBackButton && TouchLabel__ctor;
+           N3Dialog__setTitle && N3Dialog__enableBackButton &&
+           N3Dialog__setContent && TouchLabel__ctor;
+}
+
+// Same discipline as nf_open_book_staged (above): getById answers an
+// unknown ContentID with a default-constructed Volume rather than an
+// error, so isValid is what actually distinguishes "found it" from "no
+// such book" -- and the dtor runs on the SAME path either way, since
+// getById always constructs into volbuf when it returns non-null. See
+// nfnickel.h for why this deliberately stops at isValid and never reaches
+// for Volume::getDbValues.
+bool nf_volume_exists(QString const& contentId, QString const& dbName) {
+    if (!nf_nickel_resolve())
+        return false;
+
+    // Same buffer, same size, same measurement as nf_open_book_staged's own
+    // volbuf -- see that function's comment for the derivation. A second
+    // 128-byte stack buffer per call is not worth sharing across calls: this
+    // runs once per file per directory listing (nf_row_meta, nfview.cc),
+    // synchronously, on the GUI thread, never concurrently with itself.
+    unsigned char volbuf[128] __attribute__((aligned(8)));
+    memset(volbuf, 0, sizeof volbuf);
+
+    Volume *v = VolumeManager__getById(volbuf, &contentId, &dbName);
+    if (!v)
+        return false;
+    bool valid = Volume__isValid(v);
+    Volume__dtor(v);
+    return valid;
 }
 
 // dbName is a Repository cache-partition key. Device::calcDbName compares the

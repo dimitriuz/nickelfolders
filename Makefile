@@ -1,7 +1,7 @@
 include NickelHook/NickelHook.mk
 
 override LIBRARY  := libnfolders.so
-override SOURCES  += nfolders.cc nfnickel.cc nfbrowser.cc nfview.cc
+override SOURCES  += nfolders.cc nfnickel.cc nfbrowser.cc nfview.cc nflist.cc nffmt.cc
 override CFLAGS   += -Wall -Wextra -Werror -Wno-missing-field-initializers -fvisibility=hidden
 override CXXFLAGS += -Wall -Wextra -Werror -Wno-missing-field-initializers -fvisibility=hidden -fvisibility-inlines-hidden
 # QWidget (nfbrowser.cc's view) lives in QtWidgets, not QtGui, on Qt5 -- added

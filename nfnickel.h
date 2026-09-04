@@ -185,6 +185,24 @@ extern N3Dialog *(*N3DialogFactory__getDialog)(QWidget *content, bool buildGoToP
 extern void      (*N3Dialog__setTitle)(N3Dialog *_this, QString const &title);
 extern void      (*N3Dialog__enableBackButton)(N3Dialog *_this, bool enable);
 
+// N3Dialog::setContent(QWidget*) -- 0x10e43e4
+// (`_ZN8N3Dialog10setContentEP7QWidget`, confirmed present at this exact
+// address against the local libnickel.so.1.0.0 for this task). getDialog
+// itself calls this once, internally, for the widget handed to it (NOTES.md)
+// -- this is the SAME call, resolved separately so the folder browser
+// (nfview.cc) can call it AGAIN, after the dialog already exists, to swap
+// in a fresh set of rows for a newly-tapped folder. This is what "one
+// dialog, rows rebuilt in place" (CLAUDE.md's task brief) actually is: no
+// second N3Dialog is ever constructed after the first. Reparents the new
+// widget into the dialog's own layout and calls its show(); if a previous
+// content widget was already set, REMOVES it from the layout and calls
+// deleteLater() on it (NOTES.md) -- so the caller must not touch the old
+// content widget, or anything parented under it, after this call. Part of
+// nf_native_view_resolve()'s hard gate below: unlike disableCloseButton,
+// this call is not cosmetic -- without it the browser cannot navigate at
+// all, only show the root once.
+extern void (*N3Dialog__setContent)(N3Dialog *_this, QWidget *content);
+
 // N3Dialog::disableCloseButton() -- 0x10e4084
 // (`_ZN8N3Dialog18disableCloseButtonEv`). getDialog wires the dialog's
 // closeTapped() signal (the X button) to MainWindowController::
@@ -243,14 +261,32 @@ extern void (*TouchLabel__ctor)(TouchLabel *_this, QWidget *parent, QFlags<Qt::W
 // True once every symbol this route needs has resolved -- a THIRD,
 // independent gate from nf_nickel_resolve()/nf_browser_resolve() (the same
 // independence those two already keep from each other): a firmware that
-// renames one of these seven does not disable book-opening or the
+// renames one of these eight does not disable book-opening or the
 // borrowed-controller browser screen, and vice versa. nf_browser_show()
 // (nfview.cc) refuses to build anything at all if this is false, rather
 // than pushing a half-wired dialog with some calls silently skipped. Note
-// N3Dialog__disableCloseButton is deliberately NOT among these seven --
+// N3Dialog__disableCloseButton is deliberately NOT among these eight --
 // see its own comment above for why that one call stays a soft,
 // NULL-gated best-effort instead.
 bool nf_native_view_resolve(void);
+
+// True if a Volume exists in the library for contentId, using this
+// device's own dbName -- VolumeManager::getById + Volume::isValid, the SAME
+// measured discipline nf_open_book_staged already uses (getById answers an
+// unknown ContentID with a default-constructed Volume rather than an error,
+// so isValid is what actually distinguishes "found it" from "no such
+// book"), NOT Volume::getDbValues: CLAUDE.md's task brief for the folder
+// browser explicitly rules that call out for this milestone -- its calling
+// convention is unestablished archaeology, and guessing an ABI wrong is
+// exactly what VolumeManager::getById's missing `this` once cost this
+// project (a crashed Nickel, NOTES.md). So this can only ever answer
+// "does a row exist for this file", never "how far read" -- a caller
+// wanting reading progress has nothing here to call; that is a later task.
+// False (not a crash) if nf_nickel_resolve() is false, so a firmware that
+// breaks getById specifically degrades the browser to "every file shows as
+// not in the library" rather than refusing to browse at all -- consistent
+// with every other gate in this file staying independent per feature.
+bool nf_volume_exists(QString const& contentId, QString const& dbName);
 
 // QSharedPointer<T>'s complete runtime layout, for every T, per Qt 5.2's
 // public qsharedpointer_impl.h: a value pointer, then an

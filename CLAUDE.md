@@ -11,38 +11,49 @@ as a Qt image-format plugin, built on
 [NickelHook](https://github.com/pgaskin/NickelHook). Nickel is not modified on
 disk; the mod is removable by deleting one file.
 
-**STATUS: rungs 0–2 are device-verified and there is a working screen, but it
-is a flat book list, not a folder tree.** Opening an arbitrary sideloaded book
-by ContentID (rung 1) and pushing a screen of our own choosing onto Nickel's
-window stack that lists books we chose, opens the tapped one in the stock
-reader, and returns to our list on back (rung 2) are both proven on hardware.
-**The folder tree itself does not exist yet** — rung 2's screen is built by
-borrowing Nickel's own `ArticleListLibraryController`, which lists `Volume`s,
-not filesystem entries, so it is a deliberately smaller deliverable than the
-spec's folder browser, not a step toward one. `nfolders.cc`/`nfnickel.cc`/
-`nfbrowser.cc` are the code; `NOTES.md` is the reverse-engineering record that
-made it possible, including the rejected candidate that *would* have given
-folders for free and why it was rejected anyway. Read both before proposing
-anything.
+**STATUS: rungs 0–2 are device-verified; the folder browser now exists in
+code and is NOT YET DEVICE-TESTED.** Opening an arbitrary sideloaded book by
+ContentID (rung 1) and pushing a screen of our own choosing onto Nickel's
+window stack (rung 2) are both proven on hardware. **The folder tree itself
+is now wired up, in `nfview.cc`**: one `N3Dialog`, rooted at
+`/mnt/onboard`, whose content is rebuilt in place (`N3Dialog::setContent`)
+every time a folder row is tapped — `QDir::entryList` supplies each
+directory's raw entries, and `nflist.h`/`nffmt.h`'s pure, host-tested
+listing pipeline (`nf_build_listing`) does the hiding, ordering and
+labelling that used to have nothing to render into. Per-file metadata comes
+from `VolumeManager::getById` + `Volume::isValid` only (**not**
+`Volume::getDbValues`, whose calling convention is unestablished and stays
+out of scope on purpose), so a file's reading progress is not shown yet — a
+file with no library row is greyed and labelled with the reason, not
+hidden. This code has been built (`./nickeltc make` clean) but never run on
+the device — no claim below about what it does at runtime should be read as
+a device result until `NOTES.md` says otherwise. `nfolders.cc`/`nfnickel.cc`/
+`nfbrowser.cc`/`nfview.cc` are the code; `NOTES.md` is the reverse-
+engineering record that made it possible, including the rejected candidate
+that *would* have given folders for free through a different route
+(superseded — see "What comes next" below) and why it was rejected anyway.
+Read both before proposing anything.
 
-**`nfview.cc`'s own screen was rewritten onto the measured replacement
-route and is not yet device-tested.** It used to be built on our own
-compiler-generated `AbstractController` shim, which had a proven input bug
-found by disassembly research rather than a device run: its `QPushButton`
-rendered but could never receive a tap, because Nickel does not deliver
-touch as Qt mouse events (see "What the hardware overruled" below). That
-shim is gone — `nfview.cc` now pushes a screen built entirely out of
-Nickel's own dialog chrome and tappable row widget
-(`N3DialogFactory::getDialog` + `MainWindowController::pushView`/`popView`,
-`TouchLabel` rows), needing no `AbstractController` subclass, no fabricated
-RTTI, and no cross-cast at all — the code and its full derivation are in
-`NOTES.md` ("Task 8"). **This retires the one sanctioned exception to "Nickel's
+**`nfview.cc`'s screen is built on the measured `N3Dialog`/`TouchLabel`
+route, not the earlier `AbstractController` shim.** That shim was our own
+compiler-generated class, with a proven input bug found by disassembly
+research rather than a device run: its `QPushButton` rendered but could
+never receive a tap, because Nickel does not deliver touch as Qt mouse
+events (see "What the hardware overruled" below). It is gone —
+`nfview.cc` pushes a screen built entirely out of Nickel's own dialog
+chrome and tappable row widget (`N3DialogFactory::getDialog` +
+`MainWindowController::pushView`/`popView`/`setContent`, `TouchLabel`
+rows), needing no `AbstractController` subclass, no fabricated RTTI, and no
+cross-cast at all — the code and its full derivation are in `NOTES.md`
+("Task 8"). **This retires the one sanctioned exception to "Nickel's
 classes stay opaque" below** — `libnfolders.so` no longer defines a fake
 `_ZTI18AbstractController` of its own, a real gain worth keeping this way.
-Two independent, hardware-untested exits are wired (a guaranteed "BACK" row
-straight to `popView`, and `N3Dialog`'s own `backTapped()` signal) because
-`getDialog`'s own X button is a dead affordance on this route (wired to a
-controller-stack call `pushView` never populates) — see `nfview.cc`.
+Two independent exits are wired at every level (a guaranteed "<< BACK" row,
+and `N3Dialog`'s own `backTapped()` signal, both routed through the same
+up-one-level-or-pop-at-root logic) because `getDialog`'s own X button is a
+dead affordance on this route (wired to a controller-stack call `pushView`
+never populates) — see `nfview.cc`. None of this screen's runtime behaviour
+is device-verified yet; see the task report's own device checklist.
 
 ## The one thing that was in doubt, and no longer is
 
@@ -400,6 +411,20 @@ nfbrowser.h/.cc       constructs the Volume data source and pushes
                      ArticleListLibraryController (rung 2's borrowed screen)
                      via MainWindowController::push. No fabricated vtable,
                      no fabricated RTTI, no tap hook -- see NOTES.md.
+nfview.h/.cc          THE FOLDER BROWSER: one N3Dialog, built out of
+                     Nickel's own dialog chrome and TouchLabel rows
+                     (NOTES.md's "Task 8: touch input archaeology"), whose
+                     content is rebuilt in place (N3Dialog::setContent) on
+                     every folder tap rather than pushing a second dialog
+                     per level. Wires nflist.h/nffmt.h's pure listing
+                     pipeline to the device for the first time: QDir
+                     lists one directory, VolumeManager::getById +
+                     Volume::isValid supplies nf_row::hasRow (NOT
+                     Volume::getDbValues -- unestablished ABI, out of
+                     scope), BACK steps up one level and pops the dialog
+                     only at the root. Guarded against a re-trigger by a
+                     file-scope POD `void*` cleared off the dialog's own
+                     destroyed() signal.
 nffmt.h/.cc           PURE display/ordering logic (natural sort, book-
                      extension matching, common-prefix label stripping):
                      no libnickel, no NickelHook, no I/O, so it is the one
@@ -440,36 +465,55 @@ libnickel.so.1.0.0   GITIGNORED, 24 MB of Kobo's proprietary binary, staged
 
 ## What comes next
 
-The native-screen-vs-FBInk-overlay fork below is **resolved**: rung 2 proved
-the native screen (touch, e-ink refresh, fonts and back all came free, exactly
-as predicted) — but only as a **flat list of `Volume`s we chose by hand**, not
-a folder tree. The fork's answer stands for the record; what is actually open
-now is the folder half specifically.
+The native-screen-vs-FBInk-overlay fork below is **resolved**, and so, now,
+is the folder tree itself.
 
 - **A native Nickel screen**, pushed onto the window stack with
   `MainWindowController::push` — **done**, rung 2, `nfbrowser.cc`. Nickel's own
   `ArticleListLibraryController` renders every row; this mod supplies which
-  `Volume`s go in and reacts to nothing else.
+  `Volume`s go in and reacts to nothing else. Proved the route but, as
+  measured then, could only show a **flat list of `Volume`s chosen by hand**
+  — not a folder tree, since `ArticleListLibraryController` lists `Volume`s,
+  not filesystem entries.
 - **An FBInk overlay** drawn by a separate process, reusing koboy's existing
-  folder-browsing list widget — not pursued, and rung 2's result makes it even
-  less attractive than when this was written: the handoff problem it still
-  has is now solved a cheaper way by the native route.
+  folder-browsing list widget — not pursued, and superseded twice over: rung
+  2 already made it less attractive (the handoff problem it has is solved a
+  cheaper way by the native route), and the folder browser below removes the
+  remaining reason to want it.
+- **The folder tree — done, `nfview.cc`.** None of the three candidates this
+  section used to weigh (synthetic `folder://` `Volume`s, a compiler-generated
+  shim over the measured `InMemoryDataProvider`/`LinearLibraryDataSource`
+  shape, or `NotebookGridController` — ruled out in `NOTES.md`, "A rejected
+  candidate worth recording": its `moveToPath` mutates the singleton Nickel's
+  own My Notebooks view reads from) turned out to be needed. The tree comes
+  straight from `QDir::entryList` against `/mnt/onboard`, one directory at a
+  time — the filesystem the mod already has to look at regardless of which
+  `Volume`-based screen it might otherwise borrow — feeding nflist.h/nffmt.h's
+  already-tested listing pipeline into an `N3Dialog`/`TouchLabel` screen of
+  our own (Task 8's touch-input route, not `nfbrowser.cc`'s borrowed
+  controller, since a borrowed controller only ever lists `Volume`s).
 
-**The folder tree itself is the open problem**, not a fork to choose between
-anymore. `NOTES.md` ("A rejected candidate worth recording") has one candidate
-already ruled out (`NotebookGridController` — real folder navigation, but its
-`moveToPath` mutates a singleton Nickel's own My Notebooks view reads from).
-Two more are named but unmeasured: synthetic `folder://` `Volume`s, or a
-compiler-generated shim now that rung 2 has measured the exact shape
-(`InMemoryDataProvider`/`LinearLibraryDataSource`/controller) such a shim would
-need to fit.
+Left for later, not attempted in that task:
 
-And the **zero-C++ fallback**, still not tried: write one Nickel collection
-per folder into the `Shelf`/`ShelfContent` tables from the paths already in
-`content`, then use the stock Collections view. Flat rather than a tree, and
-it needs re-running when books are added, but it needs no injection and
-survives firmware updates. Calibre creates collections from a *column*, not
-from folders, so this is a script to write rather than an existing feature.
+- **Real scrolling.** `NF_MAX_VISIBLE_ROWS` (`nfview.cc`) caps a directory at
+  a fixed row count and shows "...and N more" past it rather than building a
+  `QScrollArea` — a deliberately deferred judgement call, not a measurement;
+  see the task's own report for what a device run needs to confirm or
+  replace it with.
+- **Reading progress.** `nf_row::percentRead` is always `-1`: the only call
+  that could fill it in, `Volume::getDbValues`, has an unestablished calling
+  convention and was ruled out of scope for that task on purpose (CLAUDE.md's
+  own ABI-risk discipline — see `VolumeManager::getById`'s missing `this`,
+  above, for what guessing one of these wrong costs).
+- **The `ReadBookActionProxy` leak** (NOTES.md, "The proxy leak, revisited")
+  is unchanged by any of this — still unpaid, still deliberate, still
+  waiting on `onSelected()`'s own PLT resolution.
+
+The **zero-C++ fallback** (one Nickel collection per folder, written into the
+`Shelf`/`ShelfContent` tables, browsed with the stock Collections view) is
+superseded by the working tree browser above and not worth pursuing further
+— left here only as the record of what was considered before the native
+route was tried.
 
 ## Related: koboy
 

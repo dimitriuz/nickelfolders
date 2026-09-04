@@ -21,24 +21,49 @@
 #ifndef NFVIEW_H
 #define NFVIEW_H
 
-// Builds a deliberately trivial screen -- three static TouchLabel rows and
-// nothing else, no listing logic, no folder navigation, no book opening --
-// wrapped in an N3Dialog with a title, and pushes it via
-// MainWindowController::pushView. This milestone exists to prove taps and
-// back navigation on hardware, on this route, before anything real rides on
-// it -- the same one-thing-at-a-time staging CLAUDE.md's "Method: adding a
-// new libnickel call" already asks for. The screen offers TWO independent
-// exits, deliberately not just one: the first row is a guaranteed "BACK"
-// affordance wired straight to popView, and N3Dialog's own backTapped()
-// signal is wired the same way -- review finding I-3, because getDialog's
-// own X button is wired to a controller-stack call this route's pushView
-// never populates, so it does nothing here (see nfview.cc/nfnickel.h).
+// The payoff milestone: this is what makes nflist.h/nffmt.h's pure, fully
+// host-tested listing pipeline (nf_build_listing) render on hardware for the
+// first time. Builds ONE N3Dialog, rooted at /mnt/onboard, and rebuilds its
+// content IN PLACE (N3Dialog::setContent -- nfnickel.h) every time a folder
+// row is tapped, rather than pushing a second dialog per level: MainWindow
+// Controller::popView's own semantics (NOTES.md) make a second push's back
+// destination unpredictable, and it would also leak. So this mod owns the
+// current-path state itself (nf_browser_cwd, nfview.cc, file-scope POD --
+// see its own comment for why POD is load-bearing here) and BACK is this
+// mod's own logic, not Nickel's: it steps up one directory, and only pops
+// the dialog off the stack once the root is reached. The screen offers TWO
+// independent exits at every level, deliberately not just one -- a
+// guaranteed "<< BACK" row wired straight to that logic, and N3Dialog's own
+// backTapped() signal wired to the exact same function -- review finding
+// I-3, because getDialog's own X button is wired to a controller-stack call
+// this route's pushView never populates, so it does nothing here (see
+// nfview.cc/nfnickel.h).
 //
-// Returns false, without pushing anything, if a required symbol never
-// resolved (every symbol this needs is looked up through the usual
-// nh_dlsym table, nfnickel.cc, and is .optional -- see nf_native_view_resolve
-// in nfnickel.h) or if MainWindowController::sharedInstance() or
-// N3DialogFactory::getDialog() themselves returned null.
+// Directory listing is QDir::entryInfoList against ONE directory, never
+// recursive, never held past the single Qt signal handler that runs it
+// (CLAUDE.md's /mnt/onboard file-handle constraint). Per-file metadata
+// (nf_row::hasRow) comes from VolumeManager::getById + Volume::isValid
+// (nf_volume_exists, nfnickel.h) -- NOT Volume::getDbValues, whose calling
+// convention is unresolved archaeology this milestone deliberately does not
+// take on; nf_row::percentRead is therefore always -1 here, and reading
+// progress is a later task. A file with no library row is shown, not
+// hidden, with its reason in the label text itself (not colour alone --
+// this panel gives four grey levels, and "slightly lighter" does not read
+// as "different"), and a tap on it logs why and does nothing.
+//
+// Guarded against a second concurrent call by nf_browser_active_dialog
+// (nfview.cc, file-scope POD `void*` -- a second trigger while a screen is
+// already up used to leak a dialog and leave BACK landing on a stale
+// duplicate; this refuses instead, and the guard clears itself off
+// N3Dialog's own destroyed() signal, so it self-heals however the dialog
+// eventually goes away).
+//
+// Returns false, without pushing anything, if a screen is already up, if a
+// required symbol never resolved (every symbol this needs is looked up
+// through the usual nh_dlsym table, nfnickel.cc, and is .optional -- see
+// nf_native_view_resolve in nfnickel.h), or if MainWindowController::
+// sharedInstance() or N3DialogFactory::getDialog() themselves returned
+// null.
 bool nf_browser_show(void);
 
 #endif
