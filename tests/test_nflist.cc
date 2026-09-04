@@ -119,18 +119,27 @@ static void test_folders_and_files_are_labelled_separately(void) {
     QVector<nf_entry> e;
     // Zero-padded on purpose. With "Volume 1" / "Volume 2" the remainder is a
     // SINGLE character, and Task 2's refuse-under-two-characters guard then
-    // correctly declines to strip -- so the unpadded form tests the guard, not
+    // correctly declines to strip -- so the unpadded form tests that guard, not
     // the separation. Traced by hand before this plan was written.
-    e << ent("Series - Volume 01.cbz", false)
-      << ent("Series - Volume 02.cbz", false)
+    //
+    // Trailing "a"/"b" on purpose too, added for the label-guard test below:
+    // a bare "01"/"02" remainder has no letter, so nf_strip_common's newer
+    // "refuse if a label has no letter" rule (added for the Steven L. Kent
+    // root-of-card case, test_nffmt.cc) would now decline to strip THIS
+    // fixture as well -- which is correct behaviour for that guard, but
+    // would leave this test unable to demonstrate labelling actually
+    // happening separately per kind. "01a"/"02b" keeps a letter in the
+    // remainder so this test still exercises separation, not the guard.
+    e << ent("Series - Volume 01a.cbz", false)
+      << ent("Series - Volume 02b.cbz", false)
       << ent("Extras", true);
     QVector<nf_row> out;
     nf_build_listing(e, fake_meta, NULL, &out);
     CHECK(out.size() == 3);
     CHECK(out.at(0).isDir);
     CHECK_EQ_STR(out.at(0).label, "Extras");
-    CHECK_EQ_STR(out.at(1).label, "01");
-    CHECK_EQ_STR(out.at(2).label, "02");
+    CHECK_EQ_STR(out.at(1).label, "01a");
+    CHECK_EQ_STR(out.at(2).label, "02b");
 }
 
 // The collision guard, with a fixture that genuinely reaches it. Stripping
