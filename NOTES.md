@@ -2226,3 +2226,134 @@ over a push that had just failed. CLAUDE.md's device-workflow section
 already says not to wrap these verbs in a pipe, for exactly this reason.
 Reading it and then doing it anyway is apparently easy; the working habit is
 to redirect to a file and check `$?` on the bare command.
+
+## Task 13: device results for the read-state filters, the icons, and label elision
+
+Verified on hardware 2026-09-04, Kobo Libra 2, firmware 4.38.23684, via
+`tools/restart-nickel.sh` rather than a reboot (Nickel PID 226 -> 2019 with
+`/proc/uptime` unchanged at ~3400s, so the in-place restart path is now
+device-proven for a second session).
+
+### Nickel's own Qt resources ARE reachable from an injected library
+
+This was the open question the icon probe existed to settle, and it is
+settled: rich text in a `TouchLabel` referencing `:/images/...` renders
+Nickel's own art from inside `libnfolders.so`, with no archaeology, no
+`rcc`, and no resource registration of our own.
+
+```
+icons: ':/images/widgets/folder.png'              -> loaded 250x350
+icons: ':/images/home/main_nav_books.png'         -> loaded 50x50
+icons: ':/images/reading/reading_image_view.png'  -> loaded 80x80
+icons: ':/images/menu/label_arrow_right.png'      -> loaded 15x26
+icons: control ':/images/widgets/nfolders_does_not_exist.png' -> NULL, as required
+```
+
+The control is what makes the rest evidence rather than decoration: a
+fabricated path reports null while the real ones do not, so "loaded" means
+loaded.
+
+### `:/images/widgets/folder.png` is NOT a folder icon
+
+It is a **250x350** cover-art-shaped light-grey placeholder, and it rendered
+on the panel as an empty box. There is no folder pictogram anywhere in
+Nickel's 373 `:/images/...` resources.
+
+Two lessons, both cheap to state and both already paid for:
+
+- **The resource NAME did not predict its content.** `folder.png` in a
+  `widgets` group is as strong a naming signal as this firmware offers, and
+  it was wrong.
+- **The probe reported 250x350 and that tell was ignored.** The dimensions
+  were logged, read, noted as "book-cover shaped, probably wrong", and
+  shipped anyway rather than checked with a screenshot first. The
+  instrument worked; the reading of it did not. This is the same shape as
+  the `readelf -r` truncation and the `tail -1` exit-code traps recorded
+  above — the measurement existed and was not believed.
+
+Replaced with `:/images/menu/label_arrow_right.png` (15x26), a right arrow,
+on the reasoning that it conventionally means "drills down". Owner confirmed
+it renders correctly. Superseded in turn by the mod drawing its own set, for
+the consistency reason below.
+
+### The borrowed art does not make a consistent set
+
+15x26, 50x50 and 80x80 across three row kinds, with **no art at all** for
+pdf or unknown, which fell back to `[PDF]` / `[ ? ]` text badges. Owner's
+verdict on seeing it: "no icon for pdf, [PDF] label instead."
+
+The route out is worth recording because it was dismissed once for a reason
+that turned out to be too narrow. A `QPixmap` we draw cannot reach a
+`QLabel`'s rich text (no public `QTextDocument`, so `addResource` is
+unreachable) and `rcc` is barred here because it registers resources with a
+file-scope static initialiser — the construct that boot-loops this mod into
+NickelHook's shared failsafe. **But a file path can reach it**: draw with
+`QPainter`, write PNGs under `/tmp`, reference them by absolute path in the
+`<img>` tag. `/tmp` is tmpfs, so there is no `/mnt/onboard` handle to
+endanger a USB session, it clears on reboot so the icons are regenerated
+every Nickel start rather than going stale, and the install stays one `.so`.
+
+### Read-state filters: verified by arithmetic, not just by looking
+
+In `books/Comics/English/Fullmetal Alchemist (v01-v27) (2005-2011)
+(Digital)`, 27 entries:
+
+| filter        | rows shown |
+|---------------|-----------|
+| all           | 27        |
+| in progress   | 3         |
+| not started   | 23        |
+| finished      | 0         |
+| pdf           | 0         |
+| epub          | 0         |
+
+`3 + 23 + 0 = 26`, leaving **exactly one** row unaccounted for: `v26`, the
+truncated 8 MiB copy with no library row. That is the owner's ruling —
+unknown read state appears under `all` and under none of the three
+read-state filters — confirmed on real data rather than only in the host
+tests. The pdf/epub zeroes in an all-`.cbz` folder are the type filter's own
+negative control, arriving for free.
+
+This arithmetic is a better check than any single filter's row count,
+because it can only balance if the unknown row is excluded from all three
+buckets AND no row is double-counted. Worth reusing whenever a partition is
+added.
+
+### The row width is measurable, and it is the VISIBLE width
+
+```
+browser: row width 1196 px -- MEASURED from the dialog
+         (N3Dialog::width() read back 1264, our layout margins 34+34,
+          panel fallback 1264)
+```
+
+`N3Dialog::width()` returns **1264**, i.e. the visible panel width, NOT the
+padded 1280 that sysfs `virtual_size` reports. So a screen pushed this way
+is laid out against real pixels and the padding is a framebuffer-grab
+concern only. The fallback constant was not needed at any point after the
+root listing.
+
+The log line names which of the two paths it took on purpose: a silently
+wrong width either elides text that fits or fails to elide text that does
+not, and both look identical to "the elision is broken".
+
+### Why elision was needed at all, and why MIDDLE
+
+The card root holds:
+
+```
+steven l. kent - the ultimate history of video games, volume 1 - 2001.kepub.epub
+steven l. kent - the ultimate history of video games, volume 2 - 2021.kepub.epub
+```
+
+These rendered as **two visually identical rows**, because the text ran past
+the panel edge and the only difference (`volume 1 - 2001` vs
+`volume 2 - 2021`) sat off-screen.
+
+`nf_strip_common` could not help, correctly: the common run leaves `1 - 2001`
+and `2 - 2021`, which contain no letter, and the letter guard rejects that
+whole set. So `Qt::ElideMiddle` is the fix — `ElideRight` would have removed
+precisely the part that distinguishes the rows, which is the trap worth
+naming here. The label-collision guard does not catch this either: it
+compares label STRINGS, which differ; it is visual clipping that made them
+the same.
