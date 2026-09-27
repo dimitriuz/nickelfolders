@@ -13,9 +13,27 @@ The workflow also refuses to publish if this file does not mention the tag
 version, so stale notes fail the build rather than shipping quietly.
 -->
 
-## NickelFolders VERSION
+## NickelFolders 0.1.0
 
-What changed in this release.
+First release.
+
+A folder tree for your Kobo that opens books in the stock reader. Browse the
+folders on the card, tap a book, read it in Nickel's own reader, and come back
+to the same folder.
+
+- **Folder browsing** with covers, reading progress, and a `[not in library]`
+  marker for files Nickel has no row for.
+- **Sort** by name, size, date, recently added or recently read, either
+  direction. Names sort naturally, so `v2` comes before `v10`.
+- **Filter** by file type or by reading state.
+- **Shorter labels** — the part every row in a folder shares is stripped, so
+  `Series v01 (2005) (Digital) (Group).cbz` reads as `v01 (2005)`. Long names
+  elide in the middle, keeping the end where the volume number lives.
+- **File operations** — select rows, then delete, copy, cut and paste.
+- **A view menu** for truncation, extensions, covers, hidden files and sizes.
+
+Deletion is limited to files and empty directories, and always confirms
+first. There is no undo.
 
 ## Install
 
