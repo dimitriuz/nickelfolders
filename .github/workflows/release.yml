@@ -41,8 +41,14 @@ jobs:
       - name: Host tests must pass before anything ships
         run: make test
 
+      # Two invocations, not one: NickelHook's `koboroot` target PACKAGES
+      # libnfolders.so, it does not build it, so `make koboroot` alone fails
+      # with "tar: libnfolders.so: Cannot stat". That is invisible locally,
+      # where the .so is always already sitting there from a previous build.
       - name: Build
-        run: ./nickeltc make koboroot
+        run: |
+          ./nickeltc make
+          ./nickeltc make koboroot
 
       # Same two invariants CI enforces. Repeated here rather than assumed
       # from a green CI run: a release is built from a tag, which is not
