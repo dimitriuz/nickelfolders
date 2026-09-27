@@ -413,7 +413,31 @@ nf_icon_kind nf_icon_kind_for(QString const& name, bool isDir);
 // constant; nothing else needs to change, because the width follows from it
 // (nf_cover_width_px) and the elision reserve is charged from the same
 // number that is emitted (nfview.cc).
-#define NF_COVER_H_PX 76
+// COUPLED TO NF_ITEMS_PER_PAGE (nfview.cc) -- change one and you must
+// recompute the other. Both are keyed to the same measured panel geometry:
+// 1330 px of content area between the first row and the bottom margin, and
+// ~75 px per text row (17 rows total, NOTES.md).
+//
+// An inline <img> sits on the TEXT BASELINE, so a row holding one is
+// `max(ascent, coverHeight) + descent` tall. Measured on this device
+// 2026-09-27: ascent 46, descent ~29, so a 70 px cover makes a ~99 px row
+// against ~75 px for a text-or-icon row.
+//
+// Worst case is a page of nothing but covers: 9 * 99 + 5 chrome rows * 75
+// = 1266, inside the 1330 available with room to spare. A page of icon rows
+// is shorter and simply leaves white space, which is the deliberate trade --
+// a page size that varied with how many covers happened to be on it would
+// make the row count jump around as you page through one folder.
+//
+// 70 rather than "as large as fits": at 70 the cover is ~47x70 and legible
+// enough to pick a volume by its art, which is the whole point of the
+// feature; larger buys little and costs another item off the page.
+//
+// This number was 76 once, and 76 was NOT a measurement -- it came from
+// eyeballing row spacing in a screenshot. It produced rows whose text was
+// clipped by the row below. Anything put here needs the arithmetic above
+// redone, not an estimate.
+#define NF_COVER_H_PX 70
 
 // The four characters Image::cleanId replaces with '_', and ONLY those four:
 // '/', ':', '.' and space. Parentheses, hyphens and commas survive, measured

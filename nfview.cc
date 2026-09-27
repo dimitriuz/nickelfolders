@@ -139,7 +139,10 @@
 // Trivially raised once a fuller worst-case page -- indicator, PREV, sort,
 // filter, 12 items, AND NEXT together -- has actually been seen on
 // hardware; see the task report's device checklist.
-#define NF_ITEMS_PER_PAGE 12
+// COUPLED TO NF_COVER_H_PX (nffmt.h) -- see its comment for the arithmetic.
+// 9, not 12, because a row carrying a cover is ~99 px against ~75 px for a
+// text-or-icon row, and the worst case is a page of nothing but covers.
+#define NF_ITEMS_PER_PAGE 9
 
 // PAGINATION, not scrolling -- a deliberate choice, not a shortcut, and
 // the reasoning is load-bearing enough to spell out here so nobody
@@ -1346,9 +1349,17 @@ static QString nf_row_leading_markup(nf_icon_kind kind, QString const& coverPath
         // is FontSizeAdjustingLabel's and can differ from the one this code
         // would guess, so the only number that cannot drift is the one read
         // off the metrics actually in use.
+        // NOT capped at fm.ascent() any more, deliberately. Capping was the
+        // first fix for cover rows clipping their own text, and it worked --
+        // but ascent is 46 px on this device, which made the cover 31x46, so
+        // close to the type icon it replaced that the feature stopped earning
+        // its row. The owner chose the other fix: let the row grow and take
+        // the cost in items per page (12 -> 9, NF_ITEMS_PER_PAGE).
+        //
+        // So the row IS taller than a text row now, by design, and the page
+        // size is what absorbs it. `fm` stays a parameter because the charged
+        // width below still measures the separator with it.
         int h = NF_COVER_H_PX;
-        if (h > fm.ascent())
-            h = fm.ascent();
         int w = nf_cover_width_px(h);
         *outWidth   = w + fm.width(nf_nbsp());
         *outIsCover = true;

@@ -1142,8 +1142,15 @@ static void test_cover_path_inserts_the_id_verbatim(void) {
 
 static void test_cover_width_keeps_the_native_aspect(void) {
     // The number the <img> actually gets, and the number the elision reserve
-    // is charged: 149/223 of 76 px is 50.8, rounded.
-    CHECK(nf_cover_width_px(NF_COVER_H_PX) == 51);
+    // is charged: 149/223 of 70 px is 46.8, rounded.
+    //
+    // Pinned to a literal ON PURPOSE, even though it is derived: this check
+    // is what makes changing NF_COVER_H_PX a deliberate act rather than a
+    // silent one. It has already earned that once -- the height went 76 -> 70
+    // when covers were given taller rows, and this line failed and forced the
+    // arithmetic to be redone instead of the change sliding through green.
+    // Recomputing the expectation from the constant would assert nothing.
+    CHECK(nf_cover_width_px(NF_COVER_H_PX) == 47);
     CHECK(nf_cover_width_px(NF_COVER_NATIVE_H) == NF_COVER_NATIVE_W);
     CHECK(nf_cover_width_px(2 * NF_COVER_NATIVE_H) == 2 * NF_COVER_NATIVE_W);
     // Never zero-width, whatever it is handed -- a 0-width <img> draws as
