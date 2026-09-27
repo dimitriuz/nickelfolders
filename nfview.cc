@@ -1326,7 +1326,30 @@ static QString nf_row_leading_markup(nf_icon_kind kind, QString const& coverPath
                                      QFontMetrics const& fm,
                                      int *outWidth, bool *outIsCover) {
     if (!coverPath.isEmpty()) {
-        int w = nf_cover_width_px(NF_COVER_H_PX);
+        // CAP THE HEIGHT AT THE FONT'S ASCENT, measured here rather than
+        // assumed. An inline <img> sits on the TEXT BASELINE, so the line it
+        // is on grows to `max(ascent, imageHeight) + descent`. While the image
+        // is no taller than the ascent the row keeps exactly the height a
+        // text-only row has; one pixel beyond it and every cover row grows,
+        // which is not a cosmetic difference:
+        //
+        //   - device-measured 2026-09-27 at NF_COVER_H_PX = 76, cover rows ran
+        //     ~105 px against ~75 px for icon rows, and the label's own
+        //     descenders were CLIPPED by the row below -- v01..v04 rendered
+        //     with the bottom half of the text sheared off while the icon rows
+        //     beside them were fine.
+        //   - NF_COVER_H_PX (76) was never a measurement. It came from
+        //     eyeballing row spacing in a screenshot, and the implementer said
+        //     so at the time; this is the correction.
+        //
+        // The cap is deliberately NOT a smaller hardcoded constant: the font
+        // is FontSizeAdjustingLabel's and can differ from the one this code
+        // would guess, so the only number that cannot drift is the one read
+        // off the metrics actually in use.
+        int h = NF_COVER_H_PX;
+        if (h > fm.ascent())
+            h = fm.ascent();
+        int w = nf_cover_width_px(h);
         *outWidth   = w + fm.width(nf_nbsp());
         *outIsCover = true;
         // A BARE ABSOLUTE PATH, no scheme -- device-measured on this exact
@@ -1352,7 +1375,7 @@ static QString nf_row_leading_markup(nf_icon_kind kind, QString const& coverPath
         // nffmt.h, for why that number is the owner's and what to do if a
         // screenshot shows fewer than 12).
         return QStringLiteral("<img src=\"%1\" width=\"%2\" height=\"%3\">&nbsp;")
-                   .arg(coverPath.toHtmlEscaped()).arg(w).arg(NF_COVER_H_PX);
+                   .arg(coverPath.toHtmlEscaped()).arg(w).arg(h);
     }
 
     // No cover: the type icon, exactly as before this feature existed. The
