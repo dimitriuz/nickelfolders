@@ -1153,18 +1153,20 @@ static QString nf_view_state_word(nf_view_toggle toggle, bool on) {
 }
 
 QString nf_view_bar_label(nf_view_flags view) {
-    // Compared against the defaults FIELD BY FIELD through the same toggle
-    // table the menu lists, rather than with a memcmp: padding bytes in a
-    // struct of bools are not required to be zero, and a memcmp against a
-    // differently-constructed default could compare them. It also means a
-    // toggle added to the table is automatically part of this answer.
-    nf_view_flags def = nf_view_flags_default();
-    for (int i = 0; i < NF_MENU_VIEW_ROW_COUNT; i++) {
-        nf_view_toggle t = NF_MENU_VIEW_ROWS[i];
-        if (nf_view_flag_value(view, t) != nf_view_flag_value(def, t))
-            return QStringLiteral("view: custom");
-    }
-    return QStringLiteral("view: default");
+    // STATIC TEXT, deliberately -- see nffmt.h for the owner's reason. The
+    // field-by-field comparison against the defaults that used to live here,
+    // and produced "view: default"/"view: custom", is gone with the suffix it
+    // fed; the submenu's own rows are where a toggle's state is stated, and
+    // nf_view_flags_summary is where the whole set is logged.
+    //
+    // `view` is accepted and ignored. Keeping the parameter is not
+    // absent-mindedness: this function is the bar's half of the one-place-per-
+    // word rule that nf_sort_bar_label and nf_filter_bar_label also serve, and
+    // a signature change would be the moment a call site starts spelling its
+    // own label instead. (void) to keep -Wunused-parameter quiet under
+    // -Werror without turning the parameter into a comment.
+    (void)view;
+    return QStringLiteral("view");
 }
 
 QString nf_view_flags_summary(nf_view_flags view) {
@@ -1240,4 +1242,149 @@ QString nf_menu_row_label(nf_menu_kind menu, int index,
     }
 
     return QString();
+}
+
+// --- select mode and the file operations --------------------------------
+//
+// Words only -- see nffmt.h. Nothing below can touch a path; the guards are
+// nfpath.h's and the calls are nfops.h's.
+
+QString nf_item_count_text(int count) {
+    if (count < 0)
+        count = 0; // a count has a floor where a size does not -- nffmt.h
+    return (count == 1)
+        ? QStringLiteral("1 item")
+        : QStringLiteral("%1 items").arg(count);
+}
+
+bool nf_menu_is_confirm(nf_menu_kind menu) {
+    return menu == NF_MENU_CONFIRM_DELETE ||
+           menu == NF_MENU_CONFIRM_PASTE  ||
+           menu == NF_MENU_CONFIRM_RESCAN;
+}
+
+QString nf_confirm_header(nf_menu_kind menu, int count, bool cut) {
+    switch (menu) {
+        case NF_MENU_CONFIRM_DELETE:
+            // "cannot be undone" is not decoration: this device has no
+            // recycle bin, this mod has no undo, and a book deleted here is
+            // gone from the owner's own library.
+            return QStringLiteral("Delete %1 from this folder? This cannot be undone.")
+                       .arg(nf_item_count_text(count));
+        case NF_MENU_CONFIRM_PASTE:
+            // The VERB distinguishes the two clipboards, because the
+            // consequence differs: a move leaves nothing behind where a copy
+            // duplicates. The clipboard's own source folder is named on the
+            // screen itself (nfview.cc), not here -- a path does not belong
+            // in a sentence that has to survive nh_log's truncation as well
+            // as fit a panel.
+            return cut
+                ? QStringLiteral("Move %1 into this folder?").arg(nf_item_count_text(count))
+                : QStringLiteral("Copy %1 into this folder?").arg(nf_item_count_text(count));
+        case NF_MENU_CONFIRM_RESCAN:
+            // WI-FI IS NAMED, and a test pins the word. PlugWorkflowManager::
+            // sync() runs Nickel's whole post-USB workflow on completion,
+            // which calls connectWirelessSilently() -- the owner chose a
+            // manual button because of exactly that, so the screen they tap
+            // has to say it (rescan-archaeology.md, section 7.2).
+            //
+            // "may show its own dialogs" covers the up-to-three modal dialogs
+            // and the processing screen that workflow can also put up, which
+            // is the other thing a reader would otherwise read as this mod
+            // having gone wrong.
+            return QStringLiteral("Rescan the library now? When it finishes, Nickel turns Wi-Fi ON "
+                                  "and may show its own dialogs. It does not block -- the scan runs "
+                                  "in the background.");
+        case NF_MENU_NONE:
+        case NF_MENU_SORT:
+        case NF_MENU_FILTER:
+        case NF_MENU_VIEW:
+        default:
+            return QString();
+    }
+}
+
+int nf_confirm_row_count(nf_menu_kind menu) {
+    switch (menu) {
+        case NF_MENU_CONFIRM_DELETE: return 2; // cancel, delete
+        case NF_MENU_CONFIRM_PASTE:  return 3; // cancel, paste, clear the clipboard
+        case NF_MENU_CONFIRM_RESCAN: return 2; // cancel, rescan
+        case NF_MENU_NONE:
+        case NF_MENU_SORT:
+        case NF_MENU_FILTER:
+        case NF_MENU_VIEW:
+        default:                     return 0;
+    }
+}
+
+QString nf_confirm_row_label(nf_menu_kind menu, int index, int count, bool cut) {
+    if (index < 0 || index >= nf_confirm_row_count(menu))
+        return QString(); // refuse an out-of-range index rather than guess one
+                          // -- the same rule as nf_menu_sort_key_at's
+
+    // INDEX 0 IS ALWAYS CANCEL, on every confirmation screen, so the top row
+    // is harmless on all three and a reader who has learned "the first row
+    // backs out" is never wrong. See nffmt.h.
+    if (index == 0)
+        return QStringLiteral("cancel");
+
+    switch (menu) {
+        case NF_MENU_CONFIRM_DELETE:
+            return QStringLiteral("delete %1").arg(nf_item_count_text(count));
+        case NF_MENU_CONFIRM_PASTE:
+            if (index == 1)
+                return cut
+                    ? QStringLiteral("move %1 here").arg(nf_item_count_text(count))
+                    : QStringLiteral("copy %1 here").arg(nf_item_count_text(count));
+            // The only way to put a pending clipboard DOWN. Without it a cut
+            // that the reader changed their mind about would follow them from
+            // folder to folder for the rest of the session, with the bar
+            // permanently one item wider and `paste` permanently offering to
+            // move files they had stopped thinking about.
+            return QStringLiteral("clear the clipboard");
+        case NF_MENU_CONFIRM_RESCAN:
+            // The consequence is repeated on the row itself, not only in the
+            // header: the row is what gets tapped, and a row that reads
+            // "rescan now" alone could be tapped by someone who skimmed past
+            // the sentence above it.
+            return QStringLiteral("rescan now (turns Wi-Fi on)");
+        case NF_MENU_NONE:
+        case NF_MENU_SORT:
+        case NF_MENU_FILTER:
+        case NF_MENU_VIEW:
+        default:
+            return QString(); // unreachable -- nf_confirm_row_count is 0 for these
+    }
+}
+
+QString nf_select_bar_label(int selected) {
+    if (selected < 0)
+        selected = 0;
+    return QStringLiteral("done (%1)").arg(selected);
+}
+
+QString nf_paste_bar_label(int pending) {
+    if (pending < 0)
+        pending = 0;
+    return QStringLiteral("paste (%1)").arg(pending);
+}
+
+void nf_select_marker(bool selected, QString *markup, QString *plain) {
+    // Both forms three characters plus one separator wide, ticked or not, so
+    // the names after them line up down the page -- the same reason
+    // nf_icon_badge's five badges are all five characters.
+    //
+    // The inner space of "[ ]" is non-breaking like every other space this
+    // file builds: rich text collapses a run of ordinary whitespace, so an
+    // ASCII space here would render "[]" while MEASURING as "[ ]", which is
+    // precisely the measure-versus-render mismatch that clipped every row on
+    // 2026-09-04 (nf_nbsp).
+    QString p = selected
+        ? QStringLiteral("[x]")
+        : (QStringLiteral("[") + nf_nbsp() + QStringLiteral("]"));
+    p += nf_nbsp(); // the separator between the marker and the name
+    if (plain)
+        *plain = p;
+    if (markup)
+        *markup = nf_to_markup(p);
 }

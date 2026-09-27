@@ -428,4 +428,67 @@ bool nf_build_volume_source(QStringList const& contentIds, QString const& dbName
 // wrong place.
 int nf_watch_init(char const *path, void (*cb)(void));
 
+// --- the library rescan -------------------------------------------------
+//
+// PlugWorkflowManager, Nickel's USB-plug workflow controller and the owner of
+// the library rescan. Kept OPAQUE and kept behind these two functions rather
+// than exposing the pointers the way MainWindowController's are: there are
+// exactly two calls, this file is where they belong ("the mod's ENTIRE
+// libnickel call surface, in one place on purpose"), and there is nothing a
+// caller could usefully do with the raw pointer.
+//
+// Full derivation: .superpowers/sdd/v2-features/rescan-archaeology.md. The
+// two facts that matter and that the mangled names cannot tell you:
+//
+//   PlugWorkflowManager::sharedInstance() is STATIC -- r0 is never read --
+//   which is the same trap VolumeManager::getById set and crashed Nickel on
+//   (CLAUDE.md). It returns a plain pointer in r0, NOT through an sret
+//   buffer, and it cannot return NULL (its body is a __cxa_guard'ed
+//   function-local static whose address is computed, not loaded). The NULL
+//   check below is therefore guarding the RESOLVED FUNCTION POINTER, not the
+//   return value, and no measurement may be built on the return being NULL.
+//
+//   PlugWorkflowManager::sync() is NON-static (this in r0), returns void, has
+//   no sret and is not virtual. It DOES NOT BLOCK: the chain ends at
+//   QThread::start() on a thread named "syncstateworker", so calling it from
+//   a tap handler on the GUI thread cannot freeze Nickel. It also reports
+//   nothing back -- fire and forget.
+//
+// WHAT IS DELIBERATELY NOT HERE: sync(QStringList const&). An empty list
+// reaches pruneSideLoadedFiles -> VolumeManager::removeBook with an empty
+// found-file set, and whether that prune is scoped to its path argument could
+// not be established -- a row-deleting operation with unknown blast radius on
+// a card holding 227 real books. The archaeology's own instruction is never
+// to run sync(QStringList()) on the reference device, and the way to honour
+// that is not to resolve the symbol at all.
+//
+// AND WHAT sync() ACTUALLY IS: not a bare rescan. On completion Nickel runs
+// its whole post-USB workflow on the GUI thread -- it may push its own
+// processing screen, show up to three modal dialogs, pop controllers, and it
+// calls WirelessWorkflowManager::connectWirelessSilently(), i.e. IT TURNS THE
+// WI-FI ON. Anything that offers this to the owner must say so in plain words
+// before running it (nffmt.h's nf_confirm_header does, and a test pins it).
+
+// True iff both symbols resolved. A separate, independent gate from
+// nf_nickel_resolve / nf_browser_resolve / nf_native_view_resolve, for the
+// same reason those three are separate from each other: a firmware that
+// renames PlugWorkflowManager::sync must disable the rescan button and
+// NOTHING else. Both entries are .optional = true like every other symbol in
+// this mod (CLAUDE.md: the NickelHook failsafe is SHARED, and a hard init
+// failure can make the owner's other mods uninstall themselves), so a miss
+// resolves to NULL and degrades to "rescan unavailable" rather than to a
+// failed init.
+bool nf_rescan_available(void);
+
+// sharedInstance() then sync(). Returns false, having logged and called
+// nothing, if either symbol never resolved or if sharedInstance() returned
+// NULL against expectation. Returns true once sync() has been called -- which
+// says the call was made, NOT that a scan found anything: the workflow runs
+// (and the Wi-Fi comes on) even on the branch where nothing is scanned at all
+// ("Device is not signed, it will not sync FS."), so neither the processing
+// screen nor the Wi-Fi indicator is evidence that the scan itself ran. The
+// non-vacuous check is arithmetic on row counts before and after --
+// rescan-archaeology.md, section 10.
+bool nf_rescan_start(void);
+
 #endif

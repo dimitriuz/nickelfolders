@@ -42,8 +42,18 @@
 #include "nfview.h"
 #include "nfnickel.h"
 #include "nflist.h"
+// The file operations and the pure guards under them. nfops.h does the
+// syscalls; nfpath.h decides whether any of them may happen at all. Nothing
+// in this file re-implements either -- every destructive call goes through
+// nfops.h and every path question is nfpath.h's answer.
+#include "nfops.h"
+#include "nfpath.h"
 
 #include <QBrush>
+#include <QCoreApplication> // processEvents -- the yield that keeps the panel alive mid-copy
+#include <QEventLoop>       // QEventLoop::AllEvents, for that same yield
+#include <QStringList>
+#include <QTimer>       // the zero-delay hop that gets a destructive run OFF the tap's own call stack
 #include <QDateTime>
 #include <QDir>
 #include <QFile>       // QFile::exists -- a stat, never an open; see nf_cover_path_for_row
@@ -69,7 +79,8 @@
 #include <QWidget>
 
 #include <linux/limits.h> // PATH_MAX -- same header nfnickel.cc's own nf_watch_dir uses
-#include <stdio.h>         // snprintf
+#include <stdarg.h>        // va_list -- nf_op_say's one formatted message buffer
+#include <stdio.h>         // snprintf, vsnprintf
 #include <stdlib.h>        // calloc -- see the row-allocation comment below for why not ::operator new
 
 #include <NickelHook.h>
@@ -285,6 +296,140 @@ static nf_view_flags nf_browser_view = NF_VIEW_FLAGS_DEFAULT;
 // Nickel last navigated away from a dialog it did not destroy.
 static nf_menu_kind   nf_browser_menu      = NF_MENU_NONE;
 
+// --- select mode, the clipboard, and the operation guard ----------------
+//
+// Six more pieces of file-scope state, and every one of them is POD for the
+// same load-bearing reason as the eight above: a file-scope object with a
+// dynamically initialised constructor runs from this translation unit's own
+// _GLOBAL__sub_I, whose ordering against NickelHook's nh_init/nf_init is NOT
+// guaranteed, and a QByteArray in exactly this position previously segfaulted
+// Nickel on every boot (nf_browser_active_dialog's own comment). A `bool`, an
+// `int` and a POINTER to a QStringList are all .bss-initialised with no
+// constructor to race; the QStringLists themselves are heap-allocated on
+// first use, well after boot, inside a Qt signal handler.
+// `nm libnfolders.so | grep GLOBAL__sub_I` must stay empty.
+
+// SELECT MODE. While it is on, a tap TICKS a row instead of opening it.
+// Reset to false by nf_browser_show on every trigger (the trigger means "show
+// me the listing"), by leaving it from the bar or BACK, and by any navigation
+// to a different directory.
+static bool nf_browser_select = false;
+
+// The ticked rows, as BARE NAMES within nf_browser_cwd -- never paths.
+//
+// Names, not paths, because the selection is scoped to one directory by
+// construction and a name is what the row loop has to match against anyway.
+// Scoped to one directory because a selection that survived a directory
+// change would let a later `delete` act on rows the owner can no longer see,
+// which is exactly the shape of an accident -- so nf_browser_go clears this
+// whenever the path it is asked for differs from the one already showing.
+static QStringList *nf_browser_selection = NULL;
+
+// THE CLIPBOARD: absolute source paths, plus which verb put them there.
+//
+// ABSOLUTE PATHS here, unlike the selection above, because the whole point of
+// a clipboard is that it outlives the directory it was filled in -- the
+// reader cuts in one folder and pastes in another, and a bare name would have
+// lost the only thing that says where it came from. The source folder is also
+// kept, purely so the paste confirmation can name it.
+//
+// PERSISTS across navigation and across a re-trigger, deliberately: a pending
+// cut is a job the reader is half way through, and dropping it on a refresh
+// would silently undo their last action. It is cleared by pasting, and by the
+// `clear the clipboard` row on the paste confirmation -- which exists
+// precisely so a pending cut can be put down (nffmt.cc).
+static QStringList *nf_browser_clipboard = NULL;
+static bool         nf_browser_clip_cut  = false;
+static char         nf_browser_clip_dir[PATH_MAX];
+
+// THE RE-ENTRANCY GUARD, and it is the most important four bytes in this
+// file after the path checks.
+//
+// A chunked copy yields to the event loop between chunks (nf_op_copy's tick,
+// below) so the panel stays alive and the cancel row can be tapped. That
+// means Qt can deliver ANY tap in the middle of an operation -- a row, a bar
+// item, the back arrow -- each of which would re-enter this file's own
+// handlers while a copy is half done, rebuild the content widget the progress
+// label lives in, and in the worst case start a second operation over the
+// same files.
+//
+// So every tap handler in this file returns immediately while this is set,
+// and the only control that does anything during an operation is the cancel
+// row, which sets nf_op_cancel_requested and returns. Nothing else runs, and
+// nothing navigates, until the operation has finished and rebuilt the screen
+// itself.
+static bool nf_op_busy = false;
+static bool nf_op_cancel_requested = false;
+
+// The progress screen's counter label, tracked the same way the dialog and
+// the content widget are (a file-scope POD `void*` cleared off the widget's
+// own destroyed() signal) rather than being held as a captured pointer.
+//
+// It has to be, because of what a copy does: it yields to the event loop
+// between chunks, and ANYTHING can happen in that yield -- the device can go
+// to sleep, Nickel can pop our dialog for a system dialog of its own -- any
+// of which destroys this label while the copy is still running. A captured
+// QLabel* would then be written to after it was freed, once per percent, for
+// the rest of an 820 MB copy. Reading it back through a pointer that Qt
+// itself nulls means the worst case is a copy that finishes with no visible
+// progress.
+static void *nf_progress_label = NULL;
+
+// What the next listing build will show at the top of the screen, once.
+// A char[] and not a QString for the reason every other piece of file-scope
+// state in this file is POD: no dynamic initialiser may exist in this
+// translation unit (`nm libnfolders.so | grep GLOBAL__sub_I` must print
+// nothing -- CLAUDE.md). 256 bytes because that is also nh_log's own silent
+// truncation point, so a message that fits here fits the log too.
+static char nf_op_message[256];
+
+// Lazily-allocated accessors for the two lists. NULL is returned, rather than
+// a reference to something, if the allocation fails -- every caller treats
+// that as "the selection is empty", which degrades select mode to doing
+// nothing rather than taking the mod down (CLAUDE.md: the NickelHook failsafe
+// is SHARED infrastructure).
+static QStringList *nf_selection(void) {
+    if (!nf_browser_selection)
+        nf_browser_selection = new QStringList();
+    return nf_browser_selection;
+}
+
+static QStringList *nf_clipboard(void) {
+    if (!nf_browser_clipboard)
+        nf_browser_clipboard = new QStringList();
+    return nf_browser_clipboard;
+}
+
+static int nf_selection_count(void) {
+    return nf_browser_selection ? nf_browser_selection->size() : 0;
+}
+
+static int nf_clipboard_count(void) {
+    return nf_browser_clipboard ? nf_browser_clipboard->size() : 0;
+}
+
+// Empties the selection and says how many rows it dropped. Called from every
+// place a selection must not survive -- leaving select mode, a directory
+// change, and the end of any operation that acted on it -- so the rule has
+// one implementation rather than four.
+static void nf_selection_clear(char const *why) {
+    int n = nf_selection_count();
+    if (nf_browser_selection)
+        nf_browser_selection->clear();
+    if (n)
+        nh_log("select: cleared %d ticked row(s) -- %s", n, why);
+}
+
+static void nf_clipboard_clear(char const *why) {
+    int n = nf_clipboard_count();
+    if (nf_browser_clipboard)
+        nf_browser_clipboard->clear();
+    nf_browser_clip_cut = false;
+    nf_browser_clip_dir[0] = '\0';
+    if (n)
+        nh_log("clipboard: cleared %d pending item(s) -- %s", n, why);
+}
+
 // The mode's name for the one log line every content build carries. This is
 // the cheap check whose FAILURE MODE IS SILENCE, which is the kind this
 // project adds in advance: "the submenu opened but the rows are the
@@ -293,11 +438,14 @@ static nf_menu_kind   nf_browser_menu      = NF_MENU_NONE;
 // the bar-geometry lines, one level down.
 static char const *nf_menu_name(nf_menu_kind menu) {
     switch (menu) {
-        case NF_MENU_SORT:   return "SORT MENU";
-        case NF_MENU_FILTER: return "FILTER MENU";
-        case NF_MENU_VIEW:   return "VIEW MENU";
+        case NF_MENU_SORT:           return "SORT MENU";
+        case NF_MENU_FILTER:         return "FILTER MENU";
+        case NF_MENU_VIEW:           return "VIEW MENU";
+        case NF_MENU_CONFIRM_DELETE: return "CONFIRM DELETE";
+        case NF_MENU_CONFIRM_PASTE:  return "CONFIRM PASTE";
+        case NF_MENU_CONFIRM_RESCAN: return "CONFIRM RESCAN";
         case NF_MENU_NONE:
-        default:             return "BROWSE";
+        default:                     return nf_browser_select ? "BROWSE (SELECT)" : "BROWSE";
     }
 }
 
@@ -422,13 +570,12 @@ static QString nf_filter_row_label(void) {
     return nf_filter_bar_label(nf_browser_filter);
 }
 
-// The third bar item. It cannot show its setting the way the two above do --
-// five toggles, one ~316 px slot -- so it says whether anything has been
-// changed at all and leaves the detail to the menu one tap away
-// (nf_view_bar_label, nffmt.cc, which has the full reasoning).
-static QString nf_view_row_label(void) {
-    return nf_view_bar_label(nf_browser_view);
-}
+// There is no nf_view_row_label wrapper to match the two above, and its
+// absence is deliberate rather than an omission: the view bar item is now
+// STATIC TEXT (nf_view_bar_label, nffmt.cc -- the owner asked for the
+// "default"/"custom" suffix gone), so it binds no file-scope state and a
+// wrapper would exist only to forward an argument the function ignores.
+// nf_cmd_label calls it directly, like the other two.
 
 static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool resetPage);
 
@@ -446,19 +593,66 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
 // finding I-3). An open submenu is one more answer to that question, so it
 // belongs here with the others.
 static void nf_browser_back(void *mwc, N3Dialog *dialog) {
-    // CASE 1: a submenu is open. Close it, change NOTHING else, and do NOT go
-    // up a directory -- the reader opened a menu and changed their mind, which
-    // is not a request to leave the folder they are in.
+    // CASE 0: an operation is running. BACK is INERT, and this is the same
+    // re-entrancy guard every tap handler in this file carries (see
+    // nf_op_busy's own comment): a chunked copy yields to the event loop
+    // between chunks, so the back arrow really can be delivered mid-copy, and
+    // honouring it would pop the screen out from under a running operation
+    // whose progress label lives on it.
+    //
+    // FIRST of the cases, ahead of everything, because it is the only one
+    // that is about whether this function may act at all rather than about
+    // where the reader is.
+    if (nf_op_busy) {
+        nh_log("browser: BACK ignored -- a file operation is running (the cancel row is the way out of it)");
+        return;
+    }
+
+    // CASE 1: a submenu or a CONFIRMATION SCREEN is open. Close it, change
+    // NOTHING else, and do NOT go up a directory -- the reader opened it and
+    // changed their mind, which is not a request to leave the folder they are
+    // in.
     //
     // Nothing is selected and nothing is applied: the sort key, the direction,
     // the filter, the directory and the page are all exactly what they were
     // when the menu opened (nf_browser_page in particular is untouched while a
     // menu is up), so the rebuild below lands on the same screen the menu
     // replaced. resetPage is false for that reason.
+    //
+    // FOR A CONFIRMATION THIS IS THE CANCEL PATH, and it is the same code as
+    // the `cancel` row's -- the two must be identical, because a reader who
+    // uses the back arrow instead of the row must not get a different answer
+    // than "nothing happened". Nothing is deleted, moved, copied or scanned;
+    // the selection and the clipboard are both left exactly as they were, so
+    // the reader lands back on the screen they were about to act from.
+    //
+    // AHEAD OF THE SELECT-MODE CASE BELOW, deliberately: the confirm-delete
+    // screen is reached FROM select mode, so both conditions are true at once
+    // there, and the reader backing out of a confirmation means the
+    // confirmation -- not their whole selection, which they would then have
+    // to tick all over again.
     if (nf_browser_menu != NF_MENU_NONE) {
-        nh_log("browser: BACK closes the %s -- nothing selected, the listing is unchanged",
+        nh_log("browser: BACK closes the %s -- nothing was selected, applied, deleted, moved, copied or scanned",
                nf_menu_name(nf_browser_menu));
         nf_browser_menu = NF_MENU_NONE;
+        nf_browser_go(mwc, dialog, QString::fromUtf8(nf_browser_cwd), false);
+        return;
+    }
+
+    // CASE 1b: select mode is on. Leaving it is what BACK means here, and it
+    // is a CASE IN THIS FUNCTION rather than a second path for exactly the
+    // reason the submenu case above is: the two independent exits (the bar
+    // control and N3Dialog's own backTapped()) share one place to read "where
+    // am I" from, and select mode is one more answer to that question.
+    //
+    // It does NOT go up a directory, for the same reason a submenu does not:
+    // the reader is backing out of a MODE, not leaving the folder. The
+    // selection is cleared on the way out -- a tick that survived select mode
+    // would be invisible and would still act on a later `delete`.
+    if (nf_browser_select) {
+        nh_log("browser: BACK leaves select mode -- nothing is deleted, moved or copied");
+        nf_browser_select = false;
+        nf_selection_clear("left select mode");
         nf_browser_go(mwc, dialog, QString::fromUtf8(nf_browser_cwd), false);
         return;
     }
@@ -1477,11 +1671,17 @@ struct nf_bar_item {
     char const *name;
 };
 
-// Four is what the command bar holds today (BACK, sort, filter, view); six
-// leaves both bars room to grow -- file operations are the next task -- without
-// this becoming the thing that has to be edited. Overflow is dropped
-// from the LOG only, never from the bar -- see nf_bar_record.
-#define NF_BAR_MAX_ITEMS 6
+// SEVEN is the worst case the command bar can reach today: BACK, sort,
+// filter, view, select, rescan and -- only while something is on the
+// clipboard -- paste. Eight leaves one spare so the next control added is not
+// also an edit to this line. Overflow is dropped from the LOG only, never
+// from the bar -- see nf_bar_record.
+//
+// It is also what nf_bar_slot_px below divides the bar by, so a bar that
+// really did overflow this would mis-size its own elision budget as well as
+// losing a log entry; both are best-effort, neither is a correctness bound on
+// the bar itself.
+#define NF_BAR_MAX_ITEMS 8
 
 static void nf_bar_record(nf_bar_item *items, int *n, QWidget *w, char const *name) {
     if (*n >= NF_BAR_MAX_ITEMS)
@@ -1569,6 +1769,130 @@ static void nf_bar_add(QHBoxLayout *bar, nf_bar_item *items, int *n,
     item->setAlignment(align | Qt::AlignVCenter);
     bar->addWidget(item, 1);
     nf_bar_record(items, n, item, name);
+}
+
+// --- the command bar's item set ------------------------------------------
+//
+// EVERY tappable control the command bar can hold, in one enum, so the bar is
+// a TABLE rather than a run of near-identical blocks. That restructuring is
+// this task's, and it is not tidying: the bar's contents now depend on the
+// mode (browse / select / a confirmation), on whether anything is on the
+// clipboard, and -- for `rescan` -- on whether a libnickel symbol resolved.
+// Spelled as six or seven independent `if` blocks each with its own lambda,
+// the ALIGNMENT alone would be wrong in half of them, because "first item
+// left, last item right, everything else centred" is a property of the SET
+// and cannot be decided by a block that does not know what follows it.
+enum nf_cmd {
+    NF_CMD_BACK,    // browse: up one level / leave at the root. The guaranteed exit.
+    NF_CMD_SORT,
+    NF_CMD_FILTER,
+    NF_CMD_VIEW,
+    NF_CMD_SELECT,  // browse: turn select mode on
+    NF_CMD_RESCAN,  // browse: ask Nickel to re-import the card (confirms first)
+    NF_CMD_PASTE,   // either mode, only while the clipboard is non-empty
+    NF_CMD_DONE,    // select: leave select mode. THIS MODE'S guaranteed exit.
+    NF_CMD_DELETE,  // select: confirm, then delete the ticked rows
+    NF_CMD_CUT,     // select: put the ticked rows on the clipboard as a move
+    NF_CMD_COPY,    // select: put the ticked rows on the clipboard as a copy
+    NF_CMD_CANCEL,  // a confirmation screen, and the running-operation screen
+};
+
+// Fills `out` with the item set for the current mode and returns how many.
+// THE FIRST ITEM IS ALWAYS THE EXIT, in every mode, without exception --
+// BACK when browsing, `done (N)` in select mode, `cancel` on a confirmation
+// -- because the one thing this screen may never become is a place the owner
+// cannot leave, on their daily-use device, with getDialog's own X already
+// dead on this route (nfview.h, review finding I-3).
+static int nf_bar_commands(nf_cmd *out) {
+    int n = 0;
+
+    if (nf_menu_is_confirm(nf_browser_menu)) {
+        // A confirmation gets ONE control, and deliberately not the browsing
+        // bar: `sort:`/`select`/`rescan` sitting next to "delete 3 items"
+        // would all be live tap targets on a screen whose entire job is to
+        // ask one question. The action rows are in the content below it.
+        out[n++] = NF_CMD_CANCEL;
+        return n;
+    }
+
+    if (nf_browser_select) {
+        out[n++] = NF_CMD_DONE;
+        out[n++] = NF_CMD_DELETE;
+        out[n++] = NF_CMD_CUT;
+        out[n++] = NF_CMD_COPY;
+        if (nf_clipboard_count() > 0)
+            out[n++] = NF_CMD_PASTE;
+        return n;
+    }
+
+    out[n++] = NF_CMD_BACK;
+    out[n++] = NF_CMD_SORT;
+    out[n++] = NF_CMD_FILTER;
+    out[n++] = NF_CMD_VIEW;
+    out[n++] = NF_CMD_SELECT;
+    // `rescan` is only offered when its two symbols resolved. A control that
+    // silently does nothing is worse than an absent one, and CLAUDE.md's rule
+    // is that a missing symbol degrades the feature and never the mod: a
+    // firmware that renamed PlugWorkflowManager::sync loses this one item and
+    // nothing else (nfnickel.h).
+    if (nf_rescan_available())
+        out[n++] = NF_CMD_RESCAN;
+    // Paste is available OUTSIDE select mode too, because it acts on the
+    // clipboard and the current folder rather than on a selection -- cutting
+    // in one folder and pasting in another is the whole point of having a
+    // clipboard, and requiring select mode to put it down would be a mode
+    // with nothing to select in it.
+    if (nf_clipboard_count() > 0)
+        out[n++] = NF_CMD_PASTE;
+    return n;
+}
+
+// What each control SAYS. One place, so the bar and the log agree about which
+// control a tap landed on.
+static QString nf_cmd_label(nf_cmd cmd) {
+    switch (cmd) {
+        case NF_CMD_BACK:   return QStringLiteral("< BACK");
+        case NF_CMD_SORT:   return nf_sort_bar_label(nf_browser_sort_key, nf_browser_sort_desc);
+        case NF_CMD_FILTER: return nf_filter_bar_label(nf_browser_filter);
+        case NF_CMD_VIEW:   return nf_view_bar_label(nf_browser_view);
+        case NF_CMD_SELECT: return QStringLiteral("select");
+        case NF_CMD_RESCAN: return QStringLiteral("rescan");
+        case NF_CMD_PASTE:  return nf_paste_bar_label(nf_clipboard_count());
+        case NF_CMD_DONE:   return nf_select_bar_label(nf_selection_count());
+        case NF_CMD_DELETE: return QStringLiteral("delete");
+        case NF_CMD_CUT:    return QStringLiteral("cut");
+        case NF_CMD_COPY:   return QStringLiteral("copy");
+        case NF_CMD_CANCEL: return QStringLiteral("< cancel");
+    }
+    return QString(); // unreachable under -Wswitch -Werror
+}
+
+// The name the geometry log and any failed-allocation line use. A STRING
+// LITERAL, because nf_new_touch_row's `what` is documented to be one.
+static char const *nf_cmd_name(nf_cmd cmd) {
+    switch (cmd) {
+        case NF_CMD_BACK:   return "BACK";
+        case NF_CMD_SORT:   return "sort";
+        case NF_CMD_FILTER: return "filter";
+        case NF_CMD_VIEW:   return "view";
+        case NF_CMD_SELECT: return "select";
+        case NF_CMD_RESCAN: return "rescan";
+        case NF_CMD_PASTE:  return "paste";
+        case NF_CMD_DONE:   return "done";
+        case NF_CMD_DELETE: return "delete";
+        case NF_CMD_CUT:    return "cut";
+        case NF_CMD_COPY:   return "copy";
+        case NF_CMD_CANCEL: return "cancel";
+    }
+    return "bar item";
+}
+
+// The width one bar slot gets, for the elision safety net below. The bar is
+// `n` slots of EQUAL STRETCH (nf_bar_add's addWidget(w, 1)), so each one is
+// a clean fraction of the bar -- the same property the page bar's centred
+// counter already rests on.
+static int nf_bar_slot_px(int rowWidth, int n) {
+    return (n > 0) ? (rowWidth / n) : rowWidth;
 }
 
 // BROWSE mode's half of the content build: the directory listing, its item
@@ -1730,6 +2054,27 @@ static void nf_build_listing_content(void *mwc, N3Dialog *dialog, QString const 
         layout->addWidget(emptyMsg);
     }
 
+    // WHAT THE LAST OPERATION DID, shown ONCE and then forgotten. An
+    // operation that refused half of what it was given must say so somewhere
+    // the owner will actually look, and the log is not that place on a device
+    // driven by a thumb -- "deleted 2, refused 1, failed 0 of 3" is the only
+    // thing on this screen that distinguishes a partial refusal from a clean
+    // success, because both leave a listing with fewer rows in it.
+    //
+    // Cleared as it is rendered, so it belongs to the build that follows the
+    // operation and not to every build afterwards: a stale summary sitting
+    // above an unrelated folder would be read as that folder's own result.
+    // A plain QLabel -- informational, never a tap target, like the page
+    // counter and the empty-folder message.
+    if (nf_op_message[0]) {
+        QLabel *opMsg = new QLabel(content);
+        opMsg->setTextFormat(Qt::PlainText);
+        opMsg->setWordWrap(true);
+        opMsg->setText(QString::fromUtf8(nf_op_message));
+        layout->addWidget(opMsg);
+        nf_op_message[0] = '\0';
+    }
+
     // One log line per listing for the width-correction pass at the end of
     // the loop, not one per row -- see there.
     bool loggedOverflow = false;
@@ -1821,6 +2166,28 @@ static void nf_build_listing_content(void *mwc, N3Dialog *dialog, QString const 
         bool leadIsCover = false;
         QString leading = nf_row_leading_markup(kind, coverPaths.at(i), fm,
                                                 &leadWidth, &leadIsCover);
+
+        // THE SELECT-MODE TICK, appended to the leading markup and PAID FOR
+        // out of the same budget, which is the whole reason it goes through
+        // the two-form nf_select_marker (nffmt.cc) rather than being tacked
+        // onto the label: a fragment that is drawn without being measured is
+        // a fragment that pushes one or two characters off the right edge,
+        // which is exactly what NOTES.md Task 13 records at length.
+        //
+        // IN THE ROW'S TEXT, not in a style, because this panel has four grey
+        // levels and "slightly lighter" reads as "the same" -- the finding
+        // that already put "[not in library]" into a row's words. Both states
+        // are marked ("[x]" and "[ ]"), so the tick column is visible before
+        // anything is in it.
+        bool rowSelected = false;
+        if (nf_browser_select) {
+            rowSelected = nf_browser_selection && nf_browser_selection->contains(r.name);
+            QString selMarkup, selPlain;
+            nf_select_marker(rowSelected, &selMarkup, &selPlain);
+            leading  += selMarkup;
+            leadWidth += fm.width(selPlain);
+        }
+
         int suffixWidth = fm.width(suffixPlain);
         int nameWidth   = nf_name_budget_px(textWidth, leadWidth, suffixWidth);
 
@@ -1978,6 +2345,49 @@ static void nf_build_listing_content(void *mwc, N3Dialog *dialog, QString const 
         bool    isDir     = r.isDir;
         bool    hasRow    = r.hasRow;
         QObject::connect(shim, &QPushButton::clicked, [mwc, dialog, childPath, rowName, isDir, hasRow] {
+            // The busy guard, as in every tap handler here: a chunked copy
+            // yields to the event loop, so a row tap really can be delivered
+            // mid-operation, and descending into a folder while one is
+            // running would rebuild the content the progress label lives on.
+            if (nf_op_busy) {
+                nh_log("browser: row tap ignored -- a file operation is running");
+                return;
+            }
+
+            // SELECT MODE: a tap TICKS, it does not open. Read off the
+            // file-scope flag rather than captured at build time so this can
+            // never act on a mode the screen has since left -- the content is
+            // rebuilt when the mode changes, so the two agree either way, and
+            // reading it live is the one that stays true if that ever stops
+            // being so.
+            //
+            // A folder ticks like anything else: it can be cut (rename(2)
+            // moves a directory whole) and it can be deleted if it is empty.
+            // A file with no library row ticks too -- it is a file on the
+            // card, and the reason it cannot be OPENED has nothing to do with
+            // whether it can be moved or deleted.
+            if (nf_browser_select) {
+                QStringList *sel = nf_selection();
+                if (!sel) {
+                    nh_log("select: no selection list could be allocated -- the tap does nothing");
+                    return;
+                }
+                int at = sel->indexOf(rowName);
+                if (at >= 0)
+                    sel->removeAt(at);
+                else
+                    *sel << rowName;
+                // The COUNT first, then the name and its length: nh_log
+                // truncates at 256 bytes silently and names on this card run
+                // past 230 characters, so the number has to survive even when
+                // the name does not (CLAUDE.md).
+                nh_log("select: %d ticked after %s a %d-char name",
+                       sel->size(), at >= 0 ? "unticking" : "ticking", rowName.length());
+                // Same directory, same page -- only the ticks changed.
+                nf_browser_go(mwc, dialog, QString::fromUtf8(nf_browser_cwd), false);
+                return;
+            }
+
             if (isDir) {
                 nh_log("browser: descending into '%s'", qPrintable(childPath));
                 nf_browser_go(mwc, dialog, childPath, true); // descend -- a different directory, page resets
@@ -2092,6 +2502,10 @@ static void nf_build_listing_content(void *mwc, N3Dialog *dialog, QString const 
             if (item) {
                 live = true;
                 QObject::connect(shim, &QPushButton::clicked, [mwc, dialog, path] {
+                    if (nf_op_busy) { // see nf_op_busy -- every tap handler carries this
+                        nh_log("browser: PREV ignored -- a file operation is running");
+                        return;
+                    }
                     nf_browser_page--;
                     nh_log("browser: page -- prev, now %d in '%s'", nf_browser_page, qPrintable(path));
                     nf_browser_go(mwc, dialog, path, false);
@@ -2133,6 +2547,10 @@ static void nf_build_listing_content(void *mwc, N3Dialog *dialog, QString const 
             if (item) {
                 live = true;
                 QObject::connect(shim, &QPushButton::clicked, [mwc, dialog, path] {
+                    if (nf_op_busy) { // see nf_op_busy -- every tap handler carries this
+                        nh_log("browser: NEXT ignored -- a file operation is running");
+                        return;
+                    }
                     nf_browser_page++;
                     nh_log("browser: page -- next, now %d in '%s'", nf_browser_page, qPrintable(path));
                     nf_browser_go(mwc, dialog, path, false);
@@ -2166,6 +2584,10 @@ static void nf_build_listing_content(void *mwc, N3Dialog *dialog, QString const 
 // resetPage is false for that reason.
 static void nf_browser_open_menu(void *mwc, N3Dialog *dialog, QString const &path,
                                  nf_menu_kind menu) {
+    if (nf_op_busy) { // see nf_op_busy -- every tap handler carries this
+        nh_log("browser: opening the %s ignored -- a file operation is running", nf_menu_name(menu));
+        return;
+    }
     nf_browser_menu = (nf_browser_menu == menu) ? NF_MENU_NONE : menu;
     nh_log("browser: command bar tap -- mode is now %s", nf_menu_name(nf_browser_menu));
     nf_browser_go(mwc, dialog, path, false); // same directory, same page
@@ -2193,6 +2615,10 @@ static void nf_browser_open_menu(void *mwc, N3Dialog *dialog, QString const &pat
 // is what this replaces.
 static void nf_menu_select(void *mwc, N3Dialog *dialog, QString const &path,
                            nf_menu_kind menu, int index) {
+    if (nf_op_busy) { // see nf_op_busy -- every tap handler carries this
+        nh_log("browser: menu row %d ignored -- a file operation is running", index);
+        return;
+    }
     if (menu == NF_MENU_SORT) {
         nf_sort_key key = NF_SORT_NAME;
         if (!nf_menu_sort_key_at(index, &key)) {
@@ -2347,6 +2773,684 @@ static void nf_build_menu_content(void *mwc, N3Dialog *dialog, QString const &pa
            nf_menu_name(menu), built, want, qPrintable(path));
 }
 
+// --- the file operations -------------------------------------------------
+//
+// Everything below runs on Nickel's GUI thread, inside a Qt signal handler,
+// which is one of the two windows CLAUDE.md names as safe for touching
+// /mnt/onboard at all. The destructive work is nfops.cc's and the rules are
+// nfpath.cc's; what lives here is the SCREEN around them -- the confirmation,
+// the progress, the cancel, and the summary line the next listing carries.
+//
+// THE RE-ENTRANCY DISCIPLINE, in one place so it is not re-derived at each
+// call site: every tap handler in this file begins by returning if
+// nf_op_busy is set, and the ONLY control exempt is the cancel row on the
+// progress screen, which sets a flag and returns without navigating. A
+// chunked copy yields to the event loop between chunks, so Qt really can
+// deliver a tap in the middle of one, and the alternative to this guard is a
+// second operation starting over files the first is half way through.
+
+static void nf_op_say(char const *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void nf_op_say(char const *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(nf_op_message, sizeof nf_op_message, fmt, ap);
+    va_end(ap);
+    // Logged as well as shown: the panel line is gone the moment the reader
+    // navigates, and the log is what a device run reads afterwards.
+    nh_log("fileops: %s", nf_op_message);
+}
+
+// Records `content` as the widget currently inside the dialog, and arranges
+// for that record to clear when Qt destroys it. Lifted out of nf_browser_go
+// verbatim when the progress screen (below) became a second place that calls
+// N3Dialog::setContent -- two copies of a guarded clear is two chances to
+// drop the guard, and the guard is the whole subtlety here (see below).
+static void nf_track_content(QWidget *content) {
+    nf_browser_active_content = content;
+    // The destroyed() clear is guarded on the pointer still being THIS
+    // widget: setContent deleteLater()s the previous content, so the previous
+    // widget's destroyed() fires later in the event loop, i.e. after this
+    // assignment -- an unguarded clear would then null out the LIVE pointer
+    // and quietly send the next navigation back to the dialog-width estimate.
+    QWidget *tracked = content;
+    QObject::connect(content, &QObject::destroyed, [tracked] {
+        if (nf_browser_active_content == tracked)
+            nf_browser_active_content = NULL;
+    });
+}
+
+// The progress screen a paste runs behind: a heading, a line that counts
+// bytes, and ONE tappable control, which cancels. No command bar at all --
+// every other control on this screen would be a live tap target during an
+// operation, and the busy guard would make each of them do nothing, which is
+// a worse screen than not offering them.
+struct NFProgress {
+    int     lastPct;   // so the label (and therefore the panel) is only repainted when the number changes
+    int     index;     // 1-based item number, for "copying 2 of 5"
+    int     total;     // how many items this paste is moving or copying
+    QString name;      // the item being worked on
+};
+
+// The counter label, or NULL if it has been destroyed under us (see
+// nf_progress_label). Every write to the progress line goes through this --
+// there is deliberately no second, captured pointer to it anywhere.
+static QLabel *nf_progress_line(void) {
+    return reinterpret_cast<QLabel*>(nf_progress_label);
+}
+
+// nf_op_tick_fn (nfops.h): called between chunks, never during one, with both
+// file handles closed. Three jobs, in this order:
+//
+//   1. update the counter, but only when the whole-number percentage has
+//      MOVED -- this is an e-ink panel, and a repaint per 1 MiB chunk on an
+//      820 MB file would be 820 refreshes of a label that mostly says the
+//      same thing;
+//   2. hand the event loop back, which is what keeps the panel alive and is
+//      the only way the cancel row below can ever be tapped;
+//   3. report whether the reader asked to stop.
+static bool nf_copy_tick(void *ctx, qint64 done, qint64 total) {
+    NFProgress *p = static_cast<NFProgress*>(ctx);
+
+    int pct = (total > 0) ? (int)((done * 100) / total) : 100;
+    QLabel *line = nf_progress_line();
+    if (p && line && pct != p->lastPct) {
+        p->lastPct = pct;
+        line->setText(QStringLiteral("%1 of %2: %3 -- %4%")
+                          .arg(p->index).arg(p->total).arg(p->name).arg(pct));
+    }
+
+    // THE YIELD. Bounded to 50 ms so a flood of events cannot turn one
+    // between-chunks pause into an unbounded one; AllEvents rather than
+    // ExcludeUserInputEvents because the cancel row is a TOUCH target and
+    // excluding input would make it undeliverable -- i.e. would make the
+    // cancel this screen promises impossible.
+    QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+
+    return !nf_op_cancel_requested;
+}
+
+// Builds and shows the progress screen. The counter label it creates is
+// recorded in nf_progress_label and read back through nf_progress_line() for
+// the rest of the run -- see that variable's own comment for why a captured
+// pointer would be a use-after-free waiting for the device to go to sleep.
+static void nf_show_progress_screen(N3Dialog *dialog, QString const& heading) {
+    QWidget *content = new QWidget();
+    QVBoxLayout *layout = new QVBoxLayout(content);
+
+    QLabel *head = new QLabel(content);
+    head->setTextFormat(Qt::PlainText); // never AutoText: a filename must not decide the render mode
+    head->setWordWrap(true);
+    head->setText(heading);
+    layout->addWidget(head);
+
+    QLabel *line = new QLabel(content);
+    line->setTextFormat(Qt::PlainText);
+    line->setText(QStringLiteral("starting..."));
+    layout->addWidget(line);
+
+    // The ONE control. Its handler is the single exemption from the busy
+    // guard in this whole file: it sets a flag and returns, touching no
+    // widget and navigating nowhere, so it cannot re-enter anything.
+    QPushButton *shim = NULL;
+    QLabel *cancelRow = nf_new_touch_row(content, "cancel operation", &shim);
+    if (cancelRow) {
+        cancelRow->setTextFormat(Qt::PlainText);
+        cancelRow->setText(QStringLiteral("cancel"));
+        cancelRow->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+        QObject::connect(shim, &QPushButton::clicked, [] {
+            nh_log("fileops: cancel tapped -- the copy will stop at the next chunk boundary and remove its temp file");
+            nf_op_cancel_requested = true;
+        });
+        layout->addWidget(cancelRow);
+    } else {
+        // Already logged by nf_new_touch_row. Worth its own line because the
+        // consequence is specific: an 820 MB copy with no way to stop it.
+        nh_log("fileops: the cancel control could not be allocated -- this operation cannot be cancelled");
+    }
+
+    layout->addStretch(1);
+    N3Dialog__setContent(dialog, content);
+    nf_track_content(content);
+
+    // Tracked, and cleared by Qt itself if anything destroys it mid-copy.
+    // Guarded on the pointer still being THIS label, the same guard
+    // nf_track_content carries and for the same reason: an older progress
+    // label's destroyed() can fire after a newer one has been recorded.
+    nf_progress_label = line;
+    QLabel *trackedLine = line;
+    QObject::connect(line, &QObject::destroyed, [trackedLine] {
+        if (nf_progress_label == trackedLine)
+            nf_progress_label = NULL;
+    });
+}
+
+// The one place a selection name becomes a path. Refuses a name that is not a
+// single safe component before it is ever joined -- a name containing a '/'
+// would make `dir + "/" + name` a path two levels down with no ".."
+// anywhere, which is the one way a source can escape the folder it was
+// ticked in. Unreachable from QDir::entryInfoList's own output, and checked
+// because "unreachable from today's caller" is not the same as "impossible".
+static bool nf_join_in_dir(QString const& dir, QString const& name, QString *out) {
+    if (!nf_path_name_is_safe(name)) {
+        nh_log("fileops: refused an UNSAFE entry name (%d chars) -- not a single path component",
+               name.length());
+        return false;
+    }
+    *out = dir + QLatin1Char('/') + name;
+    return true;
+}
+
+// DELETE the ticked rows, after the confirmation screen has already asked.
+// Files and EMPTY directories only -- nfops.cc refuses the rest and says why,
+// per row, and the tally below is what makes a partial refusal visible rather
+// than silent.
+static void nf_run_delete(void *mwc, N3Dialog *dialog, QString const &path) {
+    QStringList names = nf_browser_selection ? *nf_browser_selection : QStringList();
+    nf_browser_menu = NF_MENU_NONE;
+
+    if (names.isEmpty()) {
+        nf_op_say("nothing was ticked, so nothing was deleted");
+        nf_browser_go(mwc, dialog, path, false);
+        return;
+    }
+
+    nf_op_busy = true;
+    nh_log("fileops: DELETE run starting -- %d ticked row(s) in a %d-char folder path",
+           names.size(), path.length());
+
+    int ok = 0, refused = 0, failed = 0;
+    // The increment is in the for-header, NOT the last statement of the body,
+    // which is what makes any early `continue` safe here. A `continue` in a
+    // loop whose increment is the last body statement hung Nickel's GUI
+    // thread once in this project -- no crash, PID unchanged, the device
+    // needed a power cycle.
+    for (int i = 0; i < names.size(); i++) {
+        QString full;
+        if (!nf_join_in_dir(path, names.at(i), &full)) {
+            refused++;
+            continue;
+        }
+        nf_path_verdict why = NF_PATH_OK;
+        nf_op_result r = nf_op_delete(full, path, &why);
+        if (r == NF_OP_OK)
+            ok++;
+        else if (r == NF_OP_FAILED)
+            failed++;
+        else
+            refused++;
+    }
+
+    nf_op_busy = false;
+    // The ticks are gone whatever happened: the rows they pointed at have
+    // either been deleted or been refused, and a tick left over from a
+    // finished operation is a tick the next `delete` would act on.
+    nf_selection_clear("the delete run finished");
+    nf_op_say("deleted %d, refused %d, failed %d of %d", ok, refused, failed, names.size());
+    // Select mode STAYS ON, with nothing ticked: the reader came here to
+    // tidy a folder and is probably not finished. `done (0)` in the bar says
+    // plainly that nothing is ticked any more.
+    nf_browser_go(mwc, dialog, path, false);
+}
+
+// PASTE the clipboard into `path`: a move (rename(2), instant even for the
+// 820 MB .cbr) or a chunked, cancellable copy, depending on which verb filled
+// it. Never overwrites -- nfops.cc refuses a destination that exists.
+static void nf_run_paste(void *mwc, N3Dialog *dialog, QString const &path) {
+    QStringList items = nf_browser_clipboard ? *nf_browser_clipboard : QStringList();
+    bool cut = nf_browser_clip_cut;
+    nf_browser_menu = NF_MENU_NONE;
+
+    if (items.isEmpty()) {
+        nf_op_say("the clipboard is empty, so nothing was pasted");
+        nf_browser_go(mwc, dialog, path, false);
+        return;
+    }
+
+    nf_op_busy = true;
+    nf_op_cancel_requested = false;
+    nh_log("fileops: PASTE run starting -- %s, %d item(s), into a %d-char folder path",
+           cut ? "MOVE" : "COPY", items.size(), path.length());
+
+    nf_show_progress_screen(
+        dialog, cut ? QStringLiteral("Moving files. This is a rename -- it should be instant.")
+                    : QStringLiteral("Copying files. Tap cancel to stop; a part-copied file is never left behind."));
+
+    NFProgress prog;
+    prog.lastPct = -1;
+    prog.index   = 0;
+    prog.total   = items.size();
+
+    int ok = 0, refused = 0, failed = 0, cancelled = 0;
+    QStringList remaining; // clipboard entries a cut did NOT manage to move
+
+    for (int i = 0; i < items.size(); i++) {
+        prog.index   = i + 1;
+        prog.lastPct = -1;
+        prog.name    = QFileInfo(items.at(i)).fileName();
+        if (QLabel *line = nf_progress_line())
+            line->setText(QStringLiteral("%1 of %2: %3 -- starting")
+                              .arg(prog.index).arg(prog.total).arg(prog.name));
+        // One yield per ITEM as well as one per chunk, so a run of instant
+        // renames still lets the panel draw and still lets cancel land.
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+
+        // THE DIALOG MAY NOT HAVE SURVIVED THAT YIELD. Nickel can pop our
+        // screen for one of its own, and the device can go to sleep, both of
+        // which destroy the dialog -- after which `dialog` is a dangling
+        // pointer and nf_browser_go below would call setContent through it.
+        // nf_browser_active_dialog is cleared by the dialog's own destroyed()
+        // signal, so comparing against it is the one honest way to ask.
+        //
+        // Nothing is undone: the items already moved stay moved, the current
+        // item has not started, and the rest stay on the clipboard for a cut.
+        if (nf_browser_active_dialog != dialog) {
+            for (int k = i; k < items.size(); k++)
+                remaining << items.at(k);
+            nh_log("fileops: PASTE stopped at item %d of %d -- the browser screen was destroyed while it ran; %d done, %d still pending",
+                   prog.index, prog.total, ok, remaining.size());
+            nf_op_busy = false;
+            nf_op_cancel_requested = false;
+            if (cut && !remaining.isEmpty())
+                *nf_clipboard() = remaining;
+            return; // nothing below may touch `dialog`
+        }
+
+        if (nf_op_cancel_requested) {
+            // Everything not yet attempted stays on the clipboard for a cut,
+            // so a cancelled move can be resumed rather than half-lost.
+            cancelled += items.size() - i;
+            for (int k = i; k < items.size(); k++)
+                remaining << items.at(k);
+            nh_log("fileops: PASTE stopped before item %d of %d -- the reader cancelled",
+                   prog.index, prog.total);
+            break;
+        }
+
+        nf_path_verdict why = NF_PATH_OK;
+        nf_op_result r = cut
+            ? nf_op_move(items.at(i), path, path, &nf_copy_tick, &prog, &why)
+            : nf_op_copy(items.at(i), path, path, &nf_copy_tick, &prog, &why);
+
+        if (r == NF_OP_OK) {
+            ok++;
+        } else if (r == NF_OP_CANCELLED) {
+            cancelled++;
+            remaining << items.at(i);
+        } else if (r == NF_OP_FAILED) {
+            failed++;
+            remaining << items.at(i);
+        } else {
+            refused++;
+            remaining << items.at(i);
+        }
+    }
+
+    nf_op_busy = false;
+    nf_op_cancel_requested = false;
+
+    // THE CLIPBOARD'S FATE DIFFERS BY VERB, and the asymmetry is deliberate:
+    //
+    //   a CUT that succeeded has moved the file, so its clipboard entry now
+    //   names a path that does not exist -- keeping it would offer to move a
+    //   ghost. Only the entries that did NOT move are kept, so a partially
+    //   refused or cancelled move can be retried without re-ticking anything.
+    //
+    //   a COPY leaves every source exactly where it was, so the whole
+    //   clipboard stays valid and pasting the same set into a second folder
+    //   is a legitimate next action. It is put down with the `clear the
+    //   clipboard` row on the paste confirmation (nffmt.cc), which exists for
+    //   precisely this.
+    if (cut) {
+        if (remaining.isEmpty()) {
+            nf_clipboard_clear("every cut item moved");
+        } else {
+            *nf_clipboard() = remaining;
+            nh_log("clipboard: %d of %d cut item(s) did not move and stay on the clipboard",
+                   remaining.size(), items.size());
+        }
+    }
+
+    nf_op_say("%s: %d done, %d refused, %d failed, %d cancelled of %d",
+              cut ? "move" : "copy", ok, refused, failed, cancelled, items.size());
+
+    // The same check once more, for the yield that happened inside the last
+    // item's own copy rather than before it.
+    if (nf_browser_active_dialog != dialog) {
+        nh_log("fileops: the browser screen was destroyed while the paste ran -- not rebuilding it");
+        return;
+    }
+    nf_browser_go(mwc, dialog, path, false);
+}
+
+// RESCAN, after the confirmation screen has named the Wi-Fi consequence.
+// Returns at once -- sync() does not block (nfnickel.h) -- so there is no
+// progress screen here and nothing to cancel: what the owner sees next is
+// Nickel's own post-USB workflow, not this mod.
+static void nf_run_rescan(void *mwc, N3Dialog *dialog, QString const &path) {
+    nf_browser_menu = NF_MENU_NONE;
+    bool started = nf_rescan_start();
+    if (started)
+        nf_op_say("rescan started -- it runs in the background; Wi-Fi comes on when it finishes");
+    else
+        nf_op_say("rescan unavailable on this firmware -- nothing was run");
+    nf_browser_go(mwc, dialog, path, false);
+}
+
+// What tapping action row `index` of the current confirmation does. The
+// sibling of nf_menu_select, and split out for the same reason: the three
+// screens' rules sit next to each other where the asymmetries between them
+// are visible in one place.
+//
+// INDEX 0 IS CANCEL ON ALL THREE (nffmt.cc), and cancel is the same code path
+// as BACK's -- close the screen, change nothing. A reader who uses the back
+// arrow instead of the row must not get a different answer.
+static void nf_confirm_select(void *mwc, N3Dialog *dialog, QString const &path,
+                              nf_menu_kind menu, int index) {
+    if (nf_op_busy) {
+        nh_log("browser: confirmation row %d ignored -- a file operation is running", index);
+        return;
+    }
+    if (index < 0 || index >= nf_confirm_row_count(menu)) {
+        // Unreachable while the row loop only wires indices it built, and
+        // answered anyway rather than acted on: on THIS screen a nonsense
+        // index that fell through to the action row would delete something.
+        nh_log("browser: confirmation row %d is out of range -- ignoring the tap", index);
+        return;
+    }
+
+    if (index == 0) {
+        nh_log("browser: %s cancelled -- nothing was deleted, moved, copied or scanned",
+               nf_menu_name(menu));
+        nf_browser_menu = NF_MENU_NONE;
+        nf_browser_go(mwc, dialog, path, false);
+        return;
+    }
+    if (menu == NF_MENU_CONFIRM_PASTE && index == 2) {
+        // Putting the clipboard down touches no file at all, so it runs
+        // inline like the cancel above rather than taking the deferred route
+        // below -- there is nothing here that could outlive this tap.
+        nf_clipboard_clear("the reader tapped 'clear the clipboard'");
+        nf_op_say("clipboard cleared -- nothing was moved or copied");
+        nf_browser_menu = NF_MENU_NONE;
+        nf_browser_go(mwc, dialog, path, false);
+        return;
+    }
+
+    // EVERY DESTRUCTIVE RUN IS DEFERRED OFF THIS TAP'S OWN CALL STACK, by a
+    // zero-delay single-shot QTimer, and this is a correctness requirement
+    // rather than tidiness. The chain that makes it one:
+    //
+    //   this function runs inside a QPushButton::clicked emission, from a
+    //   shim button that is a CHILD of the confirmation screen's content
+    //   widget -> the run replaces that content (N3Dialog::setContent), which
+    //   deleteLater()s it -> the chunked copy then calls processEvents()
+    //   between chunks, and a DeferredDelete posted at this same event-loop
+    //   level is exactly what processEvents() will deliver -> the shim
+    //   button, and the TouchLabel whose tapped() is still being emitted
+    //   beneath it, are destroyed while their own emission frames are still
+    //   on the stack.
+    //
+    // "A slot may schedule its own object's death" is safe only because
+    // deleteLater defers past the end of the emission; a copy loop that
+    // re-enters the event loop DURING the emission is the one shape that
+    // breaks that, and this is the only place in this project that does it.
+    // Hopping through the event loop first means the tap has fully unwound
+    // before anything is deleted or written.
+    //
+    // THE TIMER IS PARENTED TO THE APPLICATION, not to the dialog and not to
+    // the content, and that is the same argument one level further out: the
+    // copy's processEvents() can deliver whatever destroys our dialog (Nickel
+    // popping it for a system dialog of its own is the plausible one), and a
+    // timer parented to the dialog would then be destroyed WHILE ITS OWN
+    // timeout() was still being emitted -- the very frame the copy is running
+    // inside. Owned by the application, it cannot be destroyed by anything
+    // except this callback's own last line.
+    //
+    // It is deleteLater()d at the END of that callback and deliberately not
+    // at the start, for the same reason again: a deletion posted before the
+    // copy would be delivered by the copy's own processEvents().
+    QTimer *hop = new QTimer(QCoreApplication::instance());
+    hop->setSingleShot(true);
+    QObject::connect(hop, &QTimer::timeout, [mwc, dialog, path, menu, index, hop] {
+        // The dialog could in principle have gone between the tap and this
+        // callback. Practically it cannot at a zero delay, and it is checked
+        // because "practically cannot" is not the standard this file holds
+        // its destructive paths to.
+        if (nf_browser_active_dialog != dialog) {
+            nh_log("browser: the confirmed action was dropped -- the browser screen went away before it could run");
+            hop->deleteLater();
+            return;
+        }
+        if (menu == NF_MENU_CONFIRM_DELETE)
+            nf_run_delete(mwc, dialog, path);
+        else if (menu == NF_MENU_CONFIRM_PASTE)
+            nf_run_paste(mwc, dialog, path);
+        else if (menu == NF_MENU_CONFIRM_RESCAN)
+            nf_run_rescan(mwc, dialog, path);
+        else
+            nh_log("browser: a confirmation row fired with no confirmation open -- ignoring it");
+        hop->deleteLater(); // LAST, never first -- see above
+    });
+    nh_log("browser: %s confirmed -- running it from the event loop, not from the tap",
+           nf_menu_name(menu));
+    hop->start(0);
+}
+
+// How many of the affected names a confirmation screen lists before it gives
+// up and counts the rest. Six fits beside the header and the action rows in
+// every mode (the listing has room for 11-15 rows and a confirmation has one
+// chrome bar instead of two), and a confirmation that filled the panel with
+// names would push its own action rows off the bottom -- which is the one
+// failure this screen cannot afford.
+#define NF_CONFIRM_LIST_MAX 6
+
+// CONFIRMATION mode's half of the content build: the sentence, the names it
+// is about, and the action rows -- added to the `layout` nf_browser_go has
+// already put the (single-item) command bar into.
+//
+// Built like the submenus, on purpose: same TouchLabel rows, same plain text,
+// same BACK routing, same elision arithmetic. What differs is that the rows
+// are nf_confirm_row_label's rather than nf_menu_row_label's, because a
+// confirmation row has to name a COUNT that only this file knows.
+static void nf_build_confirm_content(void *mwc, N3Dialog *dialog, QString const &path,
+                                     QWidget *content, QVBoxLayout *layout, int rowWidth) {
+    nf_menu_kind menu = nf_browser_menu;
+    bool cut = nf_browser_clip_cut;
+
+    QStringList names;
+    if (menu == NF_MENU_CONFIRM_DELETE) {
+        if (nf_browser_selection)
+            names = *nf_browser_selection;
+    } else if (menu == NF_MENU_CONFIRM_PASTE) {
+        if (nf_browser_clipboard) {
+            for (int i = 0; i < nf_browser_clipboard->size(); i++)
+                names << QFileInfo(nf_browser_clipboard->at(i)).fileName();
+        }
+    }
+    int count = names.size();
+
+    // THE SENTENCE. Word-wrapped and plain text: it is this mod's own words,
+    // never card data, and it is the one thing on the screen that says what
+    // the action row will do in full.
+    {
+        QLabel *head = new QLabel(content);
+        head->setTextFormat(Qt::PlainText);
+        head->setWordWrap(true);
+        head->setText(nf_confirm_header(menu, count, cut));
+        layout->addWidget(head);
+    }
+
+    // For a paste, WHERE the items are coming from. A cut made three folders
+    // ago is otherwise a set of bare names with no context at all. The folder
+    // NAME only, not its path -- a path would not fit and would not be read.
+    if (menu == NF_MENU_CONFIRM_PASTE && nf_browser_clip_dir[0]) {
+        QLabel *from = new QLabel(content);
+        from->setTextFormat(Qt::PlainText);
+        from->setWordWrap(true);
+        QString dir = QString::fromUtf8(nf_browser_clip_dir);
+        from->setText(QStringLiteral("From: %1").arg(QFileInfo(dir).fileName()));
+        layout->addWidget(from);
+    }
+
+    // THE NAMES, so "delete 3 items" is checkable against what the reader
+    // actually ticked rather than being taken on trust. Elided right, in the
+    // row's own font, against the same width arithmetic every other row here
+    // uses -- ElideRight and not ElideMiddle because these are being read to
+    // confirm a decision already made about them, where a listing's
+    // middle-elision exists to tell two similar names apart.
+    for (int i = 0; i < names.size() && i < NF_CONFIRM_LIST_MAX; i++) {
+        QLabel *nameRow = new QLabel(content);
+        nameRow->setTextFormat(Qt::PlainText);
+        QFontMetrics fm(nameRow->font());
+        int textWidth = rowWidth - nf_row_label_inset_px(nameRow, fm);
+        nameRow->setText(fm.elidedText(names.at(i), Qt::ElideRight,
+                                       nf_name_budget_px(textWidth, 0, 0)));
+        layout->addWidget(nameRow);
+    }
+    if (names.size() > NF_CONFIRM_LIST_MAX) {
+        QLabel *more = new QLabel(content);
+        more->setTextFormat(Qt::PlainText);
+        more->setText(QStringLiteral("...and %1 more").arg(names.size() - NF_CONFIRM_LIST_MAX));
+        layout->addWidget(more);
+    }
+
+    // THE ACTION ROWS. Tappable TouchLabels, exactly like the submenus', with
+    // `cancel` first -- see nf_confirm_row_label (nffmt.cc) for why the
+    // harmless row is the one a mis-tap lands on.
+    int want = nf_confirm_row_count(menu), built = 0;
+    for (int i = 0; i < want; i++) {
+        QPushButton *shim = NULL;
+        QLabel *item = nf_new_touch_row(content, "confirmation", &shim);
+        if (!item)
+            continue; // already logged; the tally below says one is gone
+        QString label = nf_confirm_row_label(menu, i, count, cut);
+        QFontMetrics fm(item->font());
+        int textWidth = rowWidth - nf_row_label_inset_px(item, fm);
+        item->setTextFormat(Qt::PlainText);
+        item->setText(fm.elidedText(label, Qt::ElideRight, nf_name_budget_px(textWidth, 0, 0)));
+        item->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+
+        int index = i;
+        QObject::connect(shim, &QPushButton::clicked, [mwc, dialog, path, menu, index] {
+            nf_confirm_select(mwc, dialog, path, menu, index);
+        });
+        layout->addWidget(item);
+        built++;
+    }
+
+    layout->addStretch(1);
+    nh_log("browser: showing the %s -- %d of %d action row(s) built over %d name(s), in '%s'",
+           nf_menu_name(menu), built, want, count, qPrintable(path));
+}
+
+// What tapping one command-bar control does. The single dispatch for the bar,
+// the sibling of nf_menu_select and nf_confirm_select, and the one place the
+// busy guard is applied to bar taps.
+static void nf_bar_command(void *mwc, N3Dialog *dialog, QString const &path, nf_cmd cmd) {
+    if (nf_op_busy) {
+        nh_log("browser: '%s' ignored -- a file operation is running", nf_cmd_name(cmd));
+        return;
+    }
+
+    switch (cmd) {
+        case NF_CMD_BACK:
+        case NF_CMD_DONE:
+        case NF_CMD_CANCEL:
+            // ALL THREE ARE THE SAME ROUTE. `done` and `cancel` are not
+            // second exits with their own logic -- they are the BACK control
+            // wearing the word that fits the mode, and they go through
+            // nf_browser_back exactly as the guaranteed BACK row and
+            // N3Dialog's own backTapped() do. One place reads "where am I"
+            // (nfview.h, review finding I-3); this is what keeps it one.
+            nf_browser_back(mwc, dialog);
+            return;
+
+        case NF_CMD_SORT:   nf_browser_open_menu(mwc, dialog, path, NF_MENU_SORT);   return;
+        case NF_CMD_FILTER: nf_browser_open_menu(mwc, dialog, path, NF_MENU_FILTER); return;
+        case NF_CMD_VIEW:   nf_browser_open_menu(mwc, dialog, path, NF_MENU_VIEW);   return;
+
+        case NF_CMD_SELECT:
+            nf_browser_select = true;
+            nf_selection_clear("entering select mode");
+            nh_log("browser: select mode ON -- taps tick rows instead of opening them");
+            nf_browser_go(mwc, dialog, path, false); // same directory, same page
+            return;
+
+        case NF_CMD_RESCAN:
+            // CONFIRMS FIRST, always. sync() is not a bare rescan: it is the
+            // front of Nickel's whole post-USB workflow and it turns the
+            // Wi-Fi on when it finishes (nfnickel.h). The owner asked for a
+            // manual button because of that, so the consequence has to be on
+            // a screen before anything runs.
+            nf_browser_menu = NF_MENU_CONFIRM_RESCAN;
+            nf_browser_go(mwc, dialog, path, false);
+            return;
+
+        case NF_CMD_PASTE:
+            if (nf_clipboard_count() <= 0) {
+                // Unreachable while nf_bar_commands only offers this control
+                // with a non-empty clipboard; answered rather than acted on.
+                nh_log("browser: paste tapped with an empty clipboard -- ignoring it");
+                return;
+            }
+            nf_browser_menu = NF_MENU_CONFIRM_PASTE;
+            nf_browser_go(mwc, dialog, path, false);
+            return;
+
+        case NF_CMD_DELETE:
+            if (nf_selection_count() <= 0) {
+                nf_op_say("nothing is ticked, so there is nothing to delete");
+                nf_browser_go(mwc, dialog, path, false);
+                return;
+            }
+            // CONFIRMS FIRST. There is no undo anywhere in this design and no
+            // recycle bin on this device.
+            nf_browser_menu = NF_MENU_CONFIRM_DELETE;
+            nf_browser_go(mwc, dialog, path, false);
+            return;
+
+        case NF_CMD_CUT:
+        case NF_CMD_COPY: {
+            bool cut = (cmd == NF_CMD_CUT);
+            if (nf_selection_count() <= 0) {
+                nf_op_say("nothing is ticked, so there is nothing to %s", cut ? "cut" : "copy");
+                nf_browser_go(mwc, dialog, path, false);
+                return;
+            }
+            // The clipboard holds ABSOLUTE paths, because it outlives the
+            // folder it was filled in -- that is the whole point of it.
+            QStringList *clip = nf_clipboard();
+            if (!clip) {
+                nf_op_say("could not allocate a clipboard -- nothing was %s", cut ? "cut" : "copied");
+                nf_browser_go(mwc, dialog, path, false);
+                return;
+            }
+            clip->clear();
+            QStringList names = nf_browser_selection ? *nf_browser_selection : QStringList();
+            for (int i = 0; i < names.size(); i++) {
+                QString full;
+                if (nf_join_in_dir(path, names.at(i), &full))
+                    *clip << full;
+            }
+            nf_browser_clip_cut = cut;
+            snprintf(nf_browser_clip_dir, sizeof nf_browser_clip_dir, "%s", qPrintable(path));
+            // LEAVES SELECT MODE on the way out: the job has moved to the
+            // destination folder, and the reader's next action is to navigate
+            // there and paste. Staying ticked would leave a selection that a
+            // later `delete` could act on, in a folder they are on their way
+            // out of.
+            nf_browser_select = false;
+            nf_selection_clear(cut ? "cut to the clipboard" : "copied to the clipboard");
+            nf_op_say("%d item(s) on the clipboard to %s -- open a folder and tap paste",
+                      clip->size(), cut ? "move" : "copy");
+            nf_browser_go(mwc, dialog, path, false);
+            return;
+        }
+    }
+
+    nh_log("browser: an unknown command-bar control fired -- ignoring it");
+}
+
 // Builds a fresh content widget for `path` and swaps it into the ALREADY-
 // EXISTING `dialog` via N3Dialog::setContent -- this is the whole navigation
 // model (nfview.h): one N3Dialog for the lifetime of a browse session, rows
@@ -2363,6 +3467,32 @@ static void nf_build_menu_content(void *mwc, N3Dialog *dialog, QString const &pa
 // second navigation stack, which is exactly why BACK out of one changes
 // nothing about where the reader is (nf_browser_back's own first case).
 static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool resetPage) {
+    // A SELECTION MAY NOT SURVIVE A DIRECTORY CHANGE. Checked here, against
+    // the path this call is FOR versus the one already showing, rather than
+    // off `resetPage`: resetPage is about the page NUMBER and today happens
+    // to be true for exactly the same calls, but the two answer different
+    // questions and a future caller that got one right and the other wrong
+    // would leave ticks pointing at rows in a folder the reader has left.
+    //
+    // That is precisely the shape of the accident this rule exists to
+    // prevent: a stale tick is invisible -- it is in another folder's listing
+    // -- and a later `delete` would act on it anyway.
+    //
+    // Compared as strings because both are this file's own canonical spelling
+    // of a path it built (NF_ROOT, or a parent, or a child name read off
+    // disk); nothing here has to resolve a symlink to know whether the reader
+    // stayed put.
+    if (path != QString::fromUtf8(nf_browser_cwd)) {
+        nf_selection_clear("the browser moved to a different folder");
+        if (nf_browser_select) {
+            // Select mode itself goes too. A mode whose whole content has
+            // just been thrown away is a mode that says "4 ticked" and means
+            // nothing; the reader turns it back on where they meant to use it.
+            nh_log("select: mode OFF -- the browser moved to a different folder");
+            nf_browser_select = false;
+        }
+    }
+
     // Recorded BEFORE anything below can fail, so BACK's own "where am I"
     // read is always this directory once this function has been entered --
     // matching every row/BACK handler being wired only after the listing
@@ -2428,138 +3558,96 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
 
     // --- THE COMMAND BAR, one row across the top ------------------------
     //
-    //     < BACK      sort: name (asc)      filter: all      view: default
+    //     < BACK     sort: name (asc)     filter: all     view     select     rescan
     //
-    // Three independently tappable TouchLabels in one horizontal layout,
-    // where there used to be three full-width rows (plus the page indicator
-    // and NEXT PAGE, now in the bottom bar). See the "two chrome bars"
-    // comment above nf_new_touch_row for why each item must be its own
-    // TouchLabel rather than one label with hot zones.
+    // Independently tappable TouchLabels in one horizontal layout, where
+    // there used to be full-width rows. See the "two chrome bars" comment
+    // above nf_new_touch_row for why each item must be its own TouchLabel
+    // rather than one label with hot zones.
+    //
+    // THE ITEM SET IS A TABLE NOW (nf_bar_commands, above), not a run of
+    // blocks, and that changed with this task rather than for tidiness: the
+    // bar's contents depend on the mode (browse / select / a confirmation),
+    // on whether anything is on the clipboard, and -- for `rescan` -- on
+    // whether a libnickel symbol resolved. Alignment in particular is a
+    // property of the SET ("first left, last right, the rest centred") and
+    // cannot be decided by a block that does not know what follows it, which
+    // is exactly the bug the old shape would have grown: when `view:` became
+    // the fourth item, the filter item's alignment had to be edited by hand.
     //
     // The `|` separators in the brief's sketch are NOT drawn: a literal "|"
     // would either be its own TouchLabel (a tap target that does nothing) or
     // live inside a neighbour's text (widening that control's label for no
-    // reason). The separation is the three equal-width slots and the
+    // reason). The separation is the equal-width slots and the
     // left/centre/right text alignment instead.
     //
-    // BUILT IN BOTH MODES, item listing and submenu alike, and that is a
-    // requirement rather than a convenience: BACK lives in this bar, and a
-    // submenu that could be entered and not left would be a dead end on the
-    // owner's daily-use device -- the same dead end getDialog's own X button
-    // already is on this route. The two labels still read the CURRENT setting
-    // ("sort: name (asc)") while a menu is open, so the bar is both the status
-    // and the way back out of the menu it opened.
-    //
-    // ORDER AND LABELS ARE UNCHANGED from the stacked rows this replaces --
-    // BACK, then sort, then filter, with the same strings, and the owner has
-    // learned those positions on hardware. What CHANGED is what a tap DOES:
-    // `sort:`/`filter:` used to cycle to the next value, which took up to
-    // eight taps to reach a specific one, and they now open a submenu over
-    // the item list instead (nf_build_menu_content).
-    //
-    // ROOM FOR MORE, and the `view:` item below is the first thing to take
-    // some: it dropped in as a fourth equal slot with no arithmetic to redo
-    // (nf_items_per_page counts bars, not bar items), exactly as this note
-    // predicted. File operations are the next task and go the same way.
-    // Nothing is reserved for them here -- an empty placeholder control would
-    // be a tap target that does nothing.
+    // BUILT IN EVERY MODE, and that is a requirement rather than a
+    // convenience: the exit lives in this bar, and a screen that could be
+    // entered and not left would be a dead end on the owner's daily-use
+    // device -- the same dead end getDialog's own X button already is on this
+    // route. The FIRST item is always that exit, whatever it is called in the
+    // mode it appears in (nf_bar_commands).
     QHBoxLayout *cmdBar   = nf_new_bar_layout();
     nf_bar_item  cmdItems[NF_BAR_MAX_ITEMS];
     int          nCmdItems = 0;
 
-    // BACK: the GUARANTEED exit, independent of N3Dialog's own backTapped()
-    // signal (wired once, in nf_browser_show, to this exact same
-    // nf_browser_back) -- review finding I-3, carried over from the
-    // trivial-screen milestone: getDialog wires the dialog's X
-    // (closeTapped()) to a controller-stack call pushView never populates, so
-    // the X does nothing on this route (see N3Dialog__disableCloseButton
-    // below, which removes it). If backTapped() ALSO failed to fire for any
-    // reason, this screen would have no way off it short of a power cycle, on
-    // the owner's daily-use device -- this control does not depend on
-    // N3Dialog's own signal at all, so it is the one most worth trusting if
-    // anything else here is wrong.
-    //
-    // FIRST in the bar, and still the first thing built, for that reason.
-    // Routed through nf_browser_back, the SAME function backTapped() calls --
-    // up one level, popping the dialog only at the root -- so there are not
-    // two forks of that logic to audit for drift.
-    {
+    nf_cmd cmds[NF_BAR_MAX_ITEMS];
+    int    nCmds = nf_bar_commands(cmds);
+    int    slotPx = nf_bar_slot_px(rowWidth, nCmds);
+
+    for (int i = 0; i < nCmds; i++) {
+        nf_cmd cmd = cmds[i];
         QPushButton *shim = NULL;
-        QLabel *item = nf_new_touch_row(content, "BACK", &shim);
-        if (item) {
-            item->setText(QStringLiteral("< BACK"));
-            QObject::connect(shim, &QPushButton::clicked, [mwc, dialog] {
-                nf_browser_back(mwc, dialog);
-            });
-            nf_bar_add(cmdBar, cmdItems, &nCmdItems, item, "BACK", Qt::AlignLeft);
-        } else {
-            nh_log("browser: no BACK control this time (backTapped()/the back arrow is still wired)");
+        QLabel *item = nf_new_touch_row(content, nf_cmd_name(cmd), &shim);
+        if (!item) {
+            // Already logged by nf_new_touch_row. NOT fatal and NOT a break:
+            // one missing control is better than half a bar. The exit is the
+            // first item built, so if anything survives, it does -- and
+            // N3Dialog's own backTapped() is wired independently of this bar
+            // regardless (nf_browser_show).
+            if (i == 0)
+                nh_log("browser: no '%s' control this time (backTapped()/the back arrow is still wired)",
+                       nf_cmd_name(cmd));
+            continue;
         }
+
+        // ALIGNMENT IS DECIDED BY POSITION IN THE SET, not by which control
+        // it is: the ends read left and right and everything between centres,
+        // so the bar reads as a bar at four items and at seven.
+        Qt::Alignment align = (i == 0)            ? Qt::AlignLeft
+                            : (i == nCmds - 1)    ? Qt::AlignRight
+                                                  : Qt::AlignHCenter;
+
+        // AN ELISION SAFETY NET, and it is a net rather than a layout rule.
+        // Every bar label this project has measured is 60-150 px against a
+        // slot that is 1196/n -- 170 px even at seven items -- so nothing
+        // should ever elide here. What it defends against is the one way a
+        // horizontal bar fails badly: a QLabel's minimum size is its whole
+        // text, so a label wider than its slot forces the layout wider than
+        // the panel and pushes the items at the end off the screen entirely.
+        // Bounding each label to its own slot makes that impossible by
+        // construction, and the log line says when it fired, so a device run
+        // reads "the bar elided" rather than "the last control vanished".
+        QString label = nf_cmd_label(cmd);
+        QFontMetrics fm(item->font());
+        int labelPx = fm.width(label);
+        if (slotPx > 0 && labelPx > slotPx) {
+            nh_log("browser: bar item '%s' is %d px against a %d px slot (%d items) -- eliding it",
+                   nf_cmd_name(cmd), labelPx, slotPx, nCmds);
+            label = fm.elidedText(label, Qt::ElideRight, slotPx);
+        }
+        item->setTextFormat(Qt::PlainText); // never AutoText -- a label must not pick its own render mode
+        item->setText(label);
+
+        QObject::connect(shim, &QPushButton::clicked, [mwc, dialog, path, cmd] {
+            nf_bar_command(mwc, dialog, path, cmd);
+        });
+        nf_bar_add(cmdBar, cmdItems, &nCmdItems, item, nf_cmd_name(cmd), align);
     }
 
-    // Sort, filter and view. Each item shows its setting and OPENS THAT
-    // SETTING'S SUBMENU on a tap -- or closes it, if it is the one already
-    // open (nf_browser_open_menu, which is the single place a bar tap sets
-    // the mode). None of the three changes the listing by itself: nothing
-    // about the row set, the directory or the page moves until an option row
-    // in the menu is tapped, which is what makes BACK out of a menu a genuine
-    // "changed my mind" rather than an undo.
-    //
-    // The old behaviour sort and filter replace was a CYCLE -- one tap
-    // advanced to the next value -- and its cost was the whole reason those
-    // menus exist: five sort keys times two directions and eight filter
-    // values means up to eight taps to reach a specific one, each of them a
-    // full rebuild of the listing on the way past. `view:` never had a cycle
-    // and never could have had one: five INDEPENDENT toggles do not form a
-    // sequence, which is why they went straight to a menu.
-    {
-        QPushButton *shim = NULL;
-        QLabel *item = nf_new_touch_row(content, "sort", &shim);
-        if (item) {
-            item->setText(nf_sort_row_label());
-            QObject::connect(shim, &QPushButton::clicked, [mwc, dialog, path] {
-                nf_browser_open_menu(mwc, dialog, path, NF_MENU_SORT);
-            });
-            nf_bar_add(cmdBar, cmdItems, &nCmdItems, item, "sort", Qt::AlignHCenter);
-        }
-    }
-    {
-        QPushButton *shim = NULL;
-        QLabel *item = nf_new_touch_row(content, "filter", &shim);
-        if (item) {
-            item->setText(nf_filter_row_label());
-            QObject::connect(shim, &QPushButton::clicked, [mwc, dialog, path] {
-                nf_browser_open_menu(mwc, dialog, path, NF_MENU_FILTER);
-            });
-            nf_bar_add(cmdBar, cmdItems, &nCmdItems, item, "filter", Qt::AlignHCenter);
-        }
-    }
-    // The fourth item, and the one the "ROOM FOR MORE" note above predicted:
-    // it drops into the bar as another equal slot with nothing to recompute,
-    // because nf_items_per_page counts BARS, not bar items. What DID have to
-    // move is the filter item's own alignment -- it was the right-hand end of
-    // a three-slot bar and is now a middle slot, so it centres like `sort:`
-    // and this item takes the right edge. Four slots of ~316 px each, against
-    // labels of 60-150 px, so nothing is close to its slot's minimum.
-    {
-        QPushButton *shim = NULL;
-        QLabel *item = nf_new_touch_row(content, "view", &shim);
-        if (item) {
-            item->setText(nf_view_row_label());
-            QObject::connect(shim, &QPushButton::clicked, [mwc, dialog, path] {
-                nf_browser_open_menu(mwc, dialog, path, NF_MENU_VIEW);
-            });
-            nf_bar_add(cmdBar, cmdItems, &nCmdItems, item, "view", Qt::AlignRight);
-        }
-    }
-
-    // ABOVE everything below it, never interleaved -- the same principle the
-    // stacked chrome followed ("whatever gets clipped first should be the
-    // least useful row"). Added here, BEFORE the mode dispatch, so it is the
-    // first thing in the layout in both modes.
     layout->addLayout(cmdBar);
 
-    // THE MODE DISPATCH. Everything above is shared by both halves; below,
+    // THE MODE DISPATCH. Everything above is shared by every mode; below,
     // exactly one of them runs. `pageItems` is declared out here rather than
     // inside the listing half because that bar's geometry is logged at the
     // very END of this function, after setContent -- which is the only point
@@ -2569,12 +3657,14 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
     if (nf_browser_menu == NF_MENU_NONE)
         nf_build_listing_content(mwc, dialog, path, content, layout, rowWidth,
                                  pageItems, &nPageItems);
+    else if (nf_menu_is_confirm(nf_browser_menu))
+        nf_build_confirm_content(mwc, dialog, path, content, layout, rowWidth);
     else
         nf_build_menu_content(mwc, dialog, path, content, layout, rowWidth);
 
     // THE TITLE is the only thing on screen that says which mode this is: the
-    // command bar looks the same in all three, because it IS the same bar. A
-    // reader who taps `sort:` sees the dialog's own title change from the
+    // command bar looks the same in all of them, because it IS the same bar.
+    // A reader who taps `sort:` sees the dialog's own title change from the
     // folder's name to "Sort by", i.e. Nickel's own chrome doing the
     // announcing rather than a row of ours pretending to be a heading.
     QString title;
@@ -2588,10 +3678,26 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
         // object of anything -- it is a setting with its own state written on
         // it.
         title = QStringLiteral("View");
+    // The three confirmations name the ACTION, with the question mark, so the
+    // chrome itself says a decision is being asked for. "Delete", not "Delete
+    // files" -- the count and the names are on the screen below it, and a
+    // title that restated them would be the second spelling of a number.
+    else if (nf_browser_menu == NF_MENU_CONFIRM_DELETE)
+        title = QStringLiteral("Delete?");
+    else if (nf_browser_menu == NF_MENU_CONFIRM_PASTE)
+        title = nf_browser_clip_cut ? QStringLiteral("Move here?") : QStringLiteral("Copy here?");
+    else if (nf_browser_menu == NF_MENU_CONFIRM_RESCAN)
+        title = QStringLiteral("Rescan library?");
     else
+        // SELECT MODE says so in the title, because the command bar is the
+        // only other thing that does and a reader who paged down is looking
+        // at rows, not at the bar. The folder's own name stays, because
+        // "which folder am I in" does not stop mattering in select mode.
         title = (path == QStringLiteral(NF_ROOT))
             ? QStringLiteral("NickelFolders")
             : QFileInfo(path).fileName();
+    if (nf_browser_menu == NF_MENU_NONE && nf_browser_select)
+        title = QStringLiteral("Select: %1").arg(title);
     N3Dialog__setTitle(dialog, title);
 
     // Reparents `content` into the dialog's own layout and shows it;
@@ -2607,19 +3713,11 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
     // Recorded AFTER setContent, so this only ever names a widget the dialog
     // has actually taken -- see nf_browser_active_content for what its width()
     // is for. `content` is not touched here beyond being remembered as a
-    // pointer, which the comment above allows.
-    //
-    // The destroyed() clear is guarded on the pointer still being THIS
-    // widget: setContent deleteLater()s the previous content, so the previous
-    // widget's destroyed() fires later in the event loop, i.e. after this
-    // assignment -- an unguarded clear would then null out the LIVE pointer
-    // and quietly send the next navigation back to the dialog-width estimate.
-    nf_browser_active_content = content;
-    QWidget *tracked = content;
-    QObject::connect(content, &QObject::destroyed, [tracked] {
-        if (nf_browser_active_content == tracked)
-            nf_browser_active_content = NULL;
-    });
+    // pointer, which the comment above allows. The guarded destroyed() clear
+    // that goes with it is in nf_track_content, which the progress screen
+    // also calls -- one implementation, because the guard is the whole
+    // subtlety and two copies of it is two chances to drop it.
+    nf_track_content(content);
 
     // THE BARS' GEOMETRY, logged here and only here, because this is the
     // first point in the build where the numbers are real: QWidget::
@@ -2644,6 +3742,18 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
 }
 
 bool nf_browser_show(void) {
+    // THE BUSY GUARD REACHES THE TRIGGER TOO. `touch /tmp/nfolders-native`
+    // arrives on the GUI thread through the inotify notifier (nfnickel.cc),
+    // i.e. through the same event loop a chunked copy is yielding to -- so a
+    // trigger fired mid-copy would rebuild the content widget the progress
+    // label lives on, out from under a running operation. Refused rather than
+    // queued: the operation finishes in seconds to a minute and rebuilds the
+    // screen itself when it does.
+    if (nf_op_busy) {
+        nh_log("browser: trigger ignored -- a file operation is running; it will rebuild the screen when it finishes");
+        return false;
+    }
+
     if (!nf_native_view_resolve()) {
         nh_log("browser: a required libnickel symbol did not resolve, refusing");
         return false;
@@ -2671,6 +3781,20 @@ bool nf_browser_show(void) {
     // comments), where the mode is a transient answer to "what is on screen
     // right now".
     nf_browser_menu = NF_MENU_NONE;
+
+    // SELECT MODE RESETS WITH IT, and its ticks go too, for the same reason
+    // and one more: the trigger means "show me the listing", and a set of
+    // ticks that survived a trigger would be a set the owner made before
+    // whatever they did in between -- possibly in a folder the refresh below
+    // is about to re-read from disk, where the ticked names may no longer
+    // exist. The CLIPBOARD deliberately does NOT reset with them: a pending
+    // cut is a job half done, and a refresh is not a request to abandon it
+    // (the paste confirmation's `clear the clipboard` row is).
+    if (nf_browser_select || nf_selection_count()) {
+        nh_log("browser: the trigger ends select mode -- the listing is what a trigger means");
+        nf_browser_select = false;
+        nf_selection_clear("a trigger arrived");
+    }
 
     if (nf_browser_active_dialog) {
         // Review finding L5: the guard used to refuse outright here, and

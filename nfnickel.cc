@@ -243,6 +243,24 @@ static void (*LinearLibraryDataSource__ctor)(LibraryDataSource *_this, void cons
 static void (*NFRefCountDeleter_Provider)(void *refCountData);
 static void (*NFRefCountDeleter_Source)(void *refCountData);
 
+// PlugWorkflowManager: Nickel's USB-plug workflow controller, and the owner of
+// the library rescan. Opaque on purpose (CLAUDE.md, "Nickel's classes stay
+// opaque") -- this mod never allocates one, never inspects one and never frees
+// one, so there is no size to over-allocate and nothing to destroy.
+//
+// sharedInstance is STATIC (r0 is never read -- the same trap
+// VolumeManager::getById and N3DialogFactory::getDialog both set, and the one
+// this project has already crashed Nickel by getting wrong), returns a plain
+// pointer rather than an sret buffer, and cannot return NULL. sync is
+// non-static (this in r0), void, no sret, not virtual, and does not block: it
+// ends at QThread::start() on a thread named "syncstateworker".
+//
+// sync(QStringList const&) is deliberately NOT resolved -- see nfnickel.h.
+// Full derivation for all of it: rescan-archaeology.md.
+typedef void PlugWorkflowManager;
+static PlugWorkflowManager *(*PlugWorkflowManager__sharedInstance)(void);
+static void (*PlugWorkflowManager__sync)(PlugWorkflowManager *_this);
+
 // Every entry below is .optional = true, and that is not carelessness on
 // getById of all things -- it is the shared-failsafe rule in CLAUDE.md taken
 // seriously. NickelHook.c resolves this array BEFORE nf_init ever runs
@@ -289,6 +307,15 @@ struct nh_dlsym NFNickelDlsym[] = {
     {.name = "_ZN23LinearLibraryDataSourceI6VolumeEC1E14QSharedPointerI19LibraryDataProviderIS0_EE", .out = nh_symoutptr(LinearLibraryDataSource__ctor), .desc = "LinearLibraryDataSource<Volume>::LinearLibraryDataSource", .optional = true},
     {.name = "_ZN15QtSharedPointer33ExternalRefCountWithCustomDeleterI19LibraryDataProviderI6VolumeENS_13NormalDeleterEE7deleterEPNS_20ExternalRefCountDataE", .out = nh_symoutptr(NFRefCountDeleter_Provider), .desc = "ExternalRefCountWithCustomDeleter<LibraryDataProvider<Volume>>::deleter", .optional = true},
     {.name = "_ZN15QtSharedPointer33ExternalRefCountWithCustomDeleterI17LibraryDataSourceI6VolumeENS_13NormalDeleterEE7deleterEPNS_20ExternalRefCountDataE", .out = nh_symoutptr(NFRefCountDeleter_Source), .desc = "ExternalRefCountWithCustomDeleter<LibraryDataSource<Volume>>::deleter", .optional = true},
+    // The rescan. Two entries, both .optional like every other line here, and
+    // NO entry for _ZN19PlugWorkflowManager4syncERK11QStringList -- the
+    // overload whose empty-list path reaches pruneSideLoadedFiles with an
+    // unknown blast radius (nfnickel.h, and rescan-archaeology.md section
+    // 6.4). Not resolving it is how the archaeology's "never run
+    // sync(QStringList()) on the reference device" is enforced rather than
+    // merely remembered.
+    {.name = "_ZN19PlugWorkflowManager14sharedInstanceEv", .out = nh_symoutptr(PlugWorkflowManager__sharedInstance), .desc = "PlugWorkflowManager::sharedInstance", .optional = true},
+    {.name = "_ZN19PlugWorkflowManager4syncEv",           .out = nh_symoutptr(PlugWorkflowManager__sync),           .desc = "PlugWorkflowManager::sync",           .optional = true},
     {0},
 };
 
@@ -1370,4 +1397,57 @@ int nf_watch_init(char const *path, void (*cb)(void)) {
     // nf_init logs "could not set up" and stays silent on "ready" rather than
     // printing a readiness line for a watch that already knows it is dead.
     return dispatcherLive ? 0 : -1;
+}
+
+// --- the library rescan -------------------------------------------------
+//
+// Two calls and a NULL check -- see nfnickel.h for the full contract, and
+// rescan-archaeology.md for the disassembly. Note what is ABSENT compared
+// with every other entry point in this file: no operator new, no
+// over-allocation, no measured object size, no sret buffer, nothing to
+// destroy and no QString to free.
+
+bool nf_rescan_available(void) {
+    return PlugWorkflowManager__sharedInstance != NULL && PlugWorkflowManager__sync != NULL;
+}
+
+bool nf_rescan_start(void) {
+    if (!nf_rescan_available()) {
+        // Degrades to "rescan unavailable", never to a failed init: every
+        // NFNickelDlsym entry is .optional and NickelHook's failsafe is SHARED
+        // infrastructure (CLAUDE.md) -- a hard failure here could take the
+        // owner's NickelMenu/NickelDBus/kfmon installs down with it.
+        nh_log("rescan: PlugWorkflowManager::sharedInstance/sync did not resolve -- rescan unavailable on this firmware, doing nothing");
+        return false;
+    }
+
+    // STATIC: called with no `this`. The symbol name cannot tell you that --
+    // the Itanium ABI mangles static and non-static members identically, which
+    // is exactly how reading r1 as `this` for VolumeManager::getById compiled,
+    // linked, resolved and crashed Nickel on the first device run (CLAUDE.md).
+    PlugWorkflowManager *wf = PlugWorkflowManager__sharedInstance();
+    if (!wf) {
+        // Per the archaeology this cannot happen: sharedInstance's body is a
+        // __cxa_guard'ed function-local static whose address is COMPUTED
+        // (`adds r0, #12` off a PC-relative base), not loaded, so the value is
+        // the address of an object in libnickel's own .bss. Kept anyway, and
+        // kept documented as unreachable, so that nothing is ever measured on
+        // this branch being taken.
+        nh_log("rescan: PlugWorkflowManager::sharedInstance() returned NULL, which the disassembly says cannot happen -- refusing to call sync() through it");
+        return false;
+    }
+
+    // NON-static, void, no sret, not virtual, and it DOES NOT BLOCK -- the
+    // chain ends at QThread::start() on "syncstateworker". So this returns
+    // immediately and the scan runs behind it; everything the owner then sees
+    // (a processing screen, up to three modal dialogs, the Wi-Fi coming on)
+    // is Nickel's own post-USB workflow running on completion, not this mod.
+    //
+    // Calling it twice while a scan is already running is a clean no-op --
+    // FSSyncManager guards on its own isSyncing() flag -- so a double tap
+    // costs nothing and needs no guard of ours.
+    nh_log("rescan: calling PlugWorkflowManager::sync() -- returns at once, the scan runs on 'syncstateworker'; Wi-Fi will come on when the workflow finishes");
+    PlugWorkflowManager__sync(wf);
+    nh_log("rescan: sync() returned (this says the CALL was made, not that anything was scanned -- the workflow runs even when nothing is)");
+    return true;
 }

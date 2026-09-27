@@ -1,7 +1,7 @@
 include NickelHook/NickelHook.mk
 
 override LIBRARY  := libnfolders.so
-override SOURCES  += nfolders.cc nfnickel.cc nfbrowser.cc nfview.cc nflist.cc nffmt.cc
+override SOURCES  += nfolders.cc nfnickel.cc nfbrowser.cc nfview.cc nfops.cc nflist.cc nffmt.cc nfpath.cc
 override CFLAGS   += -Wall -Wextra -Werror -Wno-missing-field-initializers -fvisibility=hidden
 override CXXFLAGS += -Wall -Wextra -Werror -Wno-missing-field-initializers -fvisibility=hidden -fvisibility-inlines-hidden
 # QWidget (nfbrowser.cc's view) lives in QtWidgets, not QtGui, on Qt5 -- added
@@ -24,7 +24,11 @@ include NickelHook/NickelHook.mk
 # on the next device build rather than failing quietly on the panel -- which is
 # why the skew is acceptable rather than merely tolerated.
 HOST_CXX      ?= g++
-HOST_PURE     := nffmt.cc nflist.cc
+# nfpath.cc joins the pure set with the file-operation task: it is the layer
+# that decides whether a delete, a move or a copy may touch a path at all, so
+# it is the single most important thing in this project to be able to run off
+# the device. nfops.cc is deliberately NOT here -- it does the syscalls.
+HOST_PURE     := nffmt.cc nflist.cc nfpath.cc
 HOST_TESTSRC  := $(wildcard tests/test_*.cc)
 HOST_TESTBIN  := $(patsubst tests/%.cc,build/%,$(HOST_TESTSRC))
 # Header prerequisites are load-bearing, not tidiness: without them a test

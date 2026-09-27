@@ -1665,28 +1665,50 @@ static void test_view_rows_carry_no_active_mark_and_no_space_runs(void) {
     }
 }
 
-// The bar cannot show five toggles in one slot, so it shows whether ANY of
-// them has been changed. The negative control is the whole test: flipping each
-// flag ON ITS OWN must reach "custom", or the bar would quietly keep saying
-// "default" for a mode that is not the default -- exactly the misattribution
-// this feature's logging exists to prevent, one level up.
-static void test_view_bar_label_says_custom_for_every_single_flip(void) {
-    CHECK_EQ_STR(nf_view_bar_label(nf_view_flags_default()), "view: default");
+// THE VIEW BAR ITEM IS STATIC TEXT: the bare word "view", whatever the five
+// toggles are set to.
+//
+// It used to read "view: default" / "view: custom", and this test used to pin
+// that -- flipping each flag on its own had to reach "custom". The owner has
+// seen the summary on the device and asked for it gone: "custom" says
+// something is different without saying what, and the view submenu already
+// states every toggle's real state on its own row.
+//
+// PINNED AS A LITERAL, and pinned for EVERY flag combination rather than
+// loosened to "it returns something non-empty". A test that stops pinning the
+// string stops asserting anything -- the same reasoning that had
+// nf_cover_width_px(NF_COVER_H_PX) == 51 updated to 47 rather than made to
+// recompute its own expectation. Checking all 32 combinations is what makes
+// "static" a measured property instead of a claim about the default case.
+static void test_view_bar_label_is_the_bare_word_in_every_mode(void) {
+    CHECK_EQ_STR(nf_view_bar_label(nf_view_flags_default()), "view");
 
-    nf_view_toggle const all[] = { NF_VIEW_FILENAMES, NF_VIEW_EXTENSIONS,
-                                   NF_VIEW_COVERS, NF_VIEW_HIDDEN, NF_VIEW_SIZE };
-    for (int i = 0; i < 5; i++) {
-        nf_view_flags v = nf_view_flags_default();
-        bool *flag = nf_view_flag(&v, all[i]);
-        CHECK(flag != NULL);
-        if (!flag)
-            continue;
-        *flag = true;
-        CHECK_EQ_STR(nf_view_bar_label(v), "view: custom");
-        // ...and flipping it back reaches "default" again, so this is reading
-        // the flag rather than latching on the first change it ever saw.
-        *flag = false;
-        CHECK_EQ_STR(nf_view_bar_label(v), "view: default");
+    for (int bits = 0; bits < 32; bits++) {
+        nf_view_flags v;
+        v.fullNames      = (bits & 1)  != 0;
+        v.hideExtensions = (bits & 2)  != 0;
+        v.hideCovers     = (bits & 4)  != 0;
+        v.showHidden     = (bits & 8)  != 0;
+        v.showSize       = (bits & 16) != 0;
+        CHECK_EQ_STR(nf_view_bar_label(v), "view");
+    }
+
+    // THE SUBMENU IS UNCHANGED and still carries every toggle's real state --
+    // that is where the information the suffix used to compress actually
+    // lives, so dropping the suffix must not have quietly taken it with it.
+    nf_view_flags v = nf_view_flags_default();
+    bool *covers = nf_view_flag(&v, NF_VIEW_COVERS);
+    CHECK(covers != NULL);
+    if (covers) {
+        CHECK_EQ_STR(nf_menu_row_label(NF_MENU_VIEW, 2, NF_SORT_NAME, false, NF_FILTER_ALL, v),
+                     "covers: on");
+        *covers = true;
+        CHECK_EQ_STR(nf_menu_row_label(NF_MENU_VIEW, 2, NF_SORT_NAME, false, NF_FILTER_ALL, v),
+                     "covers: off");
+        // ...and so does the per-build log line, which is what stops a
+        // screenshot being attributed to the wrong mode. It has already
+        // caught a real misdiagnosis in this project, so it stays.
+        CHECK(nf_view_flags_summary(v).contains(QStringLiteral("covers: off")));
     }
 }
 
@@ -1871,6 +1893,182 @@ static void test_folder_rows_never_carry_a_size(void) {
     CHECK(filePlain.contains(QStringLiteral("4.0")));
 }
 
+
+// --- select mode and the confirmation screens ---------------------------
+
+static void test_item_count_text_pluralises_properly(void) {
+    // "item(s)" would have been one fewer function. This string ends up
+    // inside the row a reader taps to destroy something, and boilerplate is
+    // what gets skimmed.
+    CHECK_EQ_STR(nf_item_count_text(0), "0 items");
+    CHECK_EQ_STR(nf_item_count_text(1), "1 item");
+    CHECK_EQ_STR(nf_item_count_text(2), "2 items");
+    CHECK_EQ_STR(nf_item_count_text(27), "27 items");
+    // A negative count is clamped rather than rendered -- a count has a floor
+    // where a size does not (nf_format_size refuses instead).
+    CHECK_EQ_STR(nf_item_count_text(-1), "0 items");
+}
+
+static void test_menu_is_confirm_names_exactly_the_three(void) {
+    CHECK(nf_menu_is_confirm(NF_MENU_CONFIRM_DELETE));
+    CHECK(nf_menu_is_confirm(NF_MENU_CONFIRM_PASTE));
+    CHECK(nf_menu_is_confirm(NF_MENU_CONFIRM_RESCAN));
+    // NEGATIVE CONTROL: the four browsing modes are not confirmations, and if
+    // this ever said otherwise the listing itself would be replaced by an
+    // empty confirmation screen.
+    CHECK(!nf_menu_is_confirm(NF_MENU_NONE));
+    CHECK(!nf_menu_is_confirm(NF_MENU_SORT));
+    CHECK(!nf_menu_is_confirm(NF_MENU_FILTER));
+    CHECK(!nf_menu_is_confirm(NF_MENU_VIEW));
+}
+
+static void test_confirmation_screens_have_no_ordinary_menu_rows(void) {
+    // They build their rows from nf_confirm_row_label, not nf_menu_row_label,
+    // because a confirmation row has to name a count. Saying 0 here is
+    // honest; saying anything else would have nf_build_menu_content try to
+    // build rows for a screen that has none.
+    CHECK(nf_menu_row_count(NF_MENU_CONFIRM_DELETE) == 0);
+    CHECK(nf_menu_row_count(NF_MENU_CONFIRM_PASTE) == 0);
+    CHECK(nf_menu_row_count(NF_MENU_CONFIRM_RESCAN) == 0);
+    CHECK(nf_menu_row_label(NF_MENU_CONFIRM_DELETE, 0, NF_SORT_NAME, false,
+                            NF_FILTER_ALL, nf_view_flags_default()).isEmpty());
+    // NEGATIVE CONTROL: the real menus still have theirs.
+    CHECK(nf_menu_row_count(NF_MENU_SORT) > 0);
+    CHECK(nf_menu_row_count(NF_MENU_VIEW) > 0);
+}
+
+static void test_delete_confirmation_says_it_cannot_be_undone(void) {
+    QString h = nf_confirm_header(NF_MENU_CONFIRM_DELETE, 3, false);
+    CHECK(h.contains(QStringLiteral("3 items")));
+    // PINNED: there is no undo anywhere in this design and no recycle bin on
+    // this device, so the sentence has to say so.
+    CHECK(h.contains(QStringLiteral("cannot be undone")));
+    CHECK(nf_confirm_header(NF_MENU_CONFIRM_DELETE, 1, false).contains(QStringLiteral("1 item")));
+}
+
+static void test_paste_confirmation_distinguishes_move_from_copy(void) {
+    QString mv = nf_confirm_header(NF_MENU_CONFIRM_PASTE, 2, true);
+    QString cp = nf_confirm_header(NF_MENU_CONFIRM_PASTE, 2, false);
+    CHECK(mv.contains(QStringLiteral("Move")));
+    CHECK(cp.contains(QStringLiteral("Copy")));
+    CHECK(mv != cp);
+    CHECK(mv.contains(QStringLiteral("2 items")));
+    CHECK(cp.contains(QStringLiteral("2 items")));
+    // A move must not describe itself as a copy anywhere -- the consequence
+    // differs (one leaves nothing behind) and that is the whole reason two
+    // words exist.
+    CHECK(!mv.contains(QStringLiteral("Copy")));
+    CHECK(!cp.contains(QStringLiteral("Move")));
+}
+
+static void test_rescan_confirmation_names_the_wifi_consequence(void) {
+    // THE POINT OF THIS TEST. PlugWorkflowManager::sync() is not a bare
+    // rescan: on completion Nickel runs its whole post-USB workflow and calls
+    // connectWirelessSilently(), i.e. it turns the Wi-Fi on. The owner chose
+    // a manual button because of that, so the screen they tap has to say it,
+    // and pinning the word here is what stops it being tidied away later.
+    QString h = nf_confirm_header(NF_MENU_CONFIRM_RESCAN, 0, false);
+    CHECK(h.contains(QStringLiteral("Wi-Fi")));
+    CHECK(h.contains(QStringLiteral("ON")));
+    // ...and the ROW carries it too, because the row is what gets tapped by
+    // someone who skimmed the sentence above it.
+    QString row = nf_confirm_row_label(NF_MENU_CONFIRM_RESCAN, 1, 0, false);
+    CHECK(row.contains(QStringLiteral("Wi-Fi")));
+    // It also says the scan does not block, which is the other thing a reader
+    // would otherwise read as the mod having hung.
+    CHECK(h.contains(QStringLiteral("does not block")));
+}
+
+static void test_cancel_is_always_the_first_confirmation_row(void) {
+    // A reader who taps before reading hits the harmless row on all three
+    // screens, and the destructive one is never where a mis-tap lands.
+    CHECK_EQ_STR(nf_confirm_row_label(NF_MENU_CONFIRM_DELETE, 0, 3, false), "cancel");
+    CHECK_EQ_STR(nf_confirm_row_label(NF_MENU_CONFIRM_PASTE,  0, 3, true),  "cancel");
+    CHECK_EQ_STR(nf_confirm_row_label(NF_MENU_CONFIRM_RESCAN, 0, 0, false), "cancel");
+}
+
+static void test_the_confirming_row_says_what_it_will_do_not_ok(void) {
+    // "OK" carries none of the count, none of the verb and none of the
+    // consequence -- it can only be read by remembering the header. Each of
+    // these can be read on its own.
+    CHECK_EQ_STR(nf_confirm_row_label(NF_MENU_CONFIRM_DELETE, 1, 3, false), "delete 3 items");
+    CHECK_EQ_STR(nf_confirm_row_label(NF_MENU_CONFIRM_DELETE, 1, 1, false), "delete 1 item");
+    CHECK_EQ_STR(nf_confirm_row_label(NF_MENU_CONFIRM_PASTE,  1, 2, true),  "move 2 items here");
+    CHECK_EQ_STR(nf_confirm_row_label(NF_MENU_CONFIRM_PASTE,  1, 2, false), "copy 2 items here");
+    CHECK_EQ_STR(nf_confirm_row_label(NF_MENU_CONFIRM_PASTE,  2, 2, true),  "clear the clipboard");
+    CHECK_EQ_STR(nf_confirm_row_label(NF_MENU_CONFIRM_RESCAN, 1, 0, false), "rescan now (turns Wi-Fi on)");
+    // None of them is the word "OK", checked directly rather than left to the
+    // literals above to imply.
+    for (int i = 0; i < nf_confirm_row_count(NF_MENU_CONFIRM_DELETE); i++)
+        CHECK(nf_confirm_row_label(NF_MENU_CONFIRM_DELETE, i, 3, false) != QStringLiteral("OK"));
+}
+
+static void test_confirm_row_index_out_of_range_returns_nothing(void) {
+    // Refusal rather than a guess, and on THIS screen an index that fell
+    // through to the action row would delete something.
+    CHECK(nf_confirm_row_count(NF_MENU_CONFIRM_DELETE) == 2);
+    CHECK(nf_confirm_row_count(NF_MENU_CONFIRM_PASTE) == 3);
+    CHECK(nf_confirm_row_count(NF_MENU_CONFIRM_RESCAN) == 2);
+    CHECK(nf_confirm_row_count(NF_MENU_NONE) == 0);
+    CHECK(nf_confirm_row_count(NF_MENU_SORT) == 0);
+    CHECK(nf_confirm_row_label(NF_MENU_CONFIRM_DELETE, -1, 3, false).isEmpty());
+    CHECK(nf_confirm_row_label(NF_MENU_CONFIRM_DELETE, 2, 3, false).isEmpty());
+    CHECK(nf_confirm_row_label(NF_MENU_CONFIRM_PASTE, 3, 3, false).isEmpty());
+    CHECK(nf_confirm_row_label(NF_MENU_NONE, 0, 3, false).isEmpty());
+    CHECK(nf_confirm_row_label(NF_MENU_SORT, 0, 3, false).isEmpty());
+    // NEGATIVE CONTROL: every in-range index DOES produce words, or the
+    // screen above would be a column of blank tap targets.
+    CHECK(!nf_confirm_row_label(NF_MENU_CONFIRM_PASTE, 0, 1, true).isEmpty());
+    CHECK(!nf_confirm_row_label(NF_MENU_CONFIRM_PASTE, 1, 1, true).isEmpty());
+    CHECK(!nf_confirm_row_label(NF_MENU_CONFIRM_PASTE, 2, 1, true).isEmpty());
+}
+
+static void test_the_bar_labels_carry_their_counts(void) {
+    CHECK_EQ_STR(nf_select_bar_label(0), "done (0)");
+    CHECK_EQ_STR(nf_select_bar_label(3), "done (3)");
+    CHECK_EQ_STR(nf_select_bar_label(-2), "done (0)");
+    CHECK_EQ_STR(nf_paste_bar_label(1), "paste (1)");
+    CHECK_EQ_STR(nf_paste_bar_label(12), "paste (12)");
+    CHECK_EQ_STR(nf_paste_bar_label(-1), "paste (0)");
+}
+
+static void test_the_select_marker_is_in_the_text_and_measurable(void) {
+    QString mk, pl;
+    nf_select_marker(true, &mk, &pl);
+    // THE TICK IS CHARACTERS, not a style: four grey levels on this panel,
+    // where "slightly lighter" reads as "the same".
+    CHECK(pl.startsWith(QStringLiteral("[x]")));
+    CHECK(mk.startsWith(QStringLiteral("[x]")));
+
+    QString mk0, pl0;
+    nf_select_marker(false, &mk0, &pl0);
+    CHECK(pl0.startsWith(QLatin1Char('[')));
+    CHECK(pl0 != pl);
+    // BOTH STATES ARE MARKED and both are the same width, so the names after
+    // them line up and select mode is visible from any row, not only the bar.
+    CHECK(pl0.length() == pl.length());
+
+    // THE MEASURE/RENDER INVARIANT every two-form fragment in this file has:
+    // substituting &nbsp; in the markup must yield the plain form EXACTLY.
+    // Violating it is what clipped every row on 2026-09-04.
+    CHECK(QString(mk).replace(QStringLiteral("&nbsp;"), QString(nf_nbsp())) == pl);
+    CHECK(QString(mk0).replace(QStringLiteral("&nbsp;"), QString(nf_nbsp())) == pl0);
+    // No ordinary space survives in either form -- an ASCII space is a wrap
+    // opportunity and collapses under rich text, so the string that MEASURES
+    // would stop being the string that RENDERS.
+    CHECK(!pl.contains(QLatin1Char(' ')));
+    CHECK(!pl0.contains(QLatin1Char(' ')));
+    // Each form ends in the separator that divides it from the name.
+    CHECK(pl.endsWith(nf_nbsp()));
+    CHECK(pl0.endsWith(nf_nbsp()));
+
+    // Either output pointer may be NULL, like every other two-form builder.
+    nf_select_marker(true, NULL, NULL);
+    QString onlyPlain;
+    nf_select_marker(false, NULL, &onlyPlain);
+    CHECK(onlyPlain == pl0);
+}
+
 int main(void) {
     test_unpadded_volume_dirs();
     test_strip_fullmetal();
@@ -1964,7 +2162,7 @@ int main(void) {
     test_view_menu_index_out_of_range_refuses_and_writes_nothing();
     test_view_rows_show_their_state_in_the_text();
     test_view_rows_carry_no_active_mark_and_no_space_runs();
-    test_view_bar_label_says_custom_for_every_single_flip();
+    test_view_bar_label_is_the_bare_word_in_every_mode();
     test_view_flags_summary_is_the_menu_rows();
     test_items_per_page_for_both_modes();
     test_format_size_units();
@@ -1972,5 +2170,16 @@ int main(void) {
     test_format_size_refuses_a_negative();
     test_row_suffix_shows_the_size_only_when_asked();
     test_folder_rows_never_carry_a_size();
+    test_item_count_text_pluralises_properly();
+    test_menu_is_confirm_names_exactly_the_three();
+    test_confirmation_screens_have_no_ordinary_menu_rows();
+    test_delete_confirmation_says_it_cannot_be_undone();
+    test_paste_confirmation_distinguishes_move_from_copy();
+    test_rescan_confirmation_names_the_wifi_consequence();
+    test_cancel_is_always_the_first_confirmation_row();
+    test_the_confirming_row_says_what_it_will_do_not_ok();
+    test_confirm_row_index_out_of_range_returns_nothing();
+    test_the_bar_labels_carry_their_counts();
+    test_the_select_marker_is_in_the_text_and_measurable();
     NF_TEST_MAIN_END
 }

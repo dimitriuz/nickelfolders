@@ -810,9 +810,36 @@ enum nf_menu_kind {
     // selection -- so there is no single "active" row to mark, and each row
     // states its own state instead.
     NF_MENU_VIEW,
+
+    // --- THE CONFIRMATION SCREENS ---------------------------------------
+    //
+    // Three more modes of the SAME screen, not a new mechanism and not a
+    // second mode variable: same TouchLabel rows, same command bar over them,
+    // same single BACK routing function (nfview.cc's nf_browser_back), same
+    // return-to-the-page-you-were-on. They are here, in nf_menu_kind, for
+    // exactly that reason -- two mode variables are two things that can
+    // disagree about where the reader is, and the whole argument for one BACK
+    // function is that there is then one place to read "where am I" from.
+    //
+    // What differs from the three above is only WHO BUILDS THE ROWS. A sort
+    // or view row is a pure function of the menu and an index, so
+    // nf_menu_row_label builds it. A confirmation row has to name a COUNT
+    // that only the browser knows, so it comes from nf_confirm_row_label
+    // below instead -- which is still pure, still host-tested, and still the
+    // one place those words are spelled. nf_menu_row_count therefore answers
+    // 0 for all three: they have no rows OF THAT KIND, and saying so is
+    // honest rather than a gap.
+    //
+    // EVERY ONE OF THESE IS ENTERED FROM A COMMAND-BAR TAP AND LEFT BY
+    // `cancel`, BACK, or the action row itself. None of them performs
+    // anything on the way in.
+    NF_MENU_CONFIRM_DELETE,
+    NF_MENU_CONFIRM_PASTE,
+    NF_MENU_CONFIRM_RESCAN,
 };
 
-// How many rows `menu` has. 0 for NF_MENU_NONE.
+// How many rows `menu` has. 0 for NF_MENU_NONE and for all three confirmation
+// screens -- see nf_confirm_row_count for those.
 int nf_menu_row_count(nf_menu_kind menu);
 
 // One word per sort key and per filter value, and the ONE place either
@@ -844,14 +871,23 @@ QString nf_filter_name(nf_filter_kind filter);
 QString nf_sort_bar_label(nf_sort_key key, bool descending);
 QString nf_filter_bar_label(nf_filter_kind filter);
 
-// The view bar item, which cannot show its setting the way the other two do:
-// there are FIVE independent toggles and one bar slot, and at four slots that
-// slot is ~316 px. So it says whether ANYTHING has been changed --
-// "view: default" or "view: custom" -- which is the question a reader
-// actually needs answered from the bar (why does this folder look odd?), with
-// the menu one tap away for which one. Spelling the five states out here
-// would either not fit or would elide to something that could not be read at
-// all.
+// The view bar item, which is STATIC TEXT -- the bare word "view", always,
+// with no state suffix at all.
+//
+// It used to read "view: default" or "view: custom". That suffix existed
+// because five independent toggles cannot fit one ~316 px bar slot, so it was
+// a compressed summary of whether anything had been changed. The owner has
+// now seen it on the device and would rather have no summary than a vague
+// one: "custom" says something is different without saying what, which is one
+// tap short of the answer either way, and the view submenu already states
+// every toggle's real state on its own row -- which is where that information
+// belongs.
+//
+// STILL A FUNCTION, and still taking `view`, rather than being folded into a
+// string literal at the call site: the bar item, the submenu rows and the
+// per-build log line all read their words from this file, and collapsing this
+// one into nfview.cc would be the first crack in that. The argument is
+// deliberately ignored; a test pins the literal on both sides.
 QString nf_view_bar_label(nf_view_flags view);
 
 // All five view rows joined with " | ", for the one log line every content
@@ -926,5 +962,90 @@ QString nf_menu_row_label(nf_menu_kind menu, int index,
                           nf_sort_key activeKey, bool activeDesc,
                           nf_filter_kind activeFilter,
                           nf_view_flags view);
+
+// --- select mode and the file operations --------------------------------
+//
+// The WORDS the file-operation UI uses, and nothing else: no path is touched
+// here, no filesystem is consulted, and nothing below can delete anything.
+// The guards live in nfpath.h (also pure, also host-tested) and the calls in
+// nfops.h. This block exists because a confirmation screen that does not say
+// plainly what it is about to do is worse than no confirmation at all, and
+// "says plainly" is a property a host test can pin literally.
+
+// "1 item" / "3 items" / "0 items". Proper pluralisation rather than
+// "item(s)": this string ends up inside the one row a reader taps to destroy
+// something, and a row that reads "delete 1 item(s)" invites being skimmed
+// as boilerplate. Negative counts are clamped to 0 -- a refusal to render
+// nonsense, the same rule as nf_format_size's on a negative size, except
+// that a count has a sensible floor where a size does not.
+QString nf_item_count_text(int count);
+
+// True for the three NF_MENU_CONFIRM_* modes. THE ONE PLACE that set is
+// spelled, so nfview.cc's BACK routing, its title switch and its content
+// dispatch all agree about which modes are confirmations -- three
+// independently written `menu == A || menu == B || menu == C` tests are three
+// chances to forget the third one, and the one that gets forgotten is
+// whichever was added last.
+bool nf_menu_is_confirm(nf_menu_kind menu);
+
+// The sentence at the top of a confirmation screen. `count` is how many items
+// the action would touch; `cut` distinguishes a pending MOVE from a pending
+// COPY and is ignored by the other two kinds.
+//
+// THE RESCAN HEADER NAMES THE WI-FI, in plain words, and that is a
+// requirement rather than a nicety: PlugWorkflowManager::sync() is not a bare
+// rescan -- it is the front of Nickel's whole post-USB workflow, and on
+// completion it calls WirelessWorkflowManager::connectWirelessSilently(),
+// i.e. it TURNS THE WI-FI ON (.superpowers/sdd/v2-features/
+// rescan-archaeology.md, section 7.2). The owner asked for a manual button
+// specifically BECAUSE of that, so the consequence has to be on the screen
+// they tap, not only in a comment. A test pins the word "Wi-Fi" in this
+// string so it cannot be edited out by someone tidying the wording.
+//
+// THE DELETE HEADER SAYS IT CANNOT BE UNDONE, for the same reason: there is
+// no undo anywhere in this design and no recycle bin on this device.
+QString nf_confirm_header(nf_menu_kind menu, int count, bool cut);
+
+// How many ACTION rows a confirmation screen has (0 for anything that is not
+// one), and what each says. `cancel` is ALWAYS index 0, i.e. always the top
+// row, and that ordering is the safety decision in this function: a reader
+// who taps before reading hits the harmless row, and the destructive one is
+// never where a mis-tap lands by default.
+//
+// THE CONFIRMING ROW SAYS WHAT IT WILL DO -- "delete 3 items", "move 2 items
+// here", "rescan now (turns Wi-Fi on)" -- never "OK". A row labelled "OK"
+// carries none of the count, none of the verb and none of the consequence, so
+// it can only be read by remembering the header; these can be read on their
+// own.
+int nf_confirm_row_count(nf_menu_kind menu);
+QString nf_confirm_row_label(nf_menu_kind menu, int index, int count, bool cut);
+
+// The command-bar item that leaves select mode, carrying the count: "done (3)".
+// The count is in the bar because it is the one number a reader needs before
+// tapping `delete`, and the rows that carry the ticks may be on another page.
+QString nf_select_bar_label(int selected);
+
+// The command-bar item that pastes, carrying the number of items waiting:
+// "paste (2)". Shown only when that number is non-zero (nfview.cc) -- a
+// `paste` control with an empty clipboard would be a tap target that does
+// nothing, which this project does not build.
+QString nf_paste_bar_label(int pending);
+
+// The tick a row carries in SELECT MODE, in the same TWO FORMS every other
+// row fragment comes in (nf_icon_badge, nf_row_suffix): the rich-text markup
+// that gets rendered, and the plain twin that gets MEASURED so the marker is
+// paid for out of the row's width budget before the name is elided into what
+// is left. Substituting `&nbsp;` in the markup form must yield the plain form
+// exactly -- the invariant a test pins, and the one whose violation clipped
+// every row on 2026-09-04 (nf_nbsp, above).
+//
+// IN THE TEXT, NOT IN A STYLE. This panel has four grey levels and "slightly
+// lighter" reads as "the same", which is the same finding that puts
+// "[not in library]" into a row's words. "[x]" and "[ ]" are both three
+// characters wide, so the names after them line up whether a row is ticked or
+// not -- and an UNTICKED row carries "[ ]" rather than nothing, so the tick
+// column exists before anything is in it and a reader can see that select
+// mode is on from any row, not only from the bar.
+void nf_select_marker(bool selected, QString *markup, QString *plain);
 
 #endif
