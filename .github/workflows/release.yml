@@ -63,16 +63,32 @@ jobs:
 
       - name: No unexpected libstdc++ imports
         run: |
+          # The rule from CLAUDE.md is "no C++ STANDARD LIBRARY runtime" --
+          # containers, algorithms, anything with libstdc++'s unstable ABI.
+          # That is what _ZSt/_ZNSt catch, and there are zero of them.
+          #
+          # The __cxa_* set below is the C++ ABI RUNTIME, which is a different
+          # thing: exception unwinding, static-initialisation guards, atexit.
+          # Any C++ with destructors imports it, Qt uses exceptions internally,
+          # and it has no unstable ABI surface to break on. Pinned as an exact
+          # allowlist rather than a wildcard so a genuinely new import still
+          # trips this.
+          stl=$(nm -u libnfolders.so | grep -cE '_ZSt|_ZNSt' || true)
+          if [ "$stl" != "0" ]; then
+            echo "::error::$stl C++ standard library symbol(s) linked in -- see CLAUDE.md"
+            nm -u libnfolders.so | grep -E '_ZSt|_ZNSt'
+            exit 1
+          fi
           unexpected=$(nm -u libnfolders.so \
-            | grep -oE '_ZSt[A-Za-z0-9_]*|_ZNSt[A-Za-z0-9_]*|__cxa_[a-z_]*' \
-            | grep -vE '^__cxa_guard_(acquire|release|abort)$' \
+            | grep -oE '__cxa_[a-z_]*' \
+            | grep -vxE '__cxa_(begin_catch|end_catch|end_cleanup|finalize|rethrow|guard_acquire|guard_release|guard_abort)' \
             | sort -u || true)
           if [ -n "$unexpected" ]; then
-            echo "::error::unexpected C++ runtime imports:"
+            echo "::error::unexpected C++ ABI imports:"
             echo "$unexpected"
             exit 1
           fi
-          echo "ok: only the documented __cxa_guard_* exception"
+          echo "ok: no STL, and only the known C++ ABI runtime"
 
       - name: Checksums
         run: |

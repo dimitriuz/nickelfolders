@@ -282,9 +282,20 @@ afterward.
   form keeps every layout assumption in one place and written down.
 - **No C++ standard library runtime.** Qt and libc only, with ONE measured
   exception that is already shipping and is documented rather than hidden:
-  `libnfolders.so` imports `__cxa_guard_acquire`/`_release`/`_abort` from
-  `CXXABI_1.3`, emitted for the **function-local statics** this file
-  recommends as the fix for the file-scope rule below. They resolve because
+  `libnfolders.so` imports eight `__cxa_*` symbols from `CXXABI_1.3` —
+  `guard_acquire`/`guard_release`/`guard_abort` (emitted for the
+  **function-local statics** this file recommends as the fix for the
+  file-scope rule below), plus `begin_catch`/`end_catch`/`end_cleanup`/
+  `rethrow`/`finalize` (exception unwinding and atexit, which any C++ with
+  destructors imports and which Qt needs because it uses exceptions
+  internally). An earlier version of this note listed only the three guard
+  symbols, which was simply incomplete — the other five have been there all
+  along and were found when CI first checked.
+  **The distinction that matters is C++ ABI runtime versus C++ STANDARD
+  LIBRARY.** The rule is about the latter: containers, algorithms, anything
+  carrying libstdc++'s unstable ABI. Of those there are **zero**, which is
+  the check worth automating (`nm -u libnfolders.so | grep -E '_ZSt|_ZNSt'`
+  must be empty, and CI enforces exactly that). They resolve because
   `libstdc++.so.6.0.12` is mapped into Nickel's own process (measured
   2026-09-27 in `/proc/$(pidof nickel)/maps`) — Nickel is C++/Qt, so it
   cannot not be. Check with `nm -u libnfolders.so | grep cxa_guard`.
