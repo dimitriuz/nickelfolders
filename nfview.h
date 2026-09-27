@@ -108,4 +108,19 @@
 // null. Returns true on either a fresh push or a re-push.
 bool nf_browser_show(void);
 
+// True while a file operation (a delete, a move or a chunked copy) is running
+// on the GUI thread.
+//
+// It exists because a chunked copy YIELDS to the event loop between chunks --
+// it has to, so the panel stays alive and `cancel` stays tappable -- and that
+// yield will deliver anything queued, including this mod's OWN inotify
+// triggers (/tmp/nfolders-open, /tmp/nfolders-show; nfolders.cc). Those two
+// push Nickel UI of their own, on top of a running operation, from inside the
+// operation's own call stack.
+//
+// nf_browser_show guards itself, so this is exported only for the two trigger
+// handlers that have no other way to ask. Every tap handler inside nfview.cc
+// checks the same flag directly.
+bool nf_ops_busy(void);
+
 #endif

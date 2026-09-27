@@ -149,6 +149,25 @@ nf_path_verdict nf_path_check_source(QString const& path, QString const& cwd);
 // (paste must never silently overwrite).
 nf_path_verdict nf_path_check_dest(QString const& dest, QString const& src);
 
+// THE VERDICT for the destination FOLDER a paste is landing in -- the folder
+// the reader is currently looking at. The source rules minus the cwd test,
+// because this path IS the cwd and passing it as its own `cwd` would refuse
+// every paste.
+//
+// It lives here, rather than as a chain of `if` clauses in nfops.cc where it
+// started, for the reason this whole header exists: it is the only guard that
+// was written on the untestable side, and an inverted clause in it would have
+// failed no test. `nf_path_check_dest` independently re-covers everything it
+// says except the root case -- so the exposure was never data loss, only a
+// rule nothing pinned.
+//
+// /mnt/onboard ITSELF is refused, and that one IS a judgement rather than a
+// safety rule: the root is where Nickel's own .kobo/.adds live, it is the
+// directory a USB session mounts, and a book dropped straight into it is the
+// mess this browser exists to help the owner out of. Pasting into any real
+// folder under it works, which is what the tests pin on the other side.
+nf_path_verdict nf_path_check_dest_dir(QString const& dir);
+
 // The temporary name a chunked copy writes to inside the DESTINATION
 // directory, before renaming it into place on success. Returns an empty
 // QString for a name nf_path_name_is_safe rejects, so a caller that forgets
@@ -167,8 +186,14 @@ nf_path_verdict nf_path_check_dest(QString const& dest, QString const& src);
 //     a row -- as a partial file, mid-copy, tappable.
 //   - bounded to NF_TEMP_NAME_MAX QChars, because VFAT's long-name limit is
 //     255 UTF-16 code units and the reference card already holds 230-
-//     character names; the middle of the base name is what gets dropped, and
-//     a trailing surrogate is never split.
+//     character names. THE TAIL OF THE BASE NAME IS WHAT GETS DROPPED, not
+//     its middle: the tail is where the extension is, and dropping it is what
+//     keeps a long name's temp out of the listing's extension allowlist for
+//     the same reason the trailing marker does. (This comment said "middle"
+//     and the code has always cut the tail -- a stated measurement the code
+//     contradicted, in the one file whose whole argument is that its rules are
+//     written down and pinned. The code is what was meant; the words were
+//     wrong.) A trailing surrogate is never split.
 //
 // It is NOT unique per call, and does not need to be: pastes run one item at
 // a time on the GUI thread (nfview.cc's nf_op_busy guard), and each item's

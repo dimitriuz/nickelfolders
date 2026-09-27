@@ -365,6 +365,102 @@ static void test_the_root_is_still_the_root(void) {
     CHECK(!nf_path_is_inside(S("/mnt/onboardX/books"), S(NF_PATH_ROOT)));
 }
 
+
+// --- nf_path_check_dest_dir ----------------------------------------------
+//
+// This one used to be a chain of `if` clauses inside nfops.cc, i.e. on the
+// side no host test can reach -- an inverted clause in it would have failed
+// nothing. These are the tests it did not have.
+
+static void test_dest_dir_allows_the_folders_a_reader_actually_pastes_into(void) {
+    // THE NEGATIVE CONTROL FOR THE WHOLE PREDICATE. If this stops passing,
+    // paste is simply broken and every refusal test below still passes.
+    CHECK(nf_path_check_dest_dir(S("/mnt/onboard/books")) == NF_PATH_OK);
+    CHECK(nf_path_check_dest_dir(S("/mnt/onboard/books/Comics/English")) == NF_PATH_OK);
+    CHECK(nf_path_check_dest_dir(S("/mnt/onboard/adds")) == NF_PATH_OK);
+    CHECK(nf_path_check_dest_dir(S("/mnt/onboard/.kobold")) == NF_PATH_OK);
+    CHECK(nf_path_check_dest_dir(S("/mnt/onboard/books2")) == NF_PATH_OK);
+}
+
+static void test_dest_dir_refuses_the_root_and_everything_off_the_card(void) {
+    // The root is a JUDGEMENT, not a safety rule (nfpath.h): .kobo and .adds
+    // live there, it is what a USB session mounts, and a book dropped into it
+    // is the mess this browser exists to help with. Pinned so it cannot flip
+    // silently, which is exactly what could happen while it was an `if`.
+    CHECK(nf_path_check_dest_dir(S("/mnt/onboard")) == NF_PATH_IS_ROOT);
+    CHECK(nf_path_check_dest_dir(S("/tmp")) == NF_PATH_OUTSIDE_ROOT);
+    CHECK(nf_path_check_dest_dir(S("/mnt/onboardX/books")) == NF_PATH_OUTSIDE_ROOT);
+    CHECK(nf_path_check_dest_dir(S("/mnt/sd/books")) == NF_PATH_OUTSIDE_ROOT);
+    CHECK(nf_path_check_dest_dir(S("/mnt/onboard/.kobo")) == NF_PATH_PROTECTED);
+    CHECK(nf_path_check_dest_dir(S("/mnt/onboard/.adds/koreader")) == NF_PATH_PROTECTED);
+    CHECK(nf_path_check_dest_dir(S("/mnt/onboard/System Volume Information")) == NF_PATH_PROTECTED);
+    CHECK(nf_path_check_dest_dir(QString()) == NF_PATH_UNCLEAN);
+    CHECK(nf_path_check_dest_dir(S("/mnt/onboard/books/")) == NF_PATH_UNCLEAN);
+    CHECK(nf_path_check_dest_dir(S("/mnt/onboard/books/..")) == NF_PATH_UNCLEAN);
+}
+
+static void test_dest_dir_has_no_cwd_rule_because_it_is_the_cwd(void) {
+    // The one rule it deliberately does NOT carry. nf_path_check_source
+    // refuses a path that is the folder being browsed; the destination folder
+    // IS that folder, so the same rule there would refuse every paste. Both
+    // sides are checked, against the same path, so the difference is a
+    // measurement rather than a claim.
+    QString here = S("/mnt/onboard/books");
+    CHECK(nf_path_check_source(here, here) == NF_PATH_IS_CWD_OR_ANCESTOR);
+    CHECK(nf_path_check_dest_dir(here) == NF_PATH_OK);
+}
+
+// --- the codec pairing nf_browser_cwd depends on -------------------------
+
+static void test_utf8_round_trip_survives_the_names_this_card_holds(void) {
+    // nfview.cc stores the current folder in a char[] and reads it back to
+    // decide, among other things, whether a selection survives. The write and
+    // the read must use the SAME codec: toUtf8()/fromUtf8() are inverses,
+    // toLocal8Bit()/fromUtf8() are not unless the locale codec happens to be
+    // UTF-8, and Qt 5.2 falls back to Latin-1 under a C/POSIX locale.
+    //
+    // THIS CARD HAS CYRILLIC-NAMED PDFs under /mnt/onboard/books/, so the
+    // mismatch was reachable rather than theoretical: the rebuild after a tick
+    // would have read back a different string, looked like a folder change,
+    // and cleared the tick.
+    char const *names[] = {
+        "/mnt/onboard/books",
+        "/mnt/onboard/books/\xd0\x9c\xd0\xb0\xd1\x81\xd1\x82\xd0\xb5\xd1\x80 \xd0\xb8 \xd0\x9c\xd0\xb0\xd1\x80\xd0\xb3\xd0\xb0\xd1\x80\xd0\xb8\xd1\x82\xd0\xb0.pdf", // Cyrillic
+        "/mnt/onboard/books/\xc3\x89mile Zola",                        // Latin-1-representable, still multi-byte in UTF-8
+        "/mnt/onboard/books/\xf0\x9f\x93\x96 shelf",                   // non-BMP: a surrogate pair
+        "/mnt/onboard/books/Fullmetal Alchemist (v01-v27) (2005-2011)",
+    };
+    for (int i = 0; i < (int)(sizeof names / sizeof names[0]); i++) {
+        QString path = QString::fromUtf8(names[i]);
+        // The round trip nfview.cc performs, spelled exactly as it spells it.
+        QByteArray stored = path.toUtf8();
+        CHECK(QString::fromUtf8(stored.constData()) == path);
+        // ...and it fits the PATH_MAX-sized buffer it is stored in, which is
+        // the other thing that would make the comparison fail: a truncated
+        // UTF-8 tail also reads back as a different string. 4096 is PATH_MAX
+        // on this device; the longest real path on the card is ~230 chars.
+        CHECK(stored.size() < 4096);
+    }
+}
+
+static void test_the_temp_name_drops_the_tail_not_the_middle(void) {
+    // The stated behaviour and the code disagreed once (the header said
+    // "middle"); this pins which one is real. The HEAD of a long base name
+    // survives and the tail -- including its extension -- does not, which is
+    // what keeps a truncated temp out of the listing's extension allowlist.
+    QString base = QString(180, QLatin1Char('a')) + QStringLiteral("ZZZTAIL") + QStringLiteral(".epub");
+    QString t = nf_temp_name(base);
+    CHECK(!t.isEmpty());
+    CHECK(t.length() <= NF_TEMP_NAME_MAX);
+    CHECK(t.startsWith(QStringLiteral(".aaa")));      // the head survived
+    CHECK(!t.contains(QStringLiteral("ZZZTAIL")));    // the tail did not
+    CHECK(!t.contains(QStringLiteral(".epub")));      // nor did the extension
+    CHECK(t.endsWith(QStringLiteral(".nfolders-part")));
+    // NEGATIVE CONTROL: a name that fits keeps its tail AND its extension --
+    // the truncation must not be applied to everything.
+    CHECK_EQ_STR(nf_temp_name(S("a.epub")), ".a.epub.nfolders-part");
+}
+
 int main(void) {
     test_clean_accepts_ordinary_absolute_paths();
     test_clean_refuses_the_shapes_that_make_a_guard_meaningless();
@@ -391,5 +487,10 @@ int main(void) {
     test_temp_name_is_bounded_for_the_long_names_this_card_holds();
     test_temp_name_never_splits_a_surrogate_pair();
     test_the_root_is_still_the_root();
+    test_dest_dir_allows_the_folders_a_reader_actually_pastes_into();
+    test_dest_dir_refuses_the_root_and_everything_off_the_card();
+    test_dest_dir_has_no_cwd_rule_because_it_is_the_cwd();
+    test_utf8_round_trip_survives_the_names_this_card_holds();
+    test_the_temp_name_drops_the_tail_not_the_middle();
     NF_TEST_MAIN_END
 }

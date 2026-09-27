@@ -177,6 +177,23 @@ nf_path_verdict nf_path_check_dest(QString const& dest, QString const& src) {
     return NF_PATH_OK;
 }
 
+nf_path_verdict nf_path_check_dest_dir(QString const& dir) {
+    if (!nf_path_is_clean(dir))
+        return NF_PATH_UNCLEAN;
+    // The root is refused BEFORE the inside-the-root test, so the answer names
+    // the specific thing rather than the true-of-everything one -- the same
+    // ordering nf_path_check_source uses and for the same reason.
+    if (dir == QLatin1String(NF_PATH_ROOT))
+        return NF_PATH_IS_ROOT;
+    if (!nf_path_is_inside(dir, QLatin1String(NF_PATH_ROOT)))
+        return NF_PATH_OUTSIDE_ROOT;
+    if (nf_path_is_protected(dir))
+        return NF_PATH_PROTECTED;
+    // Deliberately NO cwd-or-ancestor test: this path IS the folder being
+    // browsed, so that rule would refuse every paste there is.
+    return NF_PATH_OK;
+}
+
 QString nf_temp_name(QString const& finalName) {
     if (!nf_path_name_is_safe(finalName))
         return QString();
@@ -190,6 +207,10 @@ QString nf_temp_name(QString const& finalName) {
         int room = NF_TEMP_NAME_MAX - fixed;
         if (room < 1)
             return QString(); // unreachable while NF_TEMP_NAME_MAX > 15; a floor, not a repair
+        // THE TAIL IS WHAT GOES, not the middle -- see nfpath.h. Keeping the
+        // head is what takes the extension off a long name, which is the same
+        // property the trailing ".nfolders-part" marker gives a short one.
+        //
         // A TRAILING surrogate must not be split: QString counts UTF-16 code
         // units, so cutting between a high and a low surrogate leaves half a
         // character, which is a filename no filesystem should be asked to

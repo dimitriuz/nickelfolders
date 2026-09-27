@@ -111,6 +111,20 @@ static void nf_on_trigger() {
         nh_log("trigger: empty, ignoring");
         return;
     }
+
+    // A FILE OPERATION IS RUNNING. The trigger file has already been consumed
+    // above, deliberately: this is a refusal, not a deferral, and leaving the
+    // file behind would have the same trigger fire again on the next event.
+    //
+    // The reason a trigger can arrive at all mid-operation is that a chunked
+    // copy yields to the event loop between chunks (nfview.h's nf_ops_busy),
+    // and this callback fires from a QSocketNotifier on that same loop. Opening
+    // a book on top of a running copy would push a reader from inside the
+    // copy's own call stack.
+    if (nf_ops_busy()) {
+        nh_log("trigger: ignoring an open request -- a file operation is running");
+        return;
+    }
     // Typing the scheme every time is a nuisance, and a bare path is
     // unambiguous here.
     if (!contentId.contains(QStringLiteral("://")))
@@ -200,6 +214,16 @@ static void nf_on_trigger_show() {
     if (ids.isEmpty())
         ids = nf_default_reference_volumes();
 
+    // Same refusal as the open trigger's, and for the same reason: this
+    // callback fires from a QSocketNotifier on the event loop a running copy
+    // is yielding to, and pushing rung 2's borrowed controller on top of an
+    // operation would do it from inside that operation's own call stack.
+    // The trigger file is already consumed above -- a refusal, not a deferral.
+    if (nf_ops_busy()) {
+        nh_log("trigger: ignoring a show request -- a file operation is running");
+        return;
+    }
+
     nh_log("trigger: showing %d ContentIDs", static_cast<int>(ids.size()));
     nf_browser_show_volumes(ids);
 }
@@ -225,6 +249,9 @@ static void nf_on_trigger_view() {
     unlink(NF_TRIGGER_VIEW);
 
     nh_log("trigger: showing the native-dialog view");
+    // nf_browser_show guards itself on nf_ops_busy (nfview.cc), so there is
+    // deliberately no second check here -- one place decides, and it is the
+    // one that would do the pushing.
     nf_browser_show();
 }
 

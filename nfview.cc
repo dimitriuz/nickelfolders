@@ -388,6 +388,12 @@ static char nf_op_message[256];
 // that as "the selection is empty", which degrades select mode to doing
 // nothing rather than taking the mod down (CLAUDE.md: the NickelHook failsafe
 // is SHARED infrastructure).
+// Exported for nfolders.cc's two other trigger handlers -- see nfview.h.
+// Everything inside this file reads nf_op_busy directly.
+bool nf_ops_busy(void) {
+    return nf_op_busy;
+}
+
 static QStringList *nf_selection(void) {
     if (!nf_browser_selection)
         nf_browser_selection = new QStringList();
@@ -3123,16 +3129,42 @@ static void nf_run_paste(void *mwc, N3Dialog *dialog, QString const &path) {
 }
 
 // RESCAN, after the confirmation screen has named the Wi-Fi consequence.
-// Returns at once -- sync() does not block (nfnickel.h) -- so there is no
-// progress screen here and nothing to cancel: what the owner sees next is
+// No progress screen and nothing to cancel: what the owner sees next is
 // Nickel's own post-USB workflow, not this mod.
+//
+// IT IS GUARDED LIKE THE OTHER TWO EVEN THOUGH IT "RETURNS AT ONCE", and the
+// qualification is the whole point. sync() starting a QThread and returning
+// is ONE of its two branches. The other -- rescan-archaeology.md section 5.1,
+// the "Device is not signed, it will not sync FS." path -- emits finished()
+// INLINE, which runs onDoneProcessing synchronously inside nf_rescan_start():
+// it pops controllers, may push a QuiltedViewController, and can open modal
+// dialogs, i.e. a NESTED EVENT LOOP, inside this call.
+//
+// So the two things that shape carries are exactly the two nf_run_paste
+// already carries, for exactly the same reason:
+//
+//   nf_op_busy around the call, so a tap delivered inside that nested loop
+//   cannot schedule a second destructive run underneath this frame; and
+//
+//   a liveness re-check afterwards, because the controllers that branch pops
+//   can include our own dialog -- after which `dialog` is dangling and
+//   nf_browser_go would call setContent through it.
 static void nf_run_rescan(void *mwc, N3Dialog *dialog, QString const &path) {
     nf_browser_menu = NF_MENU_NONE;
+
+    nf_op_busy = true;
     bool started = nf_rescan_start();
+    nf_op_busy = false;
+
     if (started)
         nf_op_say("rescan started -- it runs in the background; Wi-Fi comes on when it finishes");
     else
         nf_op_say("rescan unavailable on this firmware -- nothing was run");
+
+    if (nf_browser_active_dialog != dialog) {
+        nh_log("rescan: the browser screen was destroyed while sync() ran -- not rebuilding it (the inline finished() branch pops controllers)");
+        return;
+    }
     nf_browser_go(mwc, dialog, path, false);
 }
 
@@ -3218,6 +3250,25 @@ static void nf_confirm_select(void *mwc, N3Dialog *dialog, QString const &path,
         // its destructive paths to.
         if (nf_browser_active_dialog != dialog) {
             nh_log("browser: the confirmed action was dropped -- the browser screen went away before it could run");
+            hop->deleteLater();
+            return;
+        }
+        // AND THE CONFIRMATION MUST STILL BE OPEN. `nf_op_busy` is not set
+        // until the runner itself starts, so between the confirming tap and
+        // this callback every handler is still live -- and a tap already
+        // queued behind the first one can land on `cancel`, which sets
+        // nf_browser_menu to NF_MENU_NONE and logs "nothing was deleted".
+        // Without this the timer would then fire and delete the files anyway,
+        // with both lines in the log and the reader having watched the cancel
+        // take effect.
+        //
+        // Read FRESH here rather than trusted from the capture, which is the
+        // same "ask where am I now, never where I was" discipline
+        // nf_browser_back follows -- `menu` is the capture and
+        // nf_browser_menu is the answer, so they have to agree.
+        if (nf_browser_menu != menu) {
+            nh_log("browser: the confirmed action was dropped -- the %s was closed before it could run (a cancel or a BACK got there first)",
+                   nf_menu_name(menu));
             hop->deleteLater();
             return;
         }
@@ -3433,7 +3484,11 @@ static void nf_bar_command(void *mwc, N3Dialog *dialog, QString const &path, nf_
                     *clip << full;
             }
             nf_browser_clip_cut = cut;
-            snprintf(nf_browser_clip_dir, sizeof nf_browser_clip_dir, "%s", qPrintable(path));
+            // toUtf8() to match the QString::fromUtf8() that reads it back
+            // on the paste confirmation -- the same write/read codec pairing
+            // as nf_browser_cwd's, and wrong for the same reason if it drifts.
+            QByteArray clipUtf8 = path.toUtf8();
+            snprintf(nf_browser_clip_dir, sizeof nf_browser_clip_dir, "%s", clipUtf8.constData());
             // LEAVES SELECT MODE on the way out: the job has moved to the
             // destination folder, and the reader's next action is to navigate
             // there and paste. Staying ticked would leave a selection that a
@@ -3497,7 +3552,23 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
     // read is always this directory once this function has been entered --
     // matching every row/BACK handler being wired only after the listing
     // for THIS path has been built, never before.
-    snprintf(nf_browser_cwd, sizeof nf_browser_cwd, "%s", qPrintable(path));
+    // toUtf8(), NOT qPrintable(). THE WRITE AND THE READ MUST USE THE SAME
+    // CODEC, and until this task nothing compared the two closely enough for
+    // the mismatch to show: qPrintable() is toLocal8Bit(), every read of this
+    // buffer is QString::fromUtf8(), and those are inverses only when the
+    // locale codec happens to be UTF-8 -- Qt 5.2 falls back to Latin-1 under
+    // a C/POSIX locale, which is what an init-spawned Nickel is likely to
+    // have.
+    //
+    // What made it matter is three lines up: the selection-clear compares
+    // `path` against the value read back out of here, so in a folder whose
+    // path is not ASCII the round trip would differ from the original and a
+    // mere rebuild would look like a folder change -- the tick would clear
+    // and select mode would switch itself off. THIS CARD HAS CYRILLIC-NAMED
+    // PDFs under /mnt/onboard/books/, so that is reachable rather than
+    // theoretical.
+    QByteArray cwdUtf8 = path.toUtf8();
+    snprintf(nf_browser_cwd, sizeof nf_browser_cwd, "%s", cwdUtf8.constData());
 
     // See nf_browser_page's own comment: every real navigation (descend,
     // ascend, the initial root call) passes resetPage=true here, because all

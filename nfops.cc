@@ -163,26 +163,17 @@ static nf_op_result nf_op_resolve_dest(QString const& destDir, QString const& sr
         return NF_OP_REFUSED_PATH;
     }
 
-    // The destination FOLDER gets the source rules applied to it minus the
-    // cwd test -- it IS the cwd, so passing it as its own `cwd` would refuse
-    // every paste. Written out rather than reusing nf_path_check_source for
-    // exactly that reason.
-    if (!nf_path_is_clean(dirCanon) ||
-        dirCanon == QStringLiteral(NF_PATH_ROOT) ||
-        !nf_path_is_inside(dirCanon, QStringLiteral(NF_PATH_ROOT)) ||
-        nf_path_is_protected(dirCanon)) {
-        // /mnt/onboard ITSELF is refused as a paste destination, and that is
-        // a judgement rather than an accident: the root is where Nickel's own
-        // .kobo/.adds live, it is the directory a USB session mounts, and a
-        // book dropped straight into it is the mess this browser exists to
-        // help the owner out of. Pasting into any real folder under it works.
+    // The destination FOLDER's own rules -- nf_path_check_dest_dir, in the
+    // pure layer, so this is a tested predicate rather than an ad-hoc chain of
+    // clauses in the one file no host test can reach. It used to be exactly
+    // that chain, re-deriving four of nf_path_check_source's rules by hand;
+    // an inverted clause in it would have failed no test.
+    nf_path_verdict dv = nf_path_check_dest_dir(dirCanon);
+    if (dv != NF_PATH_OK) {
         nh_log("fileops: refused destination FOLDER (%s) -- '%s' (%d chars)",
-               nf_path_verdict_text(nf_path_is_protected(dirCanon) ? NF_PATH_PROTECTED
-                                    : (dirCanon == QStringLiteral(NF_PATH_ROOT) ? NF_PATH_IS_ROOT
-                                                                                : NF_PATH_OUTSIDE_ROOT)),
-               qPrintable(nf_op_base(dirCanon)), dirCanon.length());
+               nf_path_verdict_text(dv), qPrintable(nf_op_base(dirCanon)), dirCanon.length());
         if (why)
-            *why = nf_path_is_protected(dirCanon) ? NF_PATH_PROTECTED : NF_PATH_OUTSIDE_ROOT;
+            *why = dv;
         return NF_OP_REFUSED_PATH;
     }
 
@@ -436,6 +427,31 @@ nf_op_result nf_op_copy(QString const& src, QString const& destDir, QString cons
     if (r != NF_OP_OK) {
         nf_op_drop_temp(tempPath, r == NF_OP_CANCELLED ? "after a cancel" : "after a failure");
         return r;
+    }
+
+    // THE SOURCE MUST STILL BE THE SIZE WE COPIED. `total` was sampled once,
+    // before a copy that for the 820 MB .cbr runs for a minute and a half
+    // with a yield to the event loop in every chunk -- so the source really
+    // can change underneath it (a USB session, another mod, a download
+    // finishing).
+    //
+    // The SHRINK case is already caught inside the loop: a read that returns
+    // zero bytes while `done < total` aborts, which is also what stops the
+    // loop spinning. The GROW case has no such symptom -- the loop simply
+    // stops at the stale `total`, every chunk succeeded, and without this
+    // check a TRUNCATED file would be renamed onto the final name and logged
+    // as "COPY OK". That is precisely what the temp-and-rename scheme exists
+    // to prevent, so it is checked here rather than trusted.
+    //
+    // Refused rather than repaired: copying the extra tail would race the
+    // same writer again, and a file still being written is not a file to
+    // duplicate. The temp is dropped and the source is untouched.
+    qint64 nowSize = QFileInfo(srcCanon).size();
+    if (nowSize != total) {
+        nh_log("fileops: COPY ABORTED at the last step -- the source is now %lld bytes where %lld were copied; it changed while the copy ran, so the partial copy is discarded -- '%s' (%d chars)",
+               (long long)nowSize, (long long)total, qPrintable(name), name.length());
+        nf_op_drop_temp(tempPath, "after the source changed size");
+        return NF_OP_FAILED;
     }
 
     // The second existence check. The window between the first one and here
