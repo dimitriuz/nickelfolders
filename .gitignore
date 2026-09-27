@@ -34,3 +34,8 @@ __pycache__/
 
 # Host test binaries.
 build/
+
+# Superseded process artifacts: the v1 design doc and implementation plan.
+# Kept on disk, not shipped -- NOTES.md and CLAUDE.md are the documents
+# that stayed true as the project outgrew them.
+/docs/superpowers/
