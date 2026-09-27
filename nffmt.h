@@ -597,14 +597,25 @@ int nf_cover_width_px(int heightPx);
                                  // would be visible rather than absorbed
 #define NF_CHROME_BAR_PX   75    // one horizontal chrome bar, same height as a
                                  // text row
-#define NF_CHROME_BARS     2     // the command bar on top and the page bar
+#define NF_CHROME_BARS     2     // the ORDINARY number of chrome bar ROWS: a
+                                 // one-row command bar on top and the page bar
                                  // pinned to the bottom. Both UNCONDITIONAL --
                                  // see the page bar's own comment (nfview.cc)
                                  // for why its ends stay present-but-inert
-                                 // rather than disappearing -- so there is no
-                                 // fewer-bars case to make this conditional on
+                                 // rather than disappearing.
+                                 //
+                                 // NOT a ceiling any more, which is why
+                                 // nf_items_per_page takes the count as an
+                                 // ARGUMENT rather than reading this: the
+                                 // command bar wraps to a SECOND row when its
+                                 // items do not fit side by side
+                                 // (nf_bar_plan_layout, below), and that page
+                                 // costs one item row. This is the value the
+                                 // unwrapped case passes.
 
-// How many item rows fit on one page, for the mode `covers` selects.
+// How many item rows fit on one page, for the mode `covers` selects and for a
+// chrome that occupies `chromeBarRows` bar rows (NF_CHROME_BARS ordinarily;
+// three when the command bar has wrapped -- nf_bar_plan_layout below).
 //
 // THE PAGE SIZE DEPENDS ON THE MODE, NOT ON THE PAGE. That distinction is the
 // whole design and it is easy to collapse by accident later, so: a page of
@@ -639,6 +650,21 @@ int nf_cover_width_px(int heightPx);
 // glance at the numbers suggests -- which is most of the reason the toggle is
 // worth having at all.
 //
+// AND THE SAME TWO, FOR A WRAPPED COMMAND BAR (chromeBarRows = 3, i.e. 225 px
+// of chrome instead of 150). This is the arithmetic the second bar row costs,
+// and the asymmetry in it is the interesting part -- it is NOT one item off
+// each mode:
+//
+//   covers ON.   N * 99 + 3 * 75 <= 1330  ->  N <= (1330 - 225) / 99 = 11.16
+//                -> 11. UNCHANGED, because the covers-on page already had
+//                91 px to spare and a 75 px bar row eats only that slack:
+//                11 * 99 + 225 = 1314, 16 px left. 12 would need 1413.
+//   covers OFF.  N * 75 + 3 * 75 <= 1330  ->  N <= (1330 - 225) / 75 = 14.73
+//                -> 14, one item row lost. 14 * 75 + 225 = 1275, 55 px left
+//                (the same 55 the unwrapped case had, since a bar row and a
+//                text row are the same 75 px -- the row was swapped, not
+//                squeezed). 15 would need 1350.
+//
 // Floored at 1: a firmware whose rows were taller than the whole content area
 // must still show one item rather than an empty listing with working page
 // arrows. COUPLED TO NF_COVER_H_PX above -- change it and this follows
@@ -648,7 +674,105 @@ int nf_cover_width_px(int heightPx);
 // A first device screenshot must COUNT the item rows on a full page, in BOTH
 // modes: if either shows fewer than this returns, the 1330/75/99 terms are
 // what to re-measure, not this quotient.
-int nf_items_per_page(bool covers);
+//
+// `chromeBarRows` is clamped at 0 from below, so a caller that somehow asks
+// for a negative number of bars gets the whole content area rather than a
+// page size inflated by nonsense.
+int nf_items_per_page(bool covers, int chromeBarRows);
+
+// --- the command bar's layout -------------------------------------------
+//
+// THE BAR IS LAID OUT AT NATURAL WIDTHS, and that is a device-measured
+// correction rather than a preference. It used to hand every item an equal
+// share of the width (one QHBoxLayout slot of stretch 1 each) and elide
+// anything that did not fit its share, which on 2026-09-27 produced:
+//
+//     browser: bar item 'sort' is 357 px against a 190 px slot (6 items) -- eliding it
+//     browser: bar item 'BACK' is 178 px against a 163 px slot (7 items) -- eliding it
+//
+// i.e. `< BACK  sort: n...  filter: all  view  select  rescan` on the panel,
+// with the sort state -- the one thing on that bar the owner asked to have
+// SPELLED OUT rather than carried by a caret -- elided into invisibility. The
+// items' natural widths add up to well under the bar; it was the equal slot
+// that broke them. An elided command label is a control whose function cannot
+// be read, which is strictly worse than one more page turn, so:
+//
+//   1. if the items fit side by side at their natural widths, they are laid
+//      out at those widths and the leftover becomes SPACING BETWEEN them;
+//   2. if they do not, the bar WRAPS to a second row (and the page loses one
+//      item row -- nf_items_per_page above has that arithmetic);
+//   3. only if a single row of that wrapped bar still overflows does anything
+//      elide, and then proportionally to what each item asked for rather than
+//      into equal shares.
+//
+// This function is the whole of decisions 1-3 and it is PURE -- widths in,
+// row assignments and per-item budgets out -- so the rule is host-testable
+// even though the widths themselves come from QFontMetrics on the device.
+
+// The most items either bar can hold. SEVEN is the worst case the command bar
+// reaches today (BACK, sort, filter, view, select, rescan and -- only while
+// something is on the clipboard -- paste); eight leaves one spare so the next
+// control added is not also an edit to this line.
+//
+// It lives HERE rather than in nfview.cc (where it used to) because
+// nf_bar_plan below is sized by it and the plan is what the browser reads its
+// layout out of -- two spellings of the same bound is one of them being wrong
+// later.
+#define NF_BAR_MAX_ITEMS 8
+
+// At most TWO bar rows. Not an arbitrary cap: a third row would cost a second
+// item row off the page (NF_CHROME_BAR_PX is the same 75 px as a text row),
+// and a command bar occupying a fifth of the panel to show controls nobody
+// asked to see is a worse answer than eliding the one label that overflows --
+// which is exactly what rule 3 above then does.
+#define NF_BAR_MAX_ROWS 2
+
+// The least horizontal space allowed between two adjacent bar labels, i.e.
+// the width at which two controls stop reading as two.
+//
+// EIGHT, which is about one space at this row font (measured ascent 46 px, so
+// a pixel size near 34 and a space near a quarter of that). It is deliberately
+// the MINIMUM and not the gap that actually gets drawn: the leftover width is
+// spread evenly between the items, so the drawn gap is (avail - sum)/(n-1) and
+// is far larger whenever there is slack. This number only binds at the wrap
+// boundary -- and at that boundary a tight row beats a second bar row that
+// costs an item off every page, which is why it is small.
+//
+// If a device run's bar-geometry line reports a WRAP whose natural total is
+// within a few tens of px of the width, THIS is the number to revisit; the log
+// line prints the total and the gap budget separately so that judgement is
+// made on the measurement rather than on a screenshot.
+#define NF_BAR_MIN_GAP_PX 8
+
+// What nf_bar_plan_layout decides. POD with no constructor, so a caller can
+// leave it a plain local (nfview.cc has no file-scope objects with dynamic
+// initialisers -- CLAUDE.md) and the function fills every field.
+struct nf_bar_plan {
+    int  rows;                        // 1 or NF_BAR_MAX_ROWS
+    int  rowOf[NF_BAR_MAX_ITEMS];     // which bar row item i belongs on, 0-based
+    int  budgetPx[NF_BAR_MAX_ITEMS];  // the px item i's label may occupy: its
+                                      // natural width unless it had to shrink
+    bool elided[NF_BAR_MAX_ITEMS];    // true exactly where budgetPx < natural
+    int  naturalTotalPx;              // every label plus (n-1) minimum gaps, as
+                                      // ONE row -- the number the log prints
+                                      // and the number the fit test is made on
+    bool anyElided;                   // true iff any elided[] is
+};
+
+// Lays `n` items of the given natural label widths into at most
+// NF_BAR_MAX_ROWS rows of `availPx`, per rules 1-3 above.
+//
+// Rows are filled GREEDILY, in order, which is what keeps item 0 -- always
+// this screen's EXIT (nf_bar_commands, nfview.cc) -- on the first row in every
+// case, and keeps the bar's reading order the order the caller asked for. A
+// balanced split was considered and rejected for exactly that: it can push the
+// exit onto the second row for no gain a reader would notice.
+//
+// `n` above NF_BAR_MAX_ITEMS is clamped rather than refused, `naturalPx` may
+// hold zeros, and a non-positive `availPx` (a bar measured before layout) is
+// treated as "everything fits" -- eliding against a width that is not a
+// measurement would hide labels for a reason that is not real.
+void nf_bar_plan_layout(int const *naturalPx, int n, int availPx, nf_bar_plan *out);
 
 // --- the two-form label pieces ------------------------------------------
 //

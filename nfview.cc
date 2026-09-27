@@ -127,6 +127,15 @@
 // A first device screenshot must still COUNT the item rows on a full page, in
 // BOTH modes. If either shows fewer than nf_items_per_page returns, the
 // 1330/75/99 terms in nffmt.h are what to re-measure, not this file.
+//
+// IT ALSO DEPENDS ON THE COMMAND BAR NOW. That bar wraps to a second row when
+// its controls will not fit side by side (nf_bar_plan_layout, nffmt.h), and a
+// bar row is the same 75 px as a text row -- so a wrapped bar costs an item
+// off a covers-OFF page (15 -> 14) and, because the covers-ON page already had
+// 91 px of slack, nothing at all off a covers-ON one (11 -> 11). The row count
+// is measured in nf_browser_go and handed to nf_items_per_page; both
+// arithmetics are written out beside it in nffmt.h, and the per-build log line
+// prints which count this page was sized against.
 
 // PAGINATION, not scrolling -- a deliberate choice, not a shortcut, and
 // the reasoning is load-bearing enough to spell out here so nobody
@@ -382,6 +391,34 @@ static void *nf_progress_label = NULL;
 // nothing -- CLAUDE.md). 256 bytes because that is also nh_log's own silent
 // truncation point, so a message that fits here fits the log too.
 static char nf_op_message[256];
+
+// --- the rescan's own deferred refresh -----------------------------------
+//
+// Three more file-scope PODs, same discipline and same reason as every one
+// above (`nm libnfolders.so | grep GLOBAL__sub_I` must print nothing).
+//
+// WHAT THEY ARE FOR: PlugWorkflowManager::sync() starts a QThread and returns
+// immediately (rescan-archaeology.md section 5), so the rebuild that follows
+// it runs BEFORE the scan has found anything -- which is exactly what the
+// owner reported: "after rescan i have to open other folder and return back to
+// see changes (if not i still see 'not in library')". The fix is to rebuild
+// when Nickel says the scan has FINISHED, and these are what that arriving
+// signal is checked against, because an arbitrary amount of time passes in
+// between and the owner can do anything at all in it.
+
+// The zero-delay QTimer that is BOTH the signal adaptor and the deferred hop.
+// See nf_rescan_arm_refresh for why one object does both jobs.
+static void *nf_rescan_refresh_timer = NULL;
+
+// The dialog a rescan was last started from, and the folder that dialog was
+// showing at the time. ONLY ever COMPARED, never dereferenced as a dialog --
+// so a dialog destroyed since is not a use-after-free here, it is a pointer
+// that no longer equals nf_browser_active_dialog (which Qt's own destroyed()
+// signal nulls). Even the pathological case where a NEW dialog lands on the
+// freed one's address is safe: the comparison then succeeds against the LIVE
+// dialog, which is the one a rebuild would go through anyway.
+static void *nf_rescan_dialog = NULL;
+static char  nf_rescan_cwd[PATH_MAX];
 
 // Lazily-allocated accessors for the two lists. NULL is returned, rather than
 // a reference to something, if the allocation fails -- every caller treats
@@ -1619,6 +1656,16 @@ static QString nf_row_leading_markup(nf_icon_kind kind, QString const& coverPath
 // all silent ones: items stacked at x=0, items at zero width, a bar
 // collapsed to nothing. On a screenshot those are indistinguishable from
 // "the bar did not render"; in the log they are three different lines.
+//
+// THE TWO BARS ARE LAID OUT DIFFERENTLY, and the asymmetry is deliberate.
+// The PAGE bar is three short, fixed labels whose middle one is a centred
+// counter, so equal slots are exactly right for it (nf_bar_add). The COMMAND
+// bar is six or seven labels of wildly different widths, where an equal slot
+// elided a 357 px "sort: name (asc)" into "sort: n..." on the device while
+// "view" sat in an identical slot it needed a third of -- so it lays out at
+// natural widths and wraps to a SECOND bar row rather than eliding
+// (nf_bar_plan_layout, nffmt.h, and nf_bar_add_natural below). A second row
+// costs one item off each page, which nf_items_per_page is told about.
 
 // Allocates, constructs and wires ONE tappable TouchLabel, returning it as
 // the QLabel* every caller here needs anyway (setText/setAlignment are
@@ -1677,18 +1724,11 @@ struct nf_bar_item {
     char const *name;
 };
 
-// SEVEN is the worst case the command bar can reach today: BACK, sort,
-// filter, view, select, rescan and -- only while something is on the
-// clipboard -- paste. Eight leaves one spare so the next control added is not
-// also an edit to this line. Overflow is dropped from the LOG only, never
-// from the bar -- see nf_bar_record.
-//
-// It is also what nf_bar_slot_px below divides the bar by, so a bar that
-// really did overflow this would mis-size its own elision budget as well as
-// losing a log entry; both are best-effort, neither is a correctness bound on
-// the bar itself.
-#define NF_BAR_MAX_ITEMS 8
-
+// NF_BAR_MAX_ITEMS (8, for a worst case of seven) used to be defined here and
+// now lives in nffmt.h, next to nf_bar_plan, which is sized by it: the plan is
+// what this file reads its layout out of, and two spellings of the same bound
+// is one of them being wrong later. Overflow past it is dropped from the LOG
+// only, never from the bar -- see nf_bar_record.
 static void nf_bar_record(nf_bar_item *items, int *n, QWidget *w, char const *name) {
     if (*n >= NF_BAR_MAX_ITEMS)
         return; // logging is best-effort; the widget is already in the layout
@@ -1749,11 +1789,12 @@ static void nf_log_bar_geometry(char const *bar, nf_bar_item const *items, int n
 // bar as one 75 px row. The bars sit inside the outer QVBoxLayout, which
 // already pays the horizontal margins for them.
 //
-// ZERO SPACING for a different reason: the separation between items comes
-// from the equal-width slots each item is given (addWidget(w, 1)) and from
-// each item's own text alignment, so a spacing here would be an invented
-// layout constant doing nothing the slots do not already do -- and every
-// invented layout constant in this project has so far been wrong.
+// ZERO SPACING for a different reason: the separation between items is decided
+// per bar and never here -- the PAGE bar gets it from the equal-width slots
+// each of its three items is given (addWidget(w, 1)), the COMMAND bar from the
+// explicit stretch spacers nf_bar_add_natural puts between its items. A
+// spacing set here would be an invented layout constant on top of both, and
+// every invented layout constant in this project has so far been wrong.
 static QHBoxLayout *nf_new_bar_layout(void) {
     QHBoxLayout *bar = new QHBoxLayout();
     bar->setContentsMargins(0, 0, 0, 0);
@@ -1761,11 +1802,19 @@ static QHBoxLayout *nf_new_bar_layout(void) {
     return bar;
 }
 
-// Puts one finished item into a bar: an equal-width slot (stretch 1, so the
-// slots do not move when a label's text changes -- "< PREV" becoming "no
-// prev" must not shift the page counter beside it), with the item filling its
-// slot so the TAP TARGET is the whole third rather than just the glyphs, and
-// the text aligned within it to give the bar its left/centre/right reading.
+// Puts one finished item into a bar in EQUAL SLOTS: stretch 1, so the slots do
+// not move when a label's text changes -- "< PREV" becoming "no prev" must not
+// shift the page counter beside it -- with the item filling its slot so the
+// TAP TARGET is the whole third rather than just the glyphs, and the text
+// aligned within it to give the bar its left/centre/right reading.
+//
+// THE PAGE BAR'S ROUTE, and now only the page bar's. Equal slots are right
+// there and wrong for the command bar: the page bar's three items are a fixed
+// set of short, stable labels whose middle one is a CENTRED counter, and
+// centring it in the bar is exactly what an equal middle slot does. The
+// command bar's are six or seven labels of wildly different widths, which is
+// what the equal slot elided into uselessness -- see nf_bar_plan_layout
+// (nffmt.h) and nf_bar_add_natural below.
 //
 // Alignment is set on the LABEL, not passed to addWidget: passing it to
 // addWidget shrinks the widget to its sizeHint inside the slot, which would
@@ -1774,6 +1823,39 @@ static void nf_bar_add(QHBoxLayout *bar, nf_bar_item *items, int *n,
                        QLabel *item, char const *name, Qt::Alignment align) {
     item->setAlignment(align | Qt::AlignVCenter);
     bar->addWidget(item, 1);
+    nf_bar_record(items, n, item, name);
+}
+
+// Puts one finished item into a bar at its NATURAL width, with the leftover
+// width of the bar spread between the items as spacing.
+//
+// `first` says whether this is the first item on ITS row; every later item
+// gets a stretch spacer in front of it, so a row of k items has k-1 spacers
+// sharing whatever the labels did not use. That puts the first item hard
+// against the left edge and the last hard against the right, which is the
+// reading the equal-slot version got from its end alignments -- without the
+// equal slots.
+//
+// STRETCH 0 ON THE WIDGET is what makes it natural-width: with the spacers
+// carrying all the stretch, a QLabel's own Preferred policy has nothing to
+// grow into. The one exception is a row holding a SINGLE item, which gets the
+// old full-width fill (stretch 1) instead -- that row is the confirmation
+// screens' `< cancel`, whose whole job is to be the one big tap target on a
+// screen asking a destructive question, and shrinking it to the width of six
+// glyphs would be a regression this task was not asked for.
+//
+// The tap target is otherwise the label's own box: 75 px tall (a full chrome
+// bar row -- the widget fills the bar vertically) by 68-357 px wide for the
+// labels this bar carries, which is a finger-sized target in both directions.
+static void nf_bar_add_natural(QHBoxLayout *bar, nf_bar_item *items, int *n,
+                               QLabel *item, char const *name, bool first, bool alone) {
+    // Alignment is moot for a widget that is exactly its sizeHint, and set
+    // anyway so that an ELIDED label (rule 3, nffmt.h) still reads from its
+    // start rather than from wherever Qt's default put it.
+    item->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+    if (!first)
+        bar->addStretch(1);
+    bar->addWidget(item, alone ? 1 : 0);
     nf_bar_record(items, n, item, name);
 }
 
@@ -1893,13 +1975,13 @@ static char const *nf_cmd_name(nf_cmd cmd) {
     return "bar item";
 }
 
-// The width one bar slot gets, for the elision safety net below. The bar is
-// `n` slots of EQUAL STRETCH (nf_bar_add's addWidget(w, 1)), so each one is
-// a clean fraction of the bar -- the same property the page bar's centred
-// counter already rests on.
-static int nf_bar_slot_px(int rowWidth, int n) {
-    return (n > 0) ? (rowWidth / n) : rowWidth;
-}
+// nf_bar_slot_px -- rowWidth/n, the equal share every command-bar item used to
+// be elided against -- is GONE, not moved. It was the defect: a 357 px "sort:
+// name (asc)" against the 190 px sixth of the bar it was handed, elided to
+// "sort: n...", while "view" sat in an identical 190 px slot it needed a third
+// of. The command bar now lays out at natural widths and wraps rather than
+// elides (nf_bar_plan_layout, nffmt.h); the page bar keeps its equal slots,
+// and has no elision arithmetic because its three labels are short and fixed.
 
 // BROWSE mode's half of the content build: the directory listing, its item
 // rows and the page bar, added to the `layout` nf_browser_go has already put
@@ -1918,8 +2000,15 @@ static int nf_bar_slot_px(int rowWidth, int n) {
 // page bar's geometry may only be READ after setContent -- which happens
 // after this function has returned. nf_browser_go's own comment at the end
 // has why that ordering is the whole point of those two log lines.
+//
+// `chromeBarRows` is how many 75 px bar rows the chrome has already taken off
+// this page: the page bar plus however many rows the command bar wrapped to
+// (nf_bar_plan_layout, nffmt.h). It is PASSED IN rather than recomputed here
+// because the command bar is built by the caller, before the mode dispatch,
+// and its wrap is decided there from the real label widths.
 static void nf_build_listing_content(void *mwc, N3Dialog *dialog, QString const &path,
                                      QWidget *content, QVBoxLayout *layout, int rowWidth,
+                                     int chromeBarRows,
                                      nf_bar_item *pageItems, int *nPageItems) {
     QString const *db = nf_db_name();
     NFMetaCtx ctx;
@@ -2013,17 +2102,20 @@ static void nf_build_listing_content(void *mwc, N3Dialog *dialog, QString const 
     // but a stale value surviving some path this file does not currently
     // have is a clamp, not a crash, which is cheap insurance to keep.
     //
-    // THE PAGE SIZE NOW DEPENDS ON THE MODE (nf_items_per_page, nffmt.h): 11
-    // with covers on, 15 with them off, because an icon row is 75 px where a
-    // cover row is 99. Read ONCE, here, into a local -- every use below is the
-    // same number for this build, and calling the function three times would
-    // invite a future version of it that could answer differently mid-build.
+    // THE PAGE SIZE DEPENDS ON THE MODE AND ON THE CHROME (nf_items_per_page,
+    // nffmt.h): 11 with covers on and 15 with them off against a two-row
+    // chrome, because an icon row is 75 px where a cover row is 99 -- and 11
+    // and 14 when the command bar has wrapped to a second row, which takes
+    // another 75 px off the page. Read ONCE, here, into a local -- every use
+    // below is the same number for this build, and calling the function three
+    // times would invite a future version of it that could answer differently
+    // mid-build.
     //
-    // Turning covers ON shrinks the page, which can leave nf_browser_page past
-    // the end -- the clamp two lines down already handles it, and is the same
-    // clamp a filter that shrinks the listing relies on (nf_menu_select's own
-    // comment). Nothing extra is needed for the toggle.
-    int itemsPerPage = nf_items_per_page(!nf_browser_view.hideCovers);
+    // Turning covers ON shrinks the page, and so does a wrap; either can leave
+    // nf_browser_page past the end -- the clamp two lines down already handles
+    // it, and is the same clamp a filter that shrinks the listing relies on
+    // (nf_menu_select's own comment). Nothing extra is needed for either.
+    int itemsPerPage = nf_items_per_page(!nf_browser_view.hideCovers, chromeBarRows);
     int totalPages = (rows.size() + itemsPerPage - 1) / itemsPerPage;
     if (totalPages < 1)
         totalPages = 1;
@@ -3128,6 +3220,138 @@ static void nf_run_paste(void *mwc, N3Dialog *dialog, QString const &path) {
     nf_browser_go(mwc, dialog, path, false);
 }
 
+// THE SCAN HAS FINISHED: rebuild the listing, if and only if that is still
+// the right thing to do.
+//
+// Reached from PlugWorkflowManager::doneProcessing() via the timer hop in
+// nf_rescan_arm_refresh below, so by the time this runs the tap that started
+// the rescan has fully unwound and an arbitrary amount of time has passed --
+// seconds for a real scan, and the owner can have done anything at all in it.
+// Every check below but the last is about that gap, and every one of them LOGS
+// the decision it made: a refresh that silently does not happen is the exact
+// shape that sent the owner navigating away and back to find out whether it
+// had.
+//
+// CAPTURES NOTHING. It reads the dialog, the folder and the mode out of
+// file-scope state instead, because a captured pointer would be a promise
+// about lifetime that nothing here can keep.
+static void nf_rescan_refresh_now(void) {
+    if (nf_op_busy) {
+        nh_log("rescan: doneProcessing() arrived while a file operation is running -- NOT rebuilding; the operation rebuilds the screen itself when it finishes");
+        return;
+    }
+    if (!nf_rescan_dialog) {
+        // Nickel emits this as part of its own post-USB workflow, so it can
+        // fire when our button was never pressed -- see the comment in
+        // nf_rescan_arm_refresh about why that is CORRECT and must not be
+        // "fixed" by gating on our own button. It is unreachable today only
+        // because the connection is not made until the first rescan.
+        nh_log("rescan: doneProcessing() arrived but no rescan has been started from a screen of ours -- nothing to rebuild");
+        return;
+    }
+    if (nf_browser_active_dialog != nf_rescan_dialog) {
+        nh_log("rescan: doneProcessing() -- NOT rebuilding: the browser screen the rescan was started from is gone");
+        return;
+    }
+    if (nf_browser_menu != NF_MENU_NONE) {
+        // A menu or a confirmation is on screen, so the listing is not, and
+        // rebuilding it now would repaint a screen nobody is looking at (and,
+        // on a confirmation, repaint a question mid-decision). Nothing is
+        // lost: closing either one calls nf_browser_go, which re-reads the
+        // directory and the library rows from scratch.
+        nh_log("rescan: doneProcessing() -- NOT rebuilding: the %s is open, and closing it rebuilds the listing anyway",
+               nf_menu_name(nf_browser_menu));
+        return;
+    }
+    QString cwd = QString::fromUtf8(nf_rescan_cwd);
+    if (cwd != QString::fromUtf8(nf_browser_cwd)) {
+        // A refresh that MOVES you is worse than one that does not happen.
+        // Both sides go through fromUtf8 because nf_browser_cwd is written
+        // with toUtf8 (nf_browser_go's own comment on why the codec has to
+        // match), and this card has Cyrillic-named folders under books/.
+        nh_log("rescan: doneProcessing() -- NOT rebuilding: the reader has navigated away from the folder the rescan was started in");
+        return;
+    }
+
+    void *mwc = MainWindowController__sharedInstance();
+    if (!mwc) {
+        nh_log("rescan: doneProcessing() -- NOT rebuilding: MainWindowController::sharedInstance() returned null");
+        return;
+    }
+
+    nh_log("rescan: doneProcessing() -- REBUILDING '%s' (the scan has finished, so the library rows are now current)",
+           qPrintable(cwd));
+    // Says so on the panel as well as in the log, because the visible change
+    // may be nothing at all -- a scan that found no new files leaves every row
+    // exactly as it was, and "nothing happened" and "the refresh never
+    // happened" are otherwise the same screen.
+    nf_op_say("the library rescan finished -- this folder was refreshed");
+    nf_browser_go(mwc, static_cast<N3Dialog*>(nf_rescan_dialog), cwd, false);
+}
+
+// Wires doneProcessing() up, ONCE for the life of the process, and records
+// which screen and which folder the rescan about to start belongs to.
+//
+// ONE OBJECT DOES BOTH JOBS. nfview.cc already needs two mechanisms here --
+// the hidden-signal-adaptor trick (NickelMenu, src/nickelmenu.cc) to reach a
+// lambda from an old-style SIGNAL() without a moc step of its own, and the
+// zero-delay QTimer hop parented to the APPLICATION that every destructive
+// runner on this screen goes through -- and a QTimer is both: `start()` is one
+// of its own public slots, so `doneProcessing() -> SLOT(start())` is the
+// adaptor, and its `timeout()` is the hop. The alternative, a hidden
+// QPushButton whose clicked() then starts a timer, needs a second object and a
+// QWidget parent that outlives every dialog, which there is none of on this
+// route. The hop itself is not optional: doneProcessing() can be emitted
+// INLINE inside nf_rescan_start() on the "Device is not signed" branch
+// (rescan-archaeology.md section 5.1), and a rebuild from inside that emission
+// would deleteLater() the content widget whose own shim button is still
+// emitting underneath it -- the same use-after-free shape nf_confirm_select's
+// own hop exists to prevent.
+//
+// PARENTED TO THE APPLICATION, never to the dialog or the content, for that
+// same reason one level out: the thing this timer fires into can destroy the
+// dialog, and a timer owned by the dialog would be destroyed while its own
+// timeout() was still being emitted. It is never deleted -- one QTimer for the
+// life of the process is a deliberate, permanent allocation, not a leak
+// somebody should tidy up.
+//
+// CONNECTED ONCE, not once per rescan, so N rescans cannot stack N handlers
+// and rebuild N times; Qt::UniqueConnection (nfnickel.cc) is the belt to this
+// flag's braces. A failed connect deletes the timer and leaves the pointer
+// NULL, so the next rescan RETRIES rather than being silently refresh-less
+// forever.
+//
+// IT WILL ALSO FIRE WHEN WE DID NOT ASK: this is Nickel's own post-USB
+// workflow signal, so a real USB disconnect emits it too. That is harmless and
+// in fact correct -- a rebuild showing fresh data is the right response to a
+// finished scan whoever started it -- and it is deliberately NOT gated on our
+// own button having been pressed. Do not "fix" that; the guards in
+// nf_rescan_refresh_now are what make it safe.
+static void nf_rescan_arm_refresh(N3Dialog *dialog, QString const &path) {
+    nf_rescan_dialog = dialog;
+    QByteArray cwdUtf8 = path.toUtf8(); // toUtf8, matching nf_browser_cwd's own write
+    snprintf(nf_rescan_cwd, sizeof nf_rescan_cwd, "%s", cwdUtf8.constData());
+
+    if (nf_rescan_refresh_timer)
+        return; // already wired for the life of this process
+
+    QTimer *hop = new QTimer(QCoreApplication::instance());
+    hop->setSingleShot(true);
+    hop->setInterval(0); // start() with no argument uses this
+    if (!nf_rescan_connect_done(hop, SLOT(start()))) {
+        // nfnickel.cc has already logged which of the two causes it was.
+        // Deleted rather than kept, so a later rescan tries again instead of
+        // this one failure making the refresh permanently unavailable.
+        nh_log("rescan: the listing will NOT refresh itself when this scan finishes -- reopen the folder to see the result");
+        delete hop;
+        return;
+    }
+    QObject::connect(hop, &QTimer::timeout, [] {
+        nf_rescan_refresh_now();
+    });
+    nf_rescan_refresh_timer = hop;
+}
+
 // RESCAN, after the confirmation screen has named the Wi-Fi consequence.
 // No progress screen and nothing to cancel: what the owner sees next is
 // Nickel's own post-USB workflow, not this mod.
@@ -3152,12 +3376,26 @@ static void nf_run_paste(void *mwc, N3Dialog *dialog, QString const &path) {
 static void nf_run_rescan(void *mwc, N3Dialog *dialog, QString const &path) {
     nf_browser_menu = NF_MENU_NONE;
 
+    // BEFORE sync(), not after, and that ordering is load-bearing: on the
+    // "Device is not signed" branch doneProcessing() is emitted INLINE inside
+    // nf_rescan_start() below, so a connection made afterwards would miss the
+    // only notification that scan is ever going to send. It also records which
+    // screen and which folder this rescan belongs to, which is what the
+    // handler checks the world against when it eventually fires.
+    nf_rescan_arm_refresh(dialog, path);
+
     nf_op_busy = true;
     bool started = nf_rescan_start();
     nf_op_busy = false;
 
     if (started)
-        nf_op_say("rescan started -- it runs in the background; Wi-Fi comes on when it finishes");
+        // Says the listing refreshes ITSELF, because the alternative reading
+        // -- "it is done, and my rows still say [not in library]" -- is the
+        // exact misunderstanding this whole change exists to remove. Nothing
+        // is left waiting on the signal, though: this message and the rebuild
+        // below stand on their own if doneProcessing() never arrives
+        // (rescan-archaeology.md section 5.1's silent-no-op branch).
+        nf_op_say("rescan started -- it runs in the background; this folder refreshes itself when it finishes, and Wi-Fi comes on");
     else
         nf_op_say("rescan unavailable on this firmware -- nothing was run");
 
@@ -3598,9 +3836,12 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
     // picture. The items-per-page number rides along because it is DERIVED
     // from one of them and is the single easiest thing to check a screenshot
     // against: count the rows.
-    nh_log("browser: view -- %s (%d items/page)",
-           qPrintable(nf_view_flags_summary(nf_browser_view)),
-           nf_items_per_page(!nf_browser_view.hideCovers));
+    //
+    // LOGGED AFTER THE COMMAND BAR, not here with the mode line, and that
+    // ordering is this task's: the page size now depends on how many rows the
+    // command bar wrapped to, which is not known until the bar's labels have
+    // been measured. Logged here it would print the unwrapped answer and be
+    // off by one item on exactly the screens where the number matters.
 
     QWidget *content = new QWidget();
     QVBoxLayout *layout = new QVBoxLayout(content);
@@ -3627,7 +3868,7 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
            layoutMargins.left(), layoutMargins.right(),
            NF_PANEL_VISIBLE_WIDTH_PX);
 
-    // --- THE COMMAND BAR, one row across the top ------------------------
+    // --- THE COMMAND BAR, one row across the top (two if it does not fit) --
     //
     //     < BACK     sort: name (asc)     filter: all     view     select     rescan
     //
@@ -3636,35 +3877,47 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
     // above nf_new_touch_row for why each item must be its own TouchLabel
     // rather than one label with hot zones.
     //
-    // THE ITEM SET IS A TABLE NOW (nf_bar_commands, above), not a run of
-    // blocks, and that changed with this task rather than for tidiness: the
-    // bar's contents depend on the mode (browse / select / a confirmation),
-    // on whether anything is on the clipboard, and -- for `rescan` -- on
-    // whether a libnickel symbol resolved. Alignment in particular is a
-    // property of the SET ("first left, last right, the rest centred") and
-    // cannot be decided by a block that does not know what follows it, which
-    // is exactly the bug the old shape would have grown: when `view:` became
-    // the fourth item, the filter item's alignment had to be edited by hand.
+    // THE ITEM SET IS A TABLE (nf_bar_commands, above), not a run of blocks,
+    // because the bar's contents depend on the mode (browse / select / a
+    // confirmation), on whether anything is on the clipboard, and -- for
+    // `rescan` -- on whether a libnickel symbol resolved.
+    //
+    // LAID OUT AT NATURAL WIDTHS, wrapping to a second row rather than
+    // eliding, and that is this task's correction to a device-measured defect:
+    // the bar used to hand every item an equal share (one stretch-1 slot each)
+    // and elide anything wider, which turned "sort: name (asc)" -- 357 px
+    // against a 190 px sixth of the bar -- into "sort: n...", i.e. hid the one
+    // piece of state the owner had just asked to have spelled out. The whole
+    // decision is nf_bar_plan_layout (nffmt.h), which is pure and host-tested;
+    // this loop only supplies the measured widths and renders its answer.
     //
     // The `|` separators in the brief's sketch are NOT drawn: a literal "|"
     // would either be its own TouchLabel (a tap target that does nothing) or
     // live inside a neighbour's text (widening that control's label for no
-    // reason). The separation is the equal-width slots and the
-    // left/centre/right text alignment instead.
+    // reason). The separation is the stretch spacers between the items.
     //
     // BUILT IN EVERY MODE, and that is a requirement rather than a
     // convenience: the exit lives in this bar, and a screen that could be
     // entered and not left would be a dead end on the owner's daily-use
     // device -- the same dead end getDialog's own X button already is on this
     // route. The FIRST item is always that exit, whatever it is called in the
-    // mode it appears in (nf_bar_commands).
-    QHBoxLayout *cmdBar   = nf_new_bar_layout();
-    nf_bar_item  cmdItems[NF_BAR_MAX_ITEMS];
-    int          nCmdItems = 0;
-
+    // mode it appears in (nf_bar_commands), and greedy row filling keeps it on
+    // the FIRST bar row even when the bar wraps (nf_bar_plan_layout).
     nf_cmd cmds[NF_BAR_MAX_ITEMS];
     int    nCmds = nf_bar_commands(cmds);
-    int    slotPx = nf_bar_slot_px(rowWidth, nCmds);
+
+    // EVERY ITEM IS BUILT AND MEASURED BEFORE ANY OF THEM IS PLACED, which is
+    // the ordering the natural-width layout forces: a label's width comes from
+    // QFontMetrics on the widget's own font, so the bar cannot know whether it
+    // fits until every widget exists. The four parallel arrays are locals of
+    // this one function and are indexed by `nBar`, which counts the items that
+    // were actually ALLOCATED -- an item whose calloc failed is skipped here
+    // and must not leave a hole for the plan to trip over.
+    QLabel  *barItem[NF_BAR_MAX_ITEMS];
+    QString  barLabel[NF_BAR_MAX_ITEMS];
+    int      barNatural[NF_BAR_MAX_ITEMS];
+    nf_cmd   barCmd[NF_BAR_MAX_ITEMS];
+    int      nBar = 0;
 
     for (int i = 0; i < nCmds; i++) {
         nf_cmd cmd = cmds[i];
@@ -3681,42 +3934,112 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
                        nf_cmd_name(cmd));
             continue;
         }
-
-        // ALIGNMENT IS DECIDED BY POSITION IN THE SET, not by which control
-        // it is: the ends read left and right and everything between centres,
-        // so the bar reads as a bar at four items and at seven.
-        Qt::Alignment align = (i == 0)            ? Qt::AlignLeft
-                            : (i == nCmds - 1)    ? Qt::AlignRight
-                                                  : Qt::AlignHCenter;
-
-        // AN ELISION SAFETY NET, and it is a net rather than a layout rule.
-        // Every bar label this project has measured is 60-150 px against a
-        // slot that is 1196/n -- 170 px even at seven items -- so nothing
-        // should ever elide here. What it defends against is the one way a
-        // horizontal bar fails badly: a QLabel's minimum size is its whole
-        // text, so a label wider than its slot forces the layout wider than
-        // the panel and pushes the items at the end off the screen entirely.
-        // Bounding each label to its own slot makes that impossible by
-        // construction, and the log line says when it fired, so a device run
-        // reads "the bar elided" rather than "the last control vanished".
-        QString label = nf_cmd_label(cmd);
-        QFontMetrics fm(item->font());
-        int labelPx = fm.width(label);
-        if (slotPx > 0 && labelPx > slotPx) {
-            nh_log("browser: bar item '%s' is %d px against a %d px slot (%d items) -- eliding it",
-                   nf_cmd_name(cmd), labelPx, slotPx, nCmds);
-            label = fm.elidedText(label, Qt::ElideRight, slotPx);
-        }
         item->setTextFormat(Qt::PlainText); // never AutoText -- a label must not pick its own render mode
-        item->setText(label);
 
         QObject::connect(shim, &QPushButton::clicked, [mwc, dialog, path, cmd] {
             nf_bar_command(mwc, dialog, path, cmd);
         });
-        nf_bar_add(cmdBar, cmdItems, &nCmdItems, item, nf_cmd_name(cmd), align);
+
+        barItem[nBar]    = item;
+        barLabel[nBar]   = nf_cmd_label(cmd);
+        barNatural[nBar] = QFontMetrics(item->font()).width(barLabel[nBar]);
+        barCmd[nBar]     = cmd;
+        nBar++;
     }
 
-    layout->addLayout(cmdBar);
+    nf_bar_plan plan;
+    nf_bar_plan_layout(barNatural, nBar, rowWidth, &plan);
+
+    // THE LINE THAT DIAGNOSED THE DEFECT, kept and extended. It used to fire
+    // only when an item elided, which said which control had been cut without
+    // ever saying that the SET fitted comfortably and the slot arithmetic was
+    // what did not -- so this now prints, every build, the natural total, how
+    // much of it is gap budget, the width it was measured against, and which
+    // of the three outcomes the plan chose.
+    nh_log("browser: command bar -- %d item(s), natural total %d px (labels + %d px of minimum gaps) against %d px: %s%s",
+           nBar, plan.naturalTotalPx,
+           nBar > 1 ? (nBar - 1) * NF_BAR_MIN_GAP_PX : 0, rowWidth,
+           plan.rows > 1 ? "WRAPPED to 2 rows" : "fits on ONE row",
+           plan.anyElided ? " -- and STILL had to elide (see the per-item lines)" : "");
+
+    // A WRAPPED COMMAND BAR COSTS ONE ITEM ROW, and the page size has to know:
+    // the page bar plus however many rows this bar took. Computed here, where
+    // the plan is, and handed to the listing build -- nf_items_per_page's own
+    // comment (nffmt.h) has both modes' arithmetic for two rows and for three.
+    int chromeBarRows = plan.rows + 1;
+
+    // The view-flags line, moved down from the top of this function so that
+    // its items/page number is the one this build will actually use (see the
+    // comment up there for why it exists at all). The bar-row count is the
+    // LISTING'S charge -- a submenu has no page bar, and no page size either,
+    // so the number is only ever spent in browse mode.
+    nh_log("browser: view -- %s (%d items/page against %d chrome bar row(s))",
+           qPrintable(nf_view_flags_summary(nf_browser_view)),
+           nf_items_per_page(!nf_browser_view.hideCovers, chromeBarRows),
+           chromeBarRows);
+
+    // ONE QHBoxLayout PER BAR ROW. Both go into the outer QVBoxLayout in
+    // order, so a wrapped bar reads top-to-bottom the way the item set does.
+    QHBoxLayout *cmdBar[NF_BAR_MAX_ROWS];
+    nf_bar_item  cmdItems[NF_BAR_MAX_ROWS][NF_BAR_MAX_ITEMS];
+    int          nCmdItems[NF_BAR_MAX_ROWS];
+    int          nOnRow[NF_BAR_MAX_ROWS];
+    int          nPlacedOnRow[NF_BAR_MAX_ROWS];
+    for (int r = 0; r < NF_BAR_MAX_ROWS; r++) {
+        cmdBar[r]       = NULL;
+        nCmdItems[r]    = 0;
+        nOnRow[r]       = 0;
+        nPlacedOnRow[r] = 0;
+    }
+    for (int r = 0; r < plan.rows; r++)
+        cmdBar[r] = nf_new_bar_layout();
+    // How many land on each row, known before any is placed, because
+    // nf_bar_add_natural needs to know whether an item is ALONE on its row
+    // (the confirmation screens' single `< cancel`, which keeps the old
+    // full-width fill so the one control on a destructive question stays a
+    // big target).
+    //
+    // BOUNDS-CHECKED against plan.rows, which nf_bar_plan_layout guarantees
+    // every rowOf falls inside. Checked anyway because the cost of being wrong
+    // here is a NULL cmdBar[] dereference on the owner's daily-use device, and
+    // an item quietly dropped from the bar is a survivable failure where that
+    // is not. Both loops must agree about which items they skip, so the same
+    // test is written once, here, and the placement loop below re-reads it.
+    for (int i = 0; i < nBar; i++) {
+        if (plan.rowOf[i] < 0 || plan.rowOf[i] >= plan.rows) {
+            nh_log("browser: bar item '%s' was planned onto row %d of %d -- dropping it rather than following a bad index",
+                   nf_cmd_name(barCmd[i]), plan.rowOf[i], plan.rows);
+            continue;
+        }
+        nOnRow[plan.rowOf[i]]++;
+    }
+
+    for (int i = 0; i < nBar; i++) {
+        int r = plan.rowOf[i];
+        if (r < 0 || r >= plan.rows)
+            continue; // already logged above
+        QString label = barLabel[i];
+        if (plan.elided[i]) {
+            // RULE 3 ONLY -- the fallback, not the normal case any more. It is
+            // reachable when even a wrapped row overflows, i.e. when a single
+            // label is wider than the whole bar. Logged per item, as before,
+            // because "the bar elided" and "the last control vanished" look
+            // identical on a screenshot.
+            QFontMetrics fm(barItem[i]->font());
+            nh_log("browser: bar item '%s' is %d px against a %d px budget on bar row %d of %d -- eliding it",
+                   nf_cmd_name(barCmd[i]), barNatural[i], plan.budgetPx[i],
+                   r + 1, plan.rows);
+            label = fm.elidedText(label, Qt::ElideRight, plan.budgetPx[i]);
+        }
+        barItem[i]->setText(label);
+        nf_bar_add_natural(cmdBar[r], cmdItems[r], &nCmdItems[r], barItem[i],
+                           nf_cmd_name(barCmd[i]),
+                           nPlacedOnRow[r] == 0, nOnRow[r] == 1);
+        nPlacedOnRow[r]++;
+    }
+
+    for (int r = 0; r < plan.rows; r++)
+        layout->addLayout(cmdBar[r]);
 
     // THE MODE DISPATCH. Everything above is shared by every mode; below,
     // exactly one of them runs. `pageItems` is declared out here rather than
@@ -3727,7 +4050,7 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
     int         nPageItems = 0;
     if (nf_browser_menu == NF_MENU_NONE)
         nf_build_listing_content(mwc, dialog, path, content, layout, rowWidth,
-                                 pageItems, &nPageItems);
+                                 chromeBarRows, pageItems, &nPageItems);
     else if (nf_menu_is_confirm(nf_browser_menu))
         nf_build_confirm_content(mwc, dialog, path, content, layout, rowWidth);
     else
@@ -3803,8 +4126,17 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
     // layout is new on this screen, and all three of its plausible failures
     // (items stacked at x=0, zero-width items, a collapsed bar) look
     // identical on a screenshot and different in these two lines.
+    //
+    // ONE LINE PER COMMAND-BAR ROW, not one line for the whole bar: the
+    // per-item format carries x/width/height but not y, so a wrapped bar
+    // logged as a single line would show two items at the same x and read as
+    // the "items stacked" failure above. The row is in the line's own name
+    // instead -- which is also the second, independent confirmation that the
+    // wrap the plan decided is the wrap Qt actually built.
     int laidOutWidth = content->width();
-    nf_log_bar_geometry("command", cmdItems,  nCmdItems,  laidOutWidth);
+    nf_log_bar_geometry("command", cmdItems[0], nCmdItems[0], laidOutWidth);
+    if (plan.rows > 1)
+        nf_log_bar_geometry("command row 2", cmdItems[1], nCmdItems[1], laidOutWidth);
     // No page bar in a submenu, so no line for one -- nf_log_bar_geometry's
     // own zero-item text reads "every allocation failed", which would be a
     // false accusation here rather than a missing measurement.

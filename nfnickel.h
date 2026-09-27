@@ -491,4 +491,53 @@ bool nf_rescan_available(void);
 // rescan-archaeology.md, section 10.
 bool nf_rescan_start(void);
 
+// Connects PlugWorkflowManager::doneProcessing() -- the signal at the very END
+// of Nickel's post-USB workflow, i.e. after the scan has actually finished and
+// the database has been written -- to `slot` on `receiver`.
+//
+// WHY THIS EXISTS: sync() starts a QThread and returns at once, so a listing
+// rebuilt straight after it can never show what the scan found. The owner's
+// report was exactly that shape -- "after rescan i have to open other folder
+// and return back to see changes (if not i still see 'not in library')". This
+// is the signal that says the data is ready.
+//
+// THE CONNECT IS STRING-BASED, on purpose and not for want of a better way.
+// The new-style pointer-to-member form would need a real declaration of
+// PlugWorkflowManager and of its signal, which is precisely what "Nickel's
+// classes stay opaque" (CLAUDE.md) forbids; the string form resolves through
+// the SENDER'S OWN metaobject at runtime, so nothing here declares a Nickel
+// type, needs a moc step, or adds an nh_dlsym entry. `receiver` and `slot`
+// are the caller's, and the caller reaches its own lambda through the
+// hidden-signal-adaptor trick NickelMenu documents (src/nickelmenu.cc) and
+// nfview.cc already uses for every row tap.
+//
+// Qt::UniqueConnection is passed, so calling this repeatedly cannot stack
+// handlers and rebuild N times after the Nth rescan. A second call with the
+// same receiver and slot therefore returns FALSE having connected nothing,
+// which is success, not failure -- the caller connects once and keeps the
+// flag rather than reading this return as an error.
+//
+// MEASURED, 4.38.23684: _ZN19PlugWorkflowManager14doneProcessingEv is a real
+// moc signal (its body is a tail call to QMetaObject::activate(this,
+// &PlugWorkflowManager::staticMetaObject, 1, 0) at 0xf34a78, PLT stub
+// 0x6800c4 resolved), and _ZTI19PlugWorkflowManager is a
+// __cxxabiv1::__si_class_type_info whose single base is _ZTI7QObject -- so
+// PlugWorkflowManager derives DIRECTLY from QObject, its QObject subobject is
+// at offset 0, and the cast this function makes needs no arithmetic. That is
+// the same kind of check `getById`'s missing `this` needed and did not get.
+//
+// IT MAY NEVER FIRE. rescan-archaeology.md section 5.1 records a branch that
+// logs "Device is not signed, it will not sync FS." and finishes with nothing
+// scanned -- and, worse for a caller, that branch emits finished() INLINE, so
+// doneProcessing can arrive DURING nf_rescan_start() rather than after it.
+// Nothing may be left waiting on this signal: whatever the rescan shows while
+// it runs has to resolve on its own.
+//
+// IT ALSO FIRES WHEN WE DID NOT ASK. This is Nickel's own post-USB workflow
+// signal, so a real USB disconnect emits it too. That is harmless and correct
+// -- fresh data is fresh data -- so a caller must guard on whether a rebuild
+// is SAFE (is my screen still there, is the owner still in the same folder),
+// never on whether our own button was the cause.
+bool nf_rescan_connect_done(QObject *receiver, char const *slot);
+
 #endif

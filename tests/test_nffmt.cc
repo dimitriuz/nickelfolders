@@ -1757,12 +1757,12 @@ static void test_items_per_page_for_both_modes(void) {
     CHECK(NF_FONT_ASCENT_PX + NF_FONT_DESCENT_PX == NF_TEXT_ROW_PX);
     CHECK(NF_COVER_H_PX > NF_FONT_ASCENT_PX);
 
-    int withCovers = nf_items_per_page(true);
+    int withCovers = nf_items_per_page(true, NF_CHROME_BARS);
     CHECK(withCovers == 11);
     CHECK(withCovers * coverRow + chrome <= NF_CONTENT_AREA_PX);        // 1239 <= 1330
     CHECK((withCovers + 1) * coverRow + chrome > NF_CONTENT_AREA_PX);   // 1338 >  1330
 
-    int noCovers = nf_items_per_page(false);
+    int noCovers = nf_items_per_page(false, NF_CHROME_BARS);
     CHECK(noCovers == 15);
     CHECK(noCovers * NF_TEXT_ROW_PX + chrome <= NF_CONTENT_AREA_PX);      // 1275 <= 1330
     CHECK((noCovers + 1) * NF_TEXT_ROW_PX + chrome > NF_CONTENT_AREA_PX); // 1350 >  1330
@@ -1774,6 +1774,264 @@ static void test_items_per_page_for_both_modes(void) {
     CHECK(noCovers > withCovers);
     // Taller rows can never fit MORE of themselves.
     CHECK(avail / coverRow <= avail / NF_TEXT_ROW_PX);
+}
+
+// THE WRAPPED-BAR ARITHMETIC, which is what a second command-bar row costs.
+// The interesting part is that it is NOT symmetric -- one mode loses an item
+// row and the other does not -- so checking only that "the page got smaller"
+// would pass against a function that took one off both.
+static void test_items_per_page_pays_for_a_wrapped_command_bar(void) {
+    int const chrome3 = 3 * NF_CHROME_BAR_PX;                // 225
+    int const coverRow = NF_COVER_H_PX + NF_FONT_DESCENT_PX; // 99
+
+    // covers ON: unchanged at 11, because the unwrapped page already had 91 px
+    // of slack and a 75 px bar row eats only that.
+    int wrappedCovers = nf_items_per_page(true, 3);
+    CHECK(wrappedCovers == 11);
+    CHECK(wrappedCovers == nf_items_per_page(true, NF_CHROME_BARS));
+    CHECK(wrappedCovers * coverRow + chrome3 <= NF_CONTENT_AREA_PX);      // 1314 <= 1330
+    CHECK((wrappedCovers + 1) * coverRow + chrome3 > NF_CONTENT_AREA_PX); // 1413 >  1330
+
+    // covers OFF: 15 -> 14, one item row swapped for the bar row (both 75 px).
+    int wrappedNoCovers = nf_items_per_page(false, 3);
+    CHECK(wrappedNoCovers == 14);
+    CHECK(wrappedNoCovers == nf_items_per_page(false, NF_CHROME_BARS) - 1);
+    CHECK(wrappedNoCovers * NF_TEXT_ROW_PX + chrome3 <= NF_CONTENT_AREA_PX);      // 1275 <= 1330
+    CHECK((wrappedNoCovers + 1) * NF_TEXT_ROW_PX + chrome3 > NF_CONTENT_AREA_PX); // 1350 >  1330
+
+    // THE NEGATIVE CONTROL for the new argument: it must actually be read.
+    // A function that ignored it would still satisfy both exact answers above
+    // (they are 11 and 14 against 11 and 15), so the discriminating input is
+    // one no bar could produce -- a chrome so tall nothing fits -- which must
+    // hit the floor rather than returning a two-bar answer.
+    CHECK(nf_items_per_page(false, 100) == 1);
+    CHECK(nf_items_per_page(true, 100) == 1);
+    // ...and no chrome at all must fit MORE than two bars' worth, which a
+    // function ignoring the argument could not manage either.
+    CHECK(nf_items_per_page(false, 0) > nf_items_per_page(false, NF_CHROME_BARS));
+    // A nonsense negative count is clamped to zero, never used to invent area.
+    CHECK(nf_items_per_page(false, -5) == nf_items_per_page(false, 0));
+}
+
+// --- the command bar's layout -------------------------------------------
+
+// The measurement that produced this whole change, replayed as a test. These
+// are the widths the 2026-09-27 device log printed, or the brief's own
+// estimates where it did not, and the assertion is the thing the equal-slot
+// bar got WRONG: six items whose labels add up to well under the bar must all
+// render in full.
+static void test_browse_bar_fits_on_one_row_at_natural_widths(void) {
+    // BACK, sort, filter, view, select, rescan. 178/357/187 are measured off
+    // the device log; the other three are conservative over-estimates, so a
+    // pass here is a pass for the real, narrower ones too.
+    int const natural[6] = { 178, 357, 187, 120, 140, 160 };
+    int const sum = 178 + 357 + 187 + 120 + 140 + 160; // 1142
+    int const avail = 1196;                            // 1264 panel less 34+34 margins
+
+    nf_bar_plan plan;
+    nf_bar_plan_layout(natural, 6, avail, &plan);
+
+    CHECK(plan.rows == 1);
+    CHECK(plan.naturalTotalPx == sum + 5 * NF_BAR_MIN_GAP_PX);
+    CHECK(plan.naturalTotalPx <= avail);
+    // THE DEFECT ITSELF: nothing may be elided, and in particular not the
+    // sort label, which is item 1 and the widest of the six. Under the old
+    // equal-slot rule it was 357 px against a 190 px slot.
+    CHECK(!plan.anyElided);
+    for (int i = 0; i < 6; i++) {
+        CHECK(plan.rowOf[i] == 0);
+        CHECK(!plan.elided[i]);
+        CHECK(plan.budgetPx[i] == natural[i]);
+    }
+    // ...and the old rule really would have cut it, which is what makes the
+    // check above non-vacuous rather than a tautology about a wide bar.
+    CHECK(natural[1] > avail / 6);
+}
+
+// Seven items -- browse plus `paste` while the clipboard is full -- is the
+// case that does not fit, and the required answer is a WRAP, never an elide.
+static void test_a_bar_that_does_not_fit_wraps_rather_than_eliding(void) {
+    int const natural[7] = { 178, 357, 187, 120, 140, 160, 195 };
+    int const avail = 1196;
+
+    nf_bar_plan plan;
+    nf_bar_plan_layout(natural, 7, avail, &plan);
+
+    CHECK(plan.naturalTotalPx > avail); // the premise: it genuinely does not fit
+    CHECK(plan.rows == 2);
+    CHECK(plan.rows <= NF_BAR_MAX_ROWS);
+    // Nothing is elided, because two rows are enough.
+    CHECK(!plan.anyElided);
+    for (int i = 0; i < 7; i++)
+        CHECK(plan.budgetPx[i] == natural[i]);
+
+    // THE EXIT STAYS ON THE FIRST ROW. It is always item 0 (nf_bar_commands)
+    // and a screen that could be entered and not left is the one thing this
+    // browser may not become.
+    CHECK(plan.rowOf[0] == 0);
+    // Rows are filled in order and never interleave: once an item is on row 1,
+    // no later item goes back to row 0.
+    for (int i = 1; i < 7; i++)
+        CHECK(plan.rowOf[i] >= plan.rowOf[i - 1]);
+    // Both rows are non-empty -- a "wrap" that put nothing on the second row
+    // would report rows == 2 and cost an item off the page for nothing.
+    int onRow0 = 0, onRow1 = 0;
+    for (int i = 0; i < 7; i++)
+        (plan.rowOf[i] == 0 ? onRow0 : onRow1)++;
+    CHECK(onRow0 > 0);
+    CHECK(onRow1 > 0);
+    CHECK(onRow0 + onRow1 == 7);
+    // Each row fits: its labels plus the minimum gaps between them.
+    for (int r = 0; r < plan.rows; r++) {
+        int k = 0, w = 0;
+        for (int i = 0; i < 7; i++) {
+            if (plan.rowOf[i] != r)
+                continue;
+            k++;
+            w += plan.budgetPx[i];
+        }
+        CHECK(w + (k - 1) * NF_BAR_MIN_GAP_PX <= avail);
+    }
+}
+
+// Rule 3: elision is the LAST resort, reached only when even a wrapped row
+// overflows -- i.e. when one label is wider than the whole bar.
+static void test_elision_is_the_last_resort_and_is_proportional(void) {
+    // One absurd label and two ordinary ones, against a narrow bar. Two rows
+    // cannot save this, so something has to shrink.
+    int const natural[3] = { 900, 300, 200 };
+    int const avail = 400;
+
+    nf_bar_plan plan;
+    nf_bar_plan_layout(natural, 3, avail, &plan);
+
+    CHECK(plan.anyElided);
+    CHECK(plan.rows == NF_BAR_MAX_ROWS); // it wrapped first, and still could not fit
+    // Every budget is positive -- an unreadable label is bad, a zero-width one
+    // is a control that has vanished.
+    for (int i = 0; i < 3; i++) {
+        CHECK(plan.budgetPx[i] >= 1);
+        CHECK(plan.budgetPx[i] <= natural[i]);
+        CHECK(plan.elided[i] == (plan.budgetPx[i] < natural[i]));
+    }
+    // The 900 px item is alone on row 0 and is cut to the whole bar.
+    CHECK(plan.rowOf[0] == 0);
+    CHECK(plan.budgetPx[0] == avail);
+    CHECK(plan.elided[0]);
+
+    // PROPORTIONALITY, on the row that really does share. Items 1 and 2 (300
+    // and 200) are both on row 1, which holds 500 px of label against
+    // 400 - 8 = 392 px of room, so both shrink -- and the wider one keeps
+    // more. Under the equal shares this replaced they would BOTH have been cut
+    // to 196, i.e. the 200 px label would have been elided to make room for
+    // nothing.
+    CHECK(plan.rowOf[1] == 1);
+    CHECK(plan.rowOf[2] == 1);
+    CHECK(plan.elided[1]);
+    CHECK(plan.elided[2]);
+    CHECK(plan.budgetPx[1] > plan.budgetPx[2]);
+    CHECK(plan.budgetPx[2] > avail / 3); // strictly better than an equal share
+                                         // would have left the narrower one
+    // The row's budgets plus its one gap fit the bar, which is the whole point
+    // of shrinking them.
+    CHECK(plan.budgetPx[1] + plan.budgetPx[2] + NF_BAR_MIN_GAP_PX <= avail);
+    // The exact shares, so a changed formula fails here rather than being
+    // absorbed: 300*392/500 = 235 and 200*392/500 = 156.
+    CHECK(plan.budgetPx[1] == 235);
+    CHECK(plan.budgetPx[2] == 156);
+}
+
+// THE NEGATIVE CONTROL for the whole plan: inputs that must NOT elide and must
+// NOT wrap, so that a pass on the two cases above is known to mean something.
+// A function that returned "wrapped and elided" unconditionally would satisfy
+// every assertion about the overflow cases and fail every one of these.
+static void test_bar_plan_leaves_a_comfortable_bar_alone(void) {
+    // Four short labels against the full bar: the ordinary select-mode shape.
+    int const roomy[4] = { 120, 100, 80, 90 };
+    nf_bar_plan plan;
+    nf_bar_plan_layout(roomy, 4, 1196, &plan);
+    CHECK(plan.rows == 1);
+    CHECK(!plan.anyElided);
+    for (int i = 0; i < 4; i++)
+        CHECK(plan.budgetPx[i] == roomy[i]);
+
+    // Exactly at the boundary: the natural total equal to the width fits, and
+    // one px more wraps. An off-by-one in the comparison is otherwise
+    // invisible, because both sides look like "it fits".
+    int const tight[2] = { 100, 100 };
+    int const total = 200 + NF_BAR_MIN_GAP_PX;
+    nf_bar_plan exact, over;
+    nf_bar_plan_layout(tight, 2, total, &exact);
+    CHECK(exact.rows == 1);
+    CHECK(!exact.anyElided);
+    nf_bar_plan_layout(tight, 2, total - 1, &over);
+    CHECK(over.rows == 2);
+    CHECK(!over.anyElided);
+
+    // A single item, alone and comfortable -- the confirmation screens' bar.
+    int const one[1] = { 150 };
+    nf_bar_plan single;
+    nf_bar_plan_layout(one, 1, 1196, &single);
+    CHECK(single.rows == 1);
+    CHECK(single.naturalTotalPx == 150); // no gaps: a gap is charged per JOIN
+    CHECK(!single.anyElided);
+    CHECK(single.rowOf[0] == 0);
+}
+
+// The degenerate inputs, each of which has a defined answer rather than
+// whatever the stack happened to hold: the plan is filled into an
+// uninitialised local, so a field left unwritten would be read as garbage and
+// rowOf garbage in particular would index a bar row that does not exist.
+static void test_bar_plan_defines_every_degenerate_input(void) {
+    nf_bar_plan plan;
+
+    // A null output must not be written through at all.
+    nf_bar_plan_layout(NULL, 0, 1196, NULL); // must not crash
+
+    // No items: one empty row, no total, nothing elided.
+    for (int i = 0; i < NF_BAR_MAX_ITEMS; i++)
+        plan.rowOf[i] = 999;
+    nf_bar_plan_layout(NULL, 3, 1196, &plan);
+    CHECK(plan.rows == 1);
+    CHECK(plan.naturalTotalPx == 0);
+    CHECK(!plan.anyElided);
+    for (int i = 0; i < NF_BAR_MAX_ITEMS; i++)
+        CHECK(plan.rowOf[i] == 0); // every field written, none left at 999
+
+    int const some[3] = { 100, 100, 100 };
+    nf_bar_plan_layout(some, 0, 1196, &plan);
+    CHECK(plan.rows == 1);
+    CHECK(plan.naturalTotalPx == 0);
+    nf_bar_plan_layout(some, -4, 1196, &plan);
+    CHECK(plan.rows == 1);
+
+    // A PRE-LAYOUT WIDTH is the one that matters on the device: the first
+    // listing of a session is built before the dialog has been sized, and
+    // eliding against a width that is not a measurement would hide labels for
+    // a reason that is not real (the 600-versus-1264 trap, CLAUDE.md).
+    int const wide[3] = { 900, 900, 900 };
+    nf_bar_plan_layout(wide, 3, 0, &plan);
+    CHECK(plan.rows == 1);
+    CHECK(!plan.anyElided);
+    nf_bar_plan_layout(wide, 3, -1, &plan);
+    CHECK(plan.rows == 1);
+    CHECK(!plan.anyElided);
+
+    // More items than the bar can hold: clamped, never overrun.
+    int many[NF_BAR_MAX_ITEMS + 4];
+    for (int i = 0; i < NF_BAR_MAX_ITEMS + 4; i++)
+        many[i] = 50;
+    nf_bar_plan_layout(many, NF_BAR_MAX_ITEMS + 4, 1196, &plan);
+    CHECK(plan.rows >= 1);
+    CHECK(plan.rows <= NF_BAR_MAX_ROWS);
+    CHECK(plan.naturalTotalPx == NF_BAR_MAX_ITEMS * 50 + (NF_BAR_MAX_ITEMS - 1) * NF_BAR_MIN_GAP_PX);
+
+    // A negative width is taken as zero rather than credited back against the
+    // total, where it would buy room the bar does not have.
+    int const negative[3] = { 100, -50, 100 };
+    nf_bar_plan_layout(negative, 3, 1196, &plan);
+    CHECK(plan.naturalTotalPx == 200 + 2 * NF_BAR_MIN_GAP_PX);
+    CHECK(plan.budgetPx[1] == 0);
 }
 
 // --- human-readable sizes -----------------------------------------------
@@ -2165,6 +2423,12 @@ int main(void) {
     test_view_bar_label_is_the_bare_word_in_every_mode();
     test_view_flags_summary_is_the_menu_rows();
     test_items_per_page_for_both_modes();
+    test_items_per_page_pays_for_a_wrapped_command_bar();
+    test_browse_bar_fits_on_one_row_at_natural_widths();
+    test_a_bar_that_does_not_fit_wraps_rather_than_eliding();
+    test_elision_is_the_last_resort_and_is_proportional();
+    test_bar_plan_leaves_a_comfortable_bar_alone();
+    test_bar_plan_defines_every_degenerate_input();
     test_format_size_units();
     test_format_size_uses_a_non_breaking_space();
     test_format_size_refuses_a_negative();

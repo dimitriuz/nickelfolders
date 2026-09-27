@@ -901,7 +901,7 @@ QString nf_cover_path(QString const& imageId) {
                .arg(imageId);
 }
 
-int nf_items_per_page(bool covers) {
+int nf_items_per_page(bool covers, int chromeBarRows) {
     // An inline <img> sits on the TEXT BASELINE, so a row carrying one is
     // max(ascent, imageHeight) + descent tall -- which is why this is a
     // qMax and not a plain addition. A cover SHORTER than the ascent costs
@@ -912,7 +912,14 @@ int nf_items_per_page(bool covers) {
     // quietly pessimistic one.
     int rowPx = covers ? (qMax(NF_FONT_ASCENT_PX, NF_COVER_H_PX) + NF_FONT_DESCENT_PX)
                        : NF_TEXT_ROW_PX;
-    int avail = NF_CONTENT_AREA_PX - NF_CHROME_BARS * NF_CHROME_BAR_PX;
+    // The bar rows are the CALLER'S count now, not NF_CHROME_BARS, because the
+    // command bar wraps to a second row when its items will not fit side by
+    // side (nf_bar_plan_layout) and that row costs an item off every page. The
+    // clamp is for a nonsense argument only: a negative count would otherwise
+    // ADD area that does not exist and inflate the page size.
+    if (chromeBarRows < 0)
+        chromeBarRows = 0;
+    int avail = NF_CONTENT_AREA_PX - chromeBarRows * NF_CHROME_BAR_PX;
     int n = avail / rowPx;
     // The floor is what makes a pathological geometry degrade instead of
     // disappear -- the same shape as nf_name_budget_px's. A page of zero items
@@ -935,6 +942,109 @@ int nf_cover_width_px(int heightPx) {
     if (w < 1)
         w = 1;
     return w;
+}
+
+void nf_bar_plan_layout(int const *naturalPx, int n, int availPx, nf_bar_plan *out) {
+    if (!out)
+        return;
+
+    // EVERY FIELD IS WRITTEN before any early return below. The caller's
+    // `nf_bar_plan` is an uninitialised local (it has to be -- nfview.cc may
+    // not have file-scope objects with dynamic initialisers), so a field this
+    // function left alone would be read as stack garbage, and `rowOf` garbage
+    // in particular would index a bar row that does not exist.
+    out->rows           = 1;
+    out->naturalTotalPx = 0;
+    out->anyElided      = false;
+    for (int i = 0; i < NF_BAR_MAX_ITEMS; i++) {
+        out->rowOf[i]    = 0;
+        out->budgetPx[i] = 0;
+        out->elided[i]   = false;
+    }
+
+    if (!naturalPx || n <= 0)
+        return; // an empty bar is one empty row, not zero rows
+    if (n > NF_BAR_MAX_ITEMS)
+        n = NF_BAR_MAX_ITEMS;
+
+    int sum = 0;
+    for (int i = 0; i < n; i++) {
+        // A negative width is nonsense from QFontMetrics and is taken as zero
+        // rather than subtracted from the total, where it would buy room the
+        // bar does not have.
+        int w = naturalPx[i] > 0 ? naturalPx[i] : 0;
+        out->budgetPx[i] = w; // provisional: what this item asked for
+        sum += w;
+    }
+    out->naturalTotalPx = sum + (n - 1) * NF_BAR_MIN_GAP_PX;
+
+    // RULE 1, and the non-positive-width case with it. A bar measured before
+    // its dialog has been laid out has no honest width to elide against (the
+    // 600-versus-1264 trap, CLAUDE.md), and hiding a label for a width that is
+    // not a measurement is the failure this whole function exists to stop.
+    if (availPx <= 0 || out->naturalTotalPx <= availPx)
+        return;
+
+    // RULE 2: fill row 0 until the next item would overflow, then wrap. The
+    // gap is charged per JOIN, not per item, so a row of k items pays
+    // (k-1) gaps -- the same accounting naturalTotalPx above uses.
+    int row = 0, used = 0, count = 0;
+    for (int i = 0; i < n; i++) {
+        int need = (count > 0 ? NF_BAR_MIN_GAP_PX : 0) + out->budgetPx[i];
+        if (count > 0 && used + need > availPx && row < NF_BAR_MAX_ROWS - 1) {
+            row++;
+            used  = 0;
+            count = 0;
+            need  = out->budgetPx[i]; // first on its row: no join to pay for
+        }
+        out->rowOf[i] = row;
+        used  += need;
+        count++;
+    }
+    out->rows = row + 1;
+
+    // RULE 3: a row that STILL overflows shrinks proportionally. Only two
+    // rows can reach here -- the last one (greedy has nowhere left to wrap
+    // to) and, in the pathological case, a row holding one item wider than
+    // the whole bar.
+    //
+    // PROPORTIONALLY, not into equal shares, and that is the whole point of
+    // this task: equal shares are what elided a 357 px sort label against a
+    // 190 px slot while 'view' sat in an identical slot it needed a third of.
+    for (int r = 0; r < out->rows; r++) {
+        int k = 0, rsum = 0;
+        for (int i = 0; i < n; i++) {
+            if (out->rowOf[i] != r)
+                continue;
+            k++;
+            rsum += out->budgetPx[i];
+        }
+        if (k == 0)
+            continue;
+        int forItems = availPx - (k - 1) * NF_BAR_MIN_GAP_PX;
+        // A floor of one px per item, so a pathological width degrades to
+        // unreadable-but-present rather than to a row of nothing at all --
+        // the same shape as nf_items_per_page's own floor.
+        if (forItems < k)
+            forItems = k;
+        if (rsum <= forItems)
+            continue; // this row fits at its natural widths
+        for (int i = 0; i < n; i++) {
+            if (out->rowOf[i] != r)
+                continue;
+            // rsum is summed BEFORE this loop writes anything, so every
+            // share is computed against the row's natural total and not
+            // against a total that shrank underneath it.
+            int b = (int)(((qint64)out->budgetPx[i] * forItems) / rsum);
+            if (b < 1)
+                b = 1;
+            if (b < out->budgetPx[i]) {
+                out->budgetPx[i] = b;
+                out->elided[i]   = true;
+                out->anyElided   = true;
+            }
+        }
+    }
 }
 
 void nf_page_bar_labels(int page, int totalPages,

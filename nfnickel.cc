@@ -1451,3 +1451,52 @@ bool nf_rescan_start(void) {
     nh_log("rescan: sync() returned (this says the CALL was made, not that anything was scanned -- the workflow runs even when nothing is)");
     return true;
 }
+
+bool nf_rescan_connect_done(QObject *receiver, char const *slot) {
+    if (!receiver || !slot) {
+        nh_log("rescan: nf_rescan_connect_done called with no receiver or no slot -- connecting nothing");
+        return false;
+    }
+    if (!nf_rescan_available()) {
+        // Same degradation as everywhere else in this file: a firmware that
+        // renamed these symbols loses the rescan button and its refresh, and
+        // NOTHING else (CLAUDE.md -- the NickelHook failsafe is SHARED).
+        nh_log("rescan: PlugWorkflowManager::sharedInstance/sync did not resolve -- not connecting doneProcessing(), there is nothing to refresh after");
+        return false;
+    }
+
+    // STATIC, no `this` -- see nf_rescan_start above for the full account of
+    // why the mangled name cannot tell you that and what assuming otherwise
+    // cost this project once.
+    PlugWorkflowManager *wf = PlugWorkflowManager__sharedInstance();
+    if (!wf) {
+        nh_log("rescan: PlugWorkflowManager::sharedInstance() returned NULL, which the disassembly says cannot happen -- not connecting doneProcessing()");
+        return false;
+    }
+
+    // PlugWorkflowManager derives DIRECTLY from QObject: its typeinfo
+    // (_ZTI19PlugWorkflowManager, 0x167c730) is a __si_class_type_info whose
+    // single base is _ZTI7QObject, so the QObject subobject is at offset 0 and
+    // this cast is a re-labelling rather than any arithmetic. Measured, not
+    // assumed -- the same question `VolumeManager::getById`'s missing `this`
+    // turned on.
+    //
+    // NOTHING ABOUT PlugWorkflowManager IS DECLARED HERE. The signal is named
+    // as a STRING and resolved through the object's own metaobject at runtime
+    // (`doneProcessing()` is a real moc signal on this firmware -- its body
+    // tail-calls QMetaObject::activate with local index 1, 0xf34a78), which is
+    // what lets this file keep the class opaque and still reach the signal.
+    bool ok = QObject::connect(reinterpret_cast<QObject*>(wf), SIGNAL(doneProcessing()),
+                               receiver, slot, Qt::UniqueConnection);
+    if (ok)
+        nh_log("rescan: connected PlugWorkflowManager::doneProcessing() to %s -- a finished scan will now say so", slot);
+    else
+        // Two very different causes, and the caller cannot tell them apart
+        // from here: the connection already existed (Qt::UniqueConnection, and
+        // the caller should be connecting once anyway), or the old-style
+        // connect failed to resolve the signal or the slot -- which is not
+        // compile-checked, so it is logged loudly rather than silently doing
+        // nothing.
+        nh_log("rescan: QObject::connect(doneProcessing() -> %s) returned false -- either it was already connected (Qt::UniqueConnection) or one of the two names did not resolve; the listing will not refresh itself if it is the latter", slot);
+    return ok;
+}
