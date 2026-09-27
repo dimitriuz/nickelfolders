@@ -2735,3 +2735,103 @@ Zero plain `bl` forms appeared in any function read for this task, so the
 literal-pool trap never arose here. Stated because it was checked, not
 skipped — six such words have already been mistaken for calls in this
 firmware.
+
+## Task 16: the library rescan, and why it is a BUTTON rather than automatic
+
+Needed because the mod is about to delete, move and copy files on
+`/mnt/onboard`, and Nickel's library keeps rows keyed to the old paths.
+Editing its database directly was already ruled out (Task 12: no
+`sqlite3_*` exports, Qt5Sql not mapped, only a Qt4 driver plugin on the
+device), so the only route is asking Nickel to rescan.
+
+NickelMenu ships exactly this as `rescan_books`, is MIT, and its
+`src/action_cc.cc` was **read rather than disassembled**, per CLAUDE.md's
+rule about not re-deriving another open-source mod's public code. The ABI,
+the blocking behaviour and the side effects below are this project's own
+disassembly of this firmware; the call sequence is NickelMenu's.
+
+### The two symbols
+
+- `_ZN19PlugWorkflowManager14sharedInstanceEv` — **static, no `this`**
+  (r0 is never read), no sret, returns `PlugWorkflowManager*` in r0. It
+  **can never be NULL**: the body is `adds r0,#12` address arithmetic on a
+  `__cxa_guard`ed function-local static living in `.bss`, with
+  `__aeabi_atexit` owning the destructor. Static-with-no-`this` again, on
+  another class — the same shape as `VolumeManager::getById` and
+  `N3DialogFactory::getDialog`. That is now four; assume nothing from a
+  member-looking mangled name.
+- `_ZN19PlugWorkflowManager4syncEv` — non-static, `this` in r0, returns
+  `void`, no sret, **not virtual** (the 13-slot vtable holds neither
+  overload). Nothing to allocate, nothing to free.
+
+```c
+static PlugWorkflowManager *(*PlugWorkflowManager__sharedInstance)(void);
+static void (*PlugWorkflowManager__sync)(PlugWorkflowManager *_this);
+```
+
+### It does NOT block — measured
+
+`sync()` → `sync(QStringList)` → `N3FSSyncManager::sync` →
+`FSSyncManager::sync` → `SyncStateMachineWorker::start()` → `new QThread` +
+`setObjectName("syncstateworker")` + `moveToThread` + `QThread::start()`.
+
+So it is safe to call from a tap handler, which was the open worry — this
+mod's UI all runs on Nickel's GUI thread and a multi-second synchronous scan
+there would freeze the panel. Re-entry is a clean no-op, guarded by
+`FSSyncManager::isSyncing()`.
+
+### What it actually is, and why that changed the design
+
+`sync()` is **not a bare rescan**. It is the front of Nickel's entire
+post-USB-disconnect workflow, and on completion `onDoneProcessing`:
+
+- calls `WirelessWorkflowManager::connectWirelessSilently()` on any device
+  past first-time setup — i.e. **turns the Wi-Fi on**
+- pops controllers and can show up to **three** modal dialogs
+- pushes a `QuiltedViewController` through `MainWindowController::push` when
+  files need work — a *different* stack from the `pushView`ed `N3Dialog`
+  this mod's screen lives on, and what that does to our screen is not
+  establishable from the binary
+- holds `blockSignals(true)` on `PlugManager` until the scan finishes
+
+Turning the user's radio on because they deleted a file is not a defensible
+thing for a file manager to do quietly. So the owner's original choice —
+rescan automatically after every operation — was **re-put to them with these
+facts and reversed**: the rescan is a **button in the command bar**, opted
+into deliberately at a moment of the owner's choosing, rather than sprung by
+a delete.
+
+Worth recording as a process point, not just a technical one: the first
+question offered "takes a few seconds and briefly shows Nickel's own
+scanning UI", which was a guess stated as a description, and it got a
+reasonable answer to a wrong question. The archaeology is what caught it,
+before any code was written. **Ask after the archaeology, not before**, when
+the question turns on what a call actually does.
+
+### The scoped overload is dangerous — do not use it
+
+`_ZN19PlugWorkflowManager4syncERK11QStringList` looked like the prize: its
+elements are absolute directories walked recursively
+(`QDir::exists`/`entryInfoList`/`isDir` plus self-recursion), so rescanning
+only the touched folder appeared free.
+
+It is not. `execute()`'s `ble.n 89c97c` sends an **empty** list straight
+into `pruneSideLoadedFiles`, which calls `VolumeManager::removeBook` with an
+empty found-file set — and whether that prune's deletion criterion is scoped
+to its path argument **could not be established** (~2,600 unread bytes at
+`0x8997f0` would settle it). A scoped rescan is therefore a row-deleting
+operation with unknown blast radius, which is not a thing to point at
+someone's library to save a few seconds.
+
+`sync(QStringList())` as a negative control is flagged **must not be run on
+the reference device** for the same reason.
+
+### Two traps for whoever device-tests this
+
+- Watch for `"Device is not signed, it will not sync FS."` — there is a
+  branch where `finished()` fires and the whole workflow runs with **nothing
+  scanned**. A check that only watches the screen would pass vacuously.
+- The honest arithmetic control is row-based, not screen-based: across a
+  copy-and-rename, `[not in library]` should fall by 2 while `hasRow` rises
+  by 2, with the ghost-row count read from the DB over ssh. A zero-byte or
+  unreadable `.epub` that must NOT gain a row is the negative control.
