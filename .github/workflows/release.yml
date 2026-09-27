@@ -1,0 +1,109 @@
+# Release for NickelFolders.
+#
+# Fires on a v* tag and publishes KoboRoot.tgz, which is what a user actually
+# installs: copy it into .kobo on the device, eject, and Nickel extracts and
+# deletes it on the next boot.
+#
+# The host tests gate the release on purpose. They cannot exercise a single
+# libnickel call -- that is what the device is for -- but they do cover the
+# path-safety rules that decide whether a delete, move or copy may touch a
+# path at all, and shipping a build that fails those is not a thing to do by
+# accident.
+
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build and release'
+        required: true
+
+permissions:
+  contents: write   # needed to create the release and upload assets
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive   # NickelHook
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Install host Qt5
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qtbase5-dev pkg-config
+
+      - name: Host tests must pass before anything ships
+        run: make test
+
+      - name: Build
+        run: ./nickeltc make koboroot
+
+      # Same two invariants CI enforces. Repeated here rather than assumed
+      # from a green CI run: a release is built from a tag, which is not
+      # necessarily a commit CI ever saw.
+      - name: No file-scope dynamic initialisers
+        run: |
+          if nm libnfolders.so | grep GLOBAL__sub_I; then
+            echo "::error::file-scope dynamic initialiser present -- see CLAUDE.md"
+            exit 1
+          fi
+          echo "ok: none"
+
+      - name: No unexpected libstdc++ imports
+        run: |
+          unexpected=$(nm -u libnfolders.so \
+            | grep -oE '_ZSt[A-Za-z0-9_]*|_ZNSt[A-Za-z0-9_]*|__cxa_[a-z_]*' \
+            | grep -vE '^__cxa_guard_(acquire|release|abort)$' \
+            | sort -u || true)
+          if [ -n "$unexpected" ]; then
+            echo "::error::unexpected C++ runtime imports:"
+            echo "$unexpected"
+            exit 1
+          fi
+          echo "ok: only the documented __cxa_guard_* exception"
+
+      - name: Checksums
+        run: |
+          sha256sum KoboRoot.tgz libnfolders.so | tee SHA256SUMS
+
+      # `gh` is preinstalled on the runner, so no third-party action is in the
+      # path between a tag and a published binary.
+      # Refuse to ship notes that are not about THIS release. koboy's own
+      # release job does the same check, and the failure it prevents is the
+      # quiet one: a tag goes out with the previous version's notes and
+      # nobody notices until someone reads the changelog.
+      - name: The release notes are about this release
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          v="${tag#v}"
+          if ! grep -qF "$v" .github/RELEASE-NOTES.md; then
+            echo "::error::.github/RELEASE-NOTES.md does not mention $v -- stale notes"
+            exit 1
+          fi
+          echo "ok: notes mention $v"
+
+      # `gh` is preinstalled on the runner, so no third-party action sits
+      # between a tag and a published binary.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          # STRIP THE MAINTAINER COMMENT. GitHub hides html comments when it
+          # renders markdown, so this looks fine in a browser and still ships:
+          # the API, the RSS feed and the release notification email all carry
+          # the RAW body. koboy shipped exactly that in its v0.5.4.
+          sed '/<!--/,/-->/d' .github/RELEASE-NOTES.md > "$RUNNER_TEMP/notes.md"
+          gh release create "$tag" \
+            --title "NickelFolders $tag" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            --verify-tag \
+            "KoboRoot.tgz#KoboRoot.tgz (install this)" \
+            "libnfolders.so#libnfolders.so (the mod itself)" \
+            "SHA256SUMS#SHA256SUMS"

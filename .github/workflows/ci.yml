@@ -1,0 +1,94 @@
+# CI for NickelFolders.
+#
+# Two jobs, deliberately separate, because they are two different compilers
+# against two different Qt versions and each catches what the other cannot:
+#
+#   host-tests  the pure display/ordering/listing/path logic, built with the
+#               runner's own g++ and Qt 5.15. This is the only thing in the
+#               project that can actually RUN off the device.
+#   cross-build the real artifact, built with NickelTC (GCC 4.9.4 against
+#               Nickel's own Qt 5.2.1). It cannot be run here, but it is where
+#               a 5.15-only API turns into a loud build failure instead of a
+#               quiet one on the panel.
+#
+# The Qt skew between them is intentional and is the point. See README.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  host-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The Makefile finds Qt through pkg-config rather than hardcoded paths,
+      # so this is the whole dependency list.
+      - name: Install host Qt5
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qtbase5-dev pkg-config
+
+      - name: Run host tests
+        run: make test
+
+  cross-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive   # NickelHook
+
+      # ./nickeltc runs the toolchain image via `docker run`, exactly as it
+      # does locally. Deliberately NOT a `container:` job: that would require
+      # Node inside the toolchain image for actions/checkout, which is not
+      # something a minimal cross-compiler image owes us, and the failure
+      # would only ever appear in CI.
+      - name: Cross-build the mod
+        run: ./nickeltc make
+
+      # These two are load-bearing project rules, not hygiene, and both have
+      # a real incident behind them (see CLAUDE.md):
+      #
+      #   A file-scope dynamic initialiser runs BEFORE NickelHook's own
+      #   constructor, so it is still zeroed .bss when read -- that boot-looped
+      #   the mod into NickelHook's SHARED failsafe, which can uninstall the
+      #   user's OTHER mods.
+      #
+      #   The stdlib import set is pinned because libstdc++ gives no ABI
+      #   guarantee on this platform. __cxa_guard_* is the one documented
+      #   exception; anything new appearing here needs a decision, not a shrug.
+      - name: No file-scope dynamic initialisers
+        run: |
+          if nm libnfolders.so | grep GLOBAL__sub_I; then
+            echo "::error::file-scope dynamic initialiser present -- see CLAUDE.md"
+            exit 1
+          fi
+          echo "ok: none"
+
+      - name: No unexpected libstdc++ imports
+        run: |
+          unexpected=$(nm -u libnfolders.so \
+            | grep -oE '_ZSt[A-Za-z0-9_]*|_ZNSt[A-Za-z0-9_]*|__cxa_[a-z_]*' \
+            | grep -vE '^__cxa_guard_(acquire|release|abort)$' \
+            | sort -u || true)
+          if [ -n "$unexpected" ]; then
+            echo "::error::unexpected C++ runtime imports:"
+            echo "$unexpected"
+            exit 1
+          fi
+          echo "ok: only the documented __cxa_guard_* exception"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libnfolders.so
+          path: libnfolders.so
+          if-no-files-found: error
