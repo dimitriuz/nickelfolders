@@ -43,7 +43,12 @@ HOST_HDR      := $(wildcard src/*.h) $(wildcard tests/*.h)
 # `pkg-config` prints "Package Qt5Core was not found" four times for no
 # reason. `=` defers the pkg-config calls until a host test binary is
 # actually being built, which is the only place these variables are used.
-HOST_CXXFLAGS = -std=gnu++11 -O1 -g -Wall -Wextra -Werror -Isrc -Itests \
+# -fPIC is NOT optional here, and the reason is invisible on some distros:
+# Debian/Ubuntu build Qt5 with -reduce-relocations, whose headers then hard
+# -#error out unless the including code is position-independent. Arch does not,
+# so this built clean locally for the whole project's life and failed the first
+# time CI ran it on ubuntu-latest. Harmless where it is not required.
+HOST_CXXFLAGS = -std=gnu++11 -O1 -g -fPIC -Wall -Wextra -Werror -Isrc -Itests \
                  $(shell pkg-config --cflags Qt5Core)
 HOST_LDLIBS   = $(shell pkg-config --libs Qt5Core)
 
