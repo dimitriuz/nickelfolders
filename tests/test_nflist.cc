@@ -705,6 +705,238 @@ static void test_labels_still_match_their_rows_under_a_date_key(void) {
     CHECK_EQ_STR(out.at(0).name, "bravo.epub");   // the date-added order, as above
 }
 
+
+// --- the view flags -----------------------------------------------------
+//
+// Only two of the five reach this file (nflist.h says which and why): the one
+// that FILTERS (`showHidden`) and the two that decide what a label SAYS
+// (`fullNames`, `hideExtensions`). `hideCovers` and `showSize` are rendering
+// decisions nf_build_listing has nothing to do with.
+
+static nf_view_flags view_with(bool fullNames, bool hideExtensions, bool showHidden) {
+    nf_view_flags v = nf_view_flags_default();
+    v.fullNames      = fullNames;
+    v.hideExtensions = hideExtensions;
+    v.showHidden     = showHidden;
+    return v;
+}
+
+// THE ONE FLAG THAT CHANGES WHICH ROWS EXIST. A dot-directory or an .sdr
+// sidecar cannot be "displayed differently" -- it is listed or it is not --
+// so `showHidden` is documented as a filter rather than pretending otherwise.
+//
+// The negative control is the first half: the DEFAULT must still hide them, or
+// "shown reveals them" would be a statement about a rule that was never
+// applied in the first place.
+static void test_hidden_files_flag_reveals_what_the_rule_drops(void) {
+    QVector<nf_entry> e;
+    e << ent("books", true) << ent(".kobo", true) << ent(".adds", true)
+      << ent("something.sdr", true) << ent("System Volume Information", true)
+      << ent("Volume 1.cbz", false);
+
+    QVector<nf_row> hidden;
+    nf_build_listing(e, fake_meta, NULL, &hidden, NF_FILTER_ALL, NF_SORT_NAME, false,
+                     NULL, view_with(false, false, false));
+    CHECK(hidden.size() == 2); // books, Volume 1.cbz
+
+    QVector<nf_row> shown;
+    nf_build_listing(e, fake_meta, NULL, &shown, NF_FILTER_ALL, NF_SORT_NAME, false,
+                     NULL, view_with(false, false, true));
+    CHECK(shown.size() == 6);
+
+    // Every one of the four the rule drops is back, by name -- not just "the
+    // count went up", which a duplicated row would also satisfy.
+    QStringList names;
+    for (int i = 0; i < shown.size(); i++)
+        names << shown.at(i).name;
+    CHECK(names.contains(QStringLiteral(".kobo")));
+    CHECK(names.contains(QStringLiteral(".adds")));
+    CHECK(names.contains(QStringLiteral("something.sdr")));
+    CHECK(names.contains(QStringLiteral("System Volume Information")));
+
+    // It does NOT loosen the FILE half -- that is the book-extension
+    // allowlist, a separate layer answering "is this a book". A .lua on the
+    // card stays out under either setting, or "hidden files: shown" would mean
+    // "show me every temp file Nickel and KOReader leave lying around".
+    QVector<nf_entry> f;
+    f << ent("metadata.calibre", false) << ent("koboy-probe-Io.txt", false)
+      << ent("Volume 1.cbz", false);
+    QVector<nf_row> g;
+    nf_build_listing(f, fake_meta, NULL, &g, NF_FILTER_ALL, NF_SORT_NAME, false,
+                     NULL, view_with(false, false, true));
+    CHECK(g.size() == 1);
+    CHECK_EQ_STR(g.at(0).name, "Volume 1.cbz");
+}
+
+// `filenames: full` is an EXPLICIT CHOICE, not one of nf_strip_common's own
+// refusals, and the two must not be conflated -- see nflist.cc's stage 6a.
+// This set is one nf_strip_common genuinely DOES shorten, which is what makes
+// the difference between the two settings visible at all.
+static void test_full_filenames_skip_the_common_strip(void) {
+    QVector<nf_entry> e;
+    e << ent("Fullmetal Alchemist v01 (2005) (Digital) (LostNerevarine-Empire).cbz", false)
+      << ent("Fullmetal Alchemist v02 (2005) (Digital) (LostNerevarine-Empire).cbz", false);
+
+    QVector<nf_row> truncated;
+    nf_build_listing(e, fake_meta, NULL, &truncated, NF_FILTER_ALL, NF_SORT_NAME, false,
+                     NULL, view_with(false, false, false));
+    CHECK(truncated.size() == 2);
+    // Everything but the volume number is common to both, so that is all that
+    // is left -- the whole point of the truncation the `full` setting turns off.
+    CHECK_EQ_STR(truncated.at(0).label, "v01");
+    CHECK_EQ_STR(truncated.at(1).label, "v02");
+
+    QVector<nf_row> full;
+    nf_build_listing(e, fake_meta, NULL, &full, NF_FILTER_ALL, NF_SORT_NAME, false,
+                     NULL, view_with(true, false, false));
+    CHECK(full.size() == 2);
+    // The name as it is on disk, extension included.
+    CHECK_EQ_STR(full.at(0).label, full.at(0).name.toUtf8().constData());
+    CHECK_EQ_STR(full.at(1).label, full.at(1).name.toUtf8().constData());
+
+    // The ROW SET is identical either way -- a display flag must not change
+    // which rows exist (nflist.h). Negative control for the whole separation.
+    CHECK(truncated.at(0).name == full.at(0).name);
+    CHECK(truncated.at(1).name == full.at(1).name);
+}
+
+// `extensions: hidden` takes a known book extension off whatever the
+// truncation stage left, and `shown` never adds one back -- see nflist.cc's
+// stage 6b for why that asymmetry is the only coherent reading.
+static void test_hidden_extensions_strip_the_extension(void) {
+    QVector<nf_entry> e;
+    e << ent("alpha.epub", false) << ent("bravo.cbz", false);
+
+    // Mixed extensions, so nf_strip_common re-appends each one as the
+    // distinguisher and there is genuinely something for this flag to remove.
+    QVector<nf_row> shown;
+    nf_build_listing(e, fake_meta, NULL, &shown, NF_FILTER_ALL, NF_SORT_NAME, false,
+                     NULL, view_with(false, false, false));
+    CHECK(shown.size() == 2);
+    // Name order: alpha.epub, then bravo.cbz.
+    CHECK(shown.at(0).label.endsWith(QStringLiteral(".epub")));
+    CHECK(shown.at(1).label.endsWith(QStringLiteral(".cbz")));
+
+    QVector<nf_row> bare;
+    nf_build_listing(e, fake_meta, NULL, &bare, NF_FILTER_ALL, NF_SORT_NAME, false,
+                     NULL, view_with(false, true, false));
+    CHECK(bare.size() == 2);
+    CHECK_EQ_STR(bare.at(0).label, "alpha");
+    CHECK_EQ_STR(bare.at(1).label, "bravo");
+
+    // INDEPENDENT of truncation: it works on full names too.
+    QVector<nf_row> fullNoExt;
+    nf_build_listing(e, fake_meta, NULL, &fullNoExt, NF_FILTER_ALL, NF_SORT_NAME, false,
+                     NULL, view_with(true, true, false));
+    CHECK(fullNoExt.size() == 2);
+    CHECK_EQ_STR(fullNoExt.at(0).label, "alpha");
+    CHECK_EQ_STR(fullNoExt.at(1).label, "bravo");
+
+    // A SET OF ONE can hide its extension too. It could not while the
+    // "fewer than two names" early-out guarded the whole label stage rather
+    // than just the common-run strip inside it.
+    QVector<nf_entry> one;
+    one << ent("solo.pdf", false);
+    QVector<nf_row> soloRows;
+    nf_build_listing(one, fake_meta, NULL, &soloRows, NF_FILTER_ALL, NF_SORT_NAME, false,
+                     NULL, view_with(false, true, false));
+    CHECK(soloRows.size() == 1);
+    CHECK_EQ_STR(soloRows.at(0).label, "solo");
+}
+
+// THE COLLISION INTERACTION. "x.cbz" and "x.epub" both become "x" with the
+// extension hidden, and two identical rows is worse than two long ones. The
+// existing guard's answer to a collision is to fall back to RAW names, which
+// here would also throw away the truncation the reader separately asked for --
+// so this step backs out ONLY ITSELF and the extensions stay on.
+static void test_hidden_extensions_back_off_on_a_collision(void) {
+    QVector<nf_entry> e;
+    e << ent("Same Name.cbz", false) << ent("Same Name.epub", false);
+
+    QVector<nf_row> out;
+    nf_build_listing(e, fake_meta, NULL, &out, NF_FILTER_ALL, NF_SORT_NAME, false,
+                     NULL, view_with(false, true, false));
+    CHECK(out.size() == 2);
+    CHECK(out.at(0).label != out.at(1).label); // the point of the guard
+    CHECK(out.at(0).label.endsWith(QStringLiteral(".cbz")));
+    CHECK(out.at(1).label.endsWith(QStringLiteral(".epub")));
+
+    // THE NEGATIVE CONTROL: a set that does NOT collide must still get bare
+    // labels under the same flag, or the guard above would be indistinguishable
+    // from the flag never working at all.
+    QVector<nf_entry> ok;
+    ok << ent("Other Name.cbz", false) << ent("Same Name.epub", false);
+    QVector<nf_row> okOut;
+    nf_build_listing(ok, fake_meta, NULL, &okOut, NF_FILTER_ALL, NF_SORT_NAME, false,
+                     NULL, view_with(true, true, false));
+    CHECK(okOut.size() == 2);
+    for (int i = 0; i < okOut.size(); i++)
+        CHECK(!okOut.at(i).label.contains(QLatin1Char('.')));
+
+    // A file whose whole name IS an extension would strip to nothing, and an
+    // empty row is worse than one with an extension on it -- refused for the
+    // set, all or nothing, the same shape as nf_strip_common's own refusals.
+    QVector<nf_entry> degenerate;
+    degenerate << ent(".cbz", false) << ent("real.cbz", false);
+    QVector<nf_row> degOut;
+    nf_build_listing(degenerate, fake_meta, NULL, &degOut, NF_FILTER_ALL, NF_SORT_NAME,
+                     false, NULL, view_with(true, true, false));
+    CHECK(degOut.size() == 2);
+    for (int i = 0; i < degOut.size(); i++)
+        CHECK(!degOut.at(i).label.isEmpty());
+}
+
+// A DIRECTORY IS NEVER STRIPPED OF AN "EXTENSION". A folder named "Comics.cbz"
+// is a folder, and nf_book_extension cannot tell -- the same trap
+// nf_icon_kind_for answers by checking isDir first.
+static void test_extension_hiding_never_touches_a_folder(void) {
+    QVector<nf_entry> e;
+    e << ent("Comics.cbz", true) << ent("Manga.cbz", true);
+    QVector<nf_row> out;
+    nf_build_listing(e, fake_meta, NULL, &out, NF_FILTER_ALL, NF_SORT_NAME, false,
+                     NULL, view_with(true, true, false));
+    CHECK(out.size() == 2);
+    CHECK_EQ_STR(out.at(0).label, "Comics.cbz");
+    CHECK_EQ_STR(out.at(1).label, "Manga.cbz");
+}
+
+// THE SEPARATION, stated directly: the four DISPLAY flags must leave the row
+// SET identical, name for name and in the same order. Only `showHidden` is
+// allowed to change it (its own test, above). Without this the two concerns
+// would be free to blur -- a label flag that quietly dropped a row would look
+// like a filter nobody chose.
+static void test_display_flags_do_not_change_which_rows_exist(void) {
+    QVector<nf_entry> e;
+    e << ent("books", true) << ent(".kobo", true)
+      << ent("Fullmetal Alchemist v01 (2005).cbz", false)
+      << ent("Fullmetal Alchemist v02 (2005).cbz", false)
+      << ent("missing thing.pdf", false);
+
+    QVector<nf_row> base;
+    nf_build_listing(e, fake_meta, NULL, &base, NF_FILTER_ALL, NF_SORT_NAME, false,
+                     NULL, nf_view_flags_default());
+    CHECK(base.size() == 4); // .kobo hidden, everything else kept
+
+    // Every combination of the three DISPLAY flags this file can see, plus the
+    // two it cannot (which are passed through and must change nothing here).
+    for (int bits = 0; bits < 16; bits++) {
+        nf_view_flags v = nf_view_flags_default();
+        v.fullNames      = (bits & 1) != 0;
+        v.hideExtensions = (bits & 2) != 0;
+        v.hideCovers     = (bits & 4) != 0;
+        v.showSize       = (bits & 8) != 0;
+        QVector<nf_row> out;
+        nf_build_listing(e, fake_meta, NULL, &out, NF_FILTER_ALL, NF_SORT_NAME, false,
+                         NULL, v);
+        CHECK(out.size() == base.size());
+        for (int i = 0; i < out.size() && i < base.size(); i++) {
+            CHECK(out.at(i).name   == base.at(i).name);
+            CHECK(out.at(i).isDir  == base.at(i).isDir);
+            CHECK(out.at(i).hasRow == base.at(i).hasRow);
+        }
+    }
+}
+
 int main(void) {
     test_junk_is_dropped_before_anything_else();
     test_metadata_is_fetched_for_every_row();
@@ -731,5 +963,11 @@ int main(void) {
     test_pipeline_orders_by_date_last_read_not_by_date_added();
     test_pipeline_keeps_a_dateless_row_under_a_date_key();
     test_labels_still_match_their_rows_under_a_date_key();
+    test_hidden_files_flag_reveals_what_the_rule_drops();
+    test_full_filenames_skip_the_common_strip();
+    test_hidden_extensions_strip_the_extension();
+    test_hidden_extensions_back_off_on_a_collision();
+    test_extension_hiding_never_touches_a_folder();
+    test_display_flags_do_not_change_which_rows_exist();
     NF_TEST_MAIN_END
 }

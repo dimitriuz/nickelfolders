@@ -822,7 +822,7 @@ static void test_suffix_twin_is_what_the_markup_renders_as(void) {
     };
     for (int i = 0; i < (int)(sizeof rows / sizeof rows[0]); i++) {
         QString markup, plain;
-        nf_row_suffix(rows[i], &markup, &plain);
+        nf_row_suffix(rows[i], nf_view_flags_default(), &markup, &plain);
         CHECK(nf_test_rendered(markup) == plain);
         // The twin must not still be carrying entity SOURCE text either --
         // that would measure "&nbsp;" as six characters instead of one.
@@ -850,7 +850,7 @@ static void test_suffix_separator_is_non_breaking(void) {
     };
     for (int i = 0; i < (int)(sizeof rows / sizeof rows[0]); i++) {
         QString markup, plain;
-        nf_row_suffix(rows[i], &markup, &plain);
+        nf_row_suffix(rows[i], nf_view_flags_default(), &markup, &plain);
         CHECK(markup.startsWith(sepMarkup));
         CHECK(plain.startsWith(sepPlain));
         // Nothing but the separator run may be non-breaking: the spaces
@@ -862,7 +862,7 @@ static void test_suffix_separator_is_non_breaking(void) {
     // A folder's "/" has no separator at all -- it terminates the name it
     // belongs to rather than standing apart from it.
     QString plain;
-    nf_row_suffix(nf_test_row(true, false, false, -1), NULL, &plain);
+    nf_row_suffix(nf_test_row(true, false, false, -1), nf_view_flags_default(), NULL, &plain);
     CHECK(!plain.startsWith(sepPlain));
 }
 
@@ -890,27 +890,27 @@ static void test_suffix_priority(void) {
     QString plain;
 
     // A folder: the trailing "/", and NO separator in front of it.
-    nf_row_suffix(nf_test_row(true, false, false, -1), NULL, &plain);
+    nf_row_suffix(nf_test_row(true, false, false, -1), nf_view_flags_default(), NULL, &plain);
     CHECK_EQ_STR(plain, "/");
 
     // isDir wins even over a percentage that should never be there for one.
-    nf_row_suffix(nf_test_row(true, true, true, 40), NULL, &plain);
+    nf_row_suffix(nf_test_row(true, true, true, 40), nf_view_flags_default(), NULL, &plain);
     CHECK_EQ_STR(plain, "/");
 
     // A file with no library row says so, in the label TEXT.
-    nf_row_suffix(nf_test_row(false, false, false, -1), NULL, &plain);
+    nf_row_suffix(nf_test_row(false, false, false, -1), nf_view_flags_default(), NULL, &plain);
     CHECK(plain.endsWith(QStringLiteral("[not in library]")));
 
     // ... and that reason outranks any progress the row happens to carry: a
     // row with no library row has no trustworthy progress to report.
-    nf_row_suffix(nf_test_row(false, false, true, 40), NULL, &plain);
+    nf_row_suffix(nf_test_row(false, false, true, 40), nf_view_flags_default(), NULL, &plain);
     CHECK(plain.endsWith(QStringLiteral("[not in library]")));
 
     // "Finished" outranks a stale percentage from an abandoned re-read.
-    nf_row_suffix(nf_test_row(false, true, true, 12), NULL, &plain);
+    nf_row_suffix(nf_test_row(false, true, true, 12), nf_view_flags_default(), NULL, &plain);
     CHECK(plain.endsWith(QStringLiteral("[finished]")));
 
-    nf_row_suffix(nf_test_row(false, true, false, 40), NULL, &plain);
+    nf_row_suffix(nf_test_row(false, true, false, 40), nf_view_flags_default(), NULL, &plain);
     CHECK(plain.endsWith(QStringLiteral("(40%)")));
 }
 
@@ -919,11 +919,11 @@ static void test_suffix_priority(void) {
 static void test_suffix_hides_zero_and_unknown_progress(void) {
     QString markup, plain;
 
-    nf_row_suffix(nf_test_row(false, true, false, 0), &markup, &plain);
+    nf_row_suffix(nf_test_row(false, true, false, 0), nf_view_flags_default(), &markup, &plain);
     CHECK(plain.isEmpty());
     CHECK(markup.isEmpty());
 
-    nf_row_suffix(nf_test_row(false, true, false, -1), &markup, &plain);
+    nf_row_suffix(nf_test_row(false, true, false, -1), nf_view_flags_default(), &markup, &plain);
     CHECK(plain.isEmpty());
     CHECK(markup.isEmpty());
 }
@@ -931,11 +931,11 @@ static void test_suffix_hides_zero_and_unknown_progress(void) {
 // Either output may be NULL -- the row loop asks for both, nf_icon_width_px
 // asks for the plain form only, and nf_icon_markup for the markup only.
 static void test_two_form_builders_accept_a_null_output(void) {
-    nf_row_suffix(nf_test_row(false, false, false, -1), NULL, NULL);
+    nf_row_suffix(nf_test_row(false, false, false, -1), nf_view_flags_default(), NULL, NULL);
     nf_icon_badge(NF_ICON_PDF, NULL, NULL);
 
     QString one;
-    nf_row_suffix(nf_test_row(false, true, false, 40), &one, NULL);
+    nf_row_suffix(nf_test_row(false, true, false, 40), nf_view_flags_default(), &one, NULL);
     CHECK(one.endsWith(QStringLiteral("(40%)")));
     nf_icon_badge(NF_ICON_PDF, NULL, &one);
     CHECK(one.startsWith(QStringLiteral("[PDF]")));
@@ -1309,10 +1309,10 @@ static void test_menu_index_out_of_range_refuses_and_writes_nothing(void) {
     CHECK(filter == NF_FILTER_PDF); // untouched
 
     CHECK(nf_menu_row_count(NF_MENU_NONE) == 0);
-    CHECK(nf_menu_row_label(NF_MENU_NONE, 0, NF_SORT_NAME, false, NF_FILTER_ALL).isEmpty());
-    CHECK(nf_menu_row_label(NF_MENU_SORT, -1, NF_SORT_NAME, false, NF_FILTER_ALL).isEmpty());
-    CHECK(nf_menu_row_label(NF_MENU_SORT, 5, NF_SORT_NAME, false, NF_FILTER_ALL).isEmpty());
-    CHECK(nf_menu_row_label(NF_MENU_FILTER, 8, NF_SORT_NAME, false, NF_FILTER_ALL).isEmpty());
+    CHECK(nf_menu_row_label(NF_MENU_NONE, 0, NF_SORT_NAME, false, NF_FILTER_ALL, nf_view_flags_default()).isEmpty());
+    CHECK(nf_menu_row_label(NF_MENU_SORT, -1, NF_SORT_NAME, false, NF_FILTER_ALL, nf_view_flags_default()).isEmpty());
+    CHECK(nf_menu_row_label(NF_MENU_SORT, 5, NF_SORT_NAME, false, NF_FILTER_ALL, nf_view_flags_default()).isEmpty());
+    CHECK(nf_menu_row_label(NF_MENU_FILTER, 8, NF_SORT_NAME, false, NF_FILTER_ALL, nf_view_flags_default()).isEmpty());
 }
 
 // EXACTLY ONE row is marked, in either menu, whatever the active value is.
@@ -1325,7 +1325,7 @@ static void test_menu_marks_exactly_one_active_row(void) {
     for (int k = 0; k < 5; k++) {
         int marked = 0;
         for (int i = 0; i < 5; i++)
-            if (nf_menu_row_label(NF_MENU_SORT, i, keys[k], false, NF_FILTER_ALL)
+            if (nf_menu_row_label(NF_MENU_SORT, i, keys[k], false, NF_FILTER_ALL, nf_view_flags_default())
                     .startsWith(QLatin1Char('*')))
                 marked++;
         CHECK(marked == 1);
@@ -1337,7 +1337,7 @@ static void test_menu_marks_exactly_one_active_row(void) {
     for (int f = 0; f < 8; f++) {
         int marked = 0;
         for (int i = 0; i < 8; i++)
-            if (nf_menu_row_label(NF_MENU_FILTER, i, NF_SORT_NAME, false, filters[f])
+            if (nf_menu_row_label(NF_MENU_FILTER, i, NF_SORT_NAME, false, filters[f], nf_view_flags_default())
                     .startsWith(QLatin1Char('*')))
                 marked++;
         CHECK(marked == 1);
@@ -1348,22 +1348,46 @@ static void test_menu_marks_exactly_one_active_row(void) {
 // one is a difference a reader can see at a glance rather than a decoration
 // every row carries.
 static void test_inactive_menu_rows_are_the_bare_word(void) {
-    CHECK_EQ_STR(nf_menu_row_label(NF_MENU_SORT, 1, NF_SORT_NAME, false, NF_FILTER_ALL), "size");
-    CHECK_EQ_STR(nf_menu_row_label(NF_MENU_SORT, 4, NF_SORT_NAME, true,  NF_FILTER_ALL), "read");
-    CHECK_EQ_STR(nf_menu_row_label(NF_MENU_FILTER, 4, NF_SORT_NAME, false, NF_FILTER_ALL), "epub");
-    CHECK_EQ_STR(nf_menu_row_label(NF_MENU_FILTER, 7, NF_SORT_NAME, false, NF_FILTER_ALL), "not started");
+    CHECK_EQ_STR(nf_menu_row_label(NF_MENU_SORT, 1, NF_SORT_NAME, false, NF_FILTER_ALL, nf_view_flags_default()), "size");
+    CHECK_EQ_STR(nf_menu_row_label(NF_MENU_SORT, 4, NF_SORT_NAME, true,  NF_FILTER_ALL, nf_view_flags_default()), "read");
+    CHECK_EQ_STR(nf_menu_row_label(NF_MENU_FILTER, 4, NF_SORT_NAME, false, NF_FILTER_ALL, nf_view_flags_default()), "epub");
+    CHECK_EQ_STR(nf_menu_row_label(NF_MENU_FILTER, 7, NF_SORT_NAME, false, NF_FILTER_ALL, nf_view_flags_default()), "not started");
 }
 
 // THE ACTIVE SORT ROW SAYS WHAT TAPPING IT WILL DO. With cycling gone,
 // tapping the already-active key is the ONLY way to reverse direction, and
 // nothing else on screen says so -- so the row itself has to, and it has to
 // name the direction a tap moves TO, not just the one in force.
+//
+// THE LITERALS WERE "* date ^ (tap for v)" AND "* date v (tap for ^)" and were
+// changed deliberately, not loosened: the owner replaced the carets with
+// spelled-out words because direction is the one thing on this screen that
+// should not have to be decoded. Pinning the whole string is the point of this
+// check -- a test that stopped pinning the literal (matching "date" and a
+// bracket, say) would still pass against a row that said nothing useful --
+// which is why this is an edit rather than a relaxation. There is precedent in
+// this file: nf_cover_width_px(NF_COVER_H_PX) == 51 was updated to 47 the same
+// way when the constant behind it changed.
+//
+// The inner word carries NO brackets ("tap for desc", not "tap for (desc)"):
+// the brackets belong to the state marker, and a bracketed word nested inside
+// another bracket reads as a typo.
 static void test_active_sort_row_shows_the_direction_and_the_tap(void) {
-    QString asc = nf_menu_row_label(NF_MENU_SORT, 2, NF_SORT_DATE, false, NF_FILTER_ALL);
-    CHECK_EQ_STR(asc, "* date ^ (tap for v)");
+    QString asc = nf_menu_row_label(NF_MENU_SORT, 2, NF_SORT_DATE, false, NF_FILTER_ALL, nf_view_flags_default());
+    CHECK_EQ_STR(asc, "* date (asc) (tap for desc)");
 
-    QString desc = nf_menu_row_label(NF_MENU_SORT, 2, NF_SORT_DATE, true, NF_FILTER_ALL);
-    CHECK_EQ_STR(desc, "* date v (tap for ^)");
+    QString desc = nf_menu_row_label(NF_MENU_SORT, 2, NF_SORT_DATE, true, NF_FILTER_ALL, nf_view_flags_default());
+    CHECK_EQ_STR(desc, "* date (desc) (tap for asc)");
+
+    // THE NEGATIVE CONTROL for the change itself: neither form may still carry
+    // a bare caret or a bare "v" as a direction. Without this, a half-applied
+    // rename -- the bar updated and the menu row not, or the other way round --
+    // would leave the two spellings live side by side and every assertion above
+    // would still pass on its own line.
+    CHECK(!asc.contains(QLatin1Char('^')));
+    CHECK(!desc.contains(QLatin1Char('^')));
+    CHECK(!asc.contains(QStringLiteral(" v ")));
+    CHECK(!desc.contains(QStringLiteral(" v ")));
 
     // The two must differ in BOTH marks, or the row would be announcing a tap
     // that does not move anywhere.
@@ -1371,16 +1395,18 @@ static void test_active_sort_row_shows_the_direction_and_the_tap(void) {
 
     // A filter has no direction, so its active row promises nothing about a
     // tap -- it states what the row is.
-    CHECK_EQ_STR(nf_menu_row_label(NF_MENU_FILTER, 5, NF_SORT_NAME, false, NF_FILTER_FINISHED),
+    CHECK_EQ_STR(nf_menu_row_label(NF_MENU_FILTER, 5, NF_SORT_NAME, false, NF_FILTER_FINISHED, nf_view_flags_default()),
                  "* finished (active)");
 }
 
 // ONE VOCABULARY. The word in the menu row and the word in the command bar
 // have to be the same one, or nothing tells a reader that tapping `added` is
-// what makes the bar read `sort: added ^`.
+// what makes the bar read `sort: added (asc)`.
 static void test_the_bar_and_the_menu_share_one_vocabulary(void) {
-    CHECK_EQ_STR(nf_sort_bar_label(NF_SORT_NAME, false),  "sort: name ^");
-    CHECK_EQ_STR(nf_sort_bar_label(NF_SORT_READ, true),   "sort: read v");
+    // The literals moved from "sort: name ^"/"sort: read v" with the same
+    // deliberate edit as the menu row's own, above -- see there.
+    CHECK_EQ_STR(nf_sort_bar_label(NF_SORT_NAME, false),  "sort: name (asc)");
+    CHECK_EQ_STR(nf_sort_bar_label(NF_SORT_READ, true),   "sort: read (desc)");
     CHECK_EQ_STR(nf_filter_bar_label(NF_FILTER_ALL),      "filter: all");
     CHECK_EQ_STR(nf_filter_bar_label(NF_FILTER_NOT_STARTED), "filter: not started");
 
@@ -1390,7 +1416,7 @@ static void test_the_bar_and_the_menu_share_one_vocabulary(void) {
         QString word = nf_sort_key_name(key);
         // the row that selects this key spells the word, and so does the bar
         // label that selecting it produces
-        CHECK(nf_menu_row_label(NF_MENU_SORT, i, key, false, NF_FILTER_ALL).contains(word));
+        CHECK(nf_menu_row_label(NF_MENU_SORT, i, key, false, NF_FILTER_ALL, nf_view_flags_default()).contains(word));
         CHECK(nf_sort_bar_label(key, false).contains(word));
     }
     for (int i = 0; i < 8; i++) {
@@ -1412,7 +1438,7 @@ static void test_menu_labels_have_no_collapsible_space_runs(void) {
     for (int k = 0; k < 5; k++) {
         for (int d = 0; d < 2; d++) {
             for (int i = 0; i < 5; i++) {
-                QString s = nf_menu_row_label(NF_MENU_SORT, i, keys[k], d != 0, NF_FILTER_ALL);
+                QString s = nf_menu_row_label(NF_MENU_SORT, i, keys[k], d != 0, NF_FILTER_ALL, nf_view_flags_default());
                 CHECK(!s.contains(QStringLiteral("  ")));
                 CHECK(!s.isEmpty());
             }
@@ -1423,7 +1449,7 @@ static void test_menu_labels_have_no_collapsible_space_runs(void) {
                                  NF_FILTER_IN_PROGRESS, NF_FILTER_NOT_STARTED };
     for (int f = 0; f < 8; f++) {
         for (int i = 0; i < 8; i++) {
-            QString s = nf_menu_row_label(NF_MENU_FILTER, i, NF_SORT_NAME, false, filters[f]);
+            QString s = nf_menu_row_label(NF_MENU_FILTER, i, NF_SORT_NAME, false, filters[f], nf_view_flags_default());
             CHECK(!s.contains(QStringLiteral("  ")));
             CHECK(!s.isEmpty());
         }
@@ -1442,9 +1468,9 @@ static void test_selecting_a_different_key_keeps_the_direction(void) {
     nf_sort_key picked = NF_SORT_NAME;
     CHECK(nf_menu_sort_key_at(3, &picked));
     CHECK(picked == NF_SORT_ADDED);
-    CHECK_EQ_STR(nf_menu_row_label(NF_MENU_SORT, 3, picked, true, NF_FILTER_ALL),
-                 "* added v (tap for ^)");
-    CHECK_EQ_STR(nf_sort_bar_label(picked, true), "sort: added v");
+    CHECK_EQ_STR(nf_menu_row_label(NF_MENU_SORT, 3, picked, true, NF_FILTER_ALL, nf_view_flags_default()),
+                 "* added (desc) (tap for asc)");
+    CHECK_EQ_STR(nf_sort_bar_label(picked, true), "sort: added (desc)");
 }
 
 // Same contract as nf_row_suffix/nf_icon_badge: a caller that wants only one
@@ -1463,6 +1489,386 @@ static void test_page_bar_accepts_null_outputs(void) {
     QString only;
     nf_page_bar_labels(1, 4, NULL, NULL, &only, NULL, NULL);
     CHECK_EQ_STR(only, "page 2/4");
+}
+
+
+// --- the view flags -----------------------------------------------------
+
+// Field-by-field, because a memcmp over a struct of bools can read padding
+// the standard does not require to be zero.
+static bool nf_test_view_eq(nf_view_flags a, nf_view_flags b) {
+    return a.fullNames      == b.fullNames
+        && a.hideExtensions == b.hideExtensions
+        && a.hideCovers     == b.hideCovers
+        && a.showHidden     == b.showHidden
+        && a.showSize       == b.showSize;
+}
+
+// THE .bss PROPERTY, made checkable. nfview.cc keeps a copy of this struct at
+// FILE SCOPE, which CLAUDE.md allows only for POD with a constant initialiser
+// -- and the reason that rule exists (NickelHook's nh_init runs before this
+// translation unit's dynamic initialisers, and a file-scope non-POD read there
+// is a load through an unconstructed pointer) means a zeroed copy is a state
+// to design for, not to rule out. Every default being `false` is what makes a
+// zeroed copy read as "the browser as it has always behaved".
+//
+// The negative control is the second half: a struct with a flag SET must not
+// compare equal to the defaults, or the comparison above would be vacuous and
+// would pass just as happily against a function that ignored its argument.
+static void test_zeroed_view_flags_are_the_defaults(void) {
+    nf_view_flags zeroed;
+    // Written field by field rather than memset, for the same padding reason
+    // as nf_test_view_eq -- and because this is what a .bss copy looks like.
+    zeroed.fullNames = zeroed.hideExtensions = zeroed.hideCovers
+        = zeroed.showHidden = zeroed.showSize = false;
+    CHECK(nf_test_view_eq(zeroed, nf_view_flags_default()));
+
+    // ...and the macro nfview.cc's file-scope copy actually uses agrees with
+    // the function every default argument in this project hands out.
+    nf_view_flags fromMacro = NF_VIEW_FLAGS_DEFAULT;
+    CHECK(nf_test_view_eq(fromMacro, nf_view_flags_default()));
+
+    nf_view_flags changed = nf_view_flags_default();
+    changed.hideCovers = true;
+    CHECK(!nf_test_view_eq(changed, nf_view_flags_default()));
+}
+
+// ONE toggle, ONE field. nfview.cc flips a flag through this pointer and has
+// no switch of its own, so a toggle wired to the wrong field here would
+// silently make one menu row change another row's setting.
+static void test_view_flag_maps_each_toggle_to_its_own_field(void) {
+    nf_view_toggle const all[] = { NF_VIEW_FILENAMES, NF_VIEW_EXTENSIONS,
+                                   NF_VIEW_COVERS, NF_VIEW_HIDDEN, NF_VIEW_SIZE };
+    for (int i = 0; i < 5; i++) {
+        nf_view_flags v = nf_view_flags_default();
+        bool *flag = nf_view_flag(&v, all[i]);
+        CHECK(flag != NULL);
+        if (!flag)
+            continue;
+        *flag = true;
+        // Exactly one field moved, and it is the one the OTHER four toggles
+        // do not point at.
+        int moved = 0;
+        for (int k = 0; k < 5; k++) {
+            bool *other = nf_view_flag(&v, all[k]);
+            if (other && *other)
+                moved++;
+        }
+        CHECK(moved == 1);
+    }
+
+    // The refusals. A NULL struct, and a value outside the enum, must both
+    // hand back NULL rather than a pointer into something -- the same
+    // refuse-rather-than-guess rule as nf_menu_sort_key_at's, and the negative
+    // control that makes the five successes above mean something.
+    CHECK(nf_view_flag(NULL, NF_VIEW_COVERS) == NULL);
+    nf_view_flags v = nf_view_flags_default();
+    CHECK(nf_view_flag(&v, (nf_view_toggle)99) == NULL);
+}
+
+// The row order this menu documents, pinned the same way the sort and filter
+// menus' orders are. Unlike theirs it preserves no cycle a reader has learned
+// on hardware -- this menu has no predecessor -- so what it pins is simply
+// that the order does not drift between builds under a reader's fingers.
+static void test_view_menu_rows_are_the_documented_order(void) {
+    CHECK(nf_menu_row_count(NF_MENU_VIEW) == 5);
+
+    nf_view_toggle const want[] = { NF_VIEW_FILENAMES, NF_VIEW_EXTENSIONS,
+                                    NF_VIEW_COVERS, NF_VIEW_HIDDEN, NF_VIEW_SIZE };
+    for (int i = 0; i < 5; i++) {
+        nf_view_toggle got = NF_VIEW_SIZE;
+        CHECK(nf_menu_view_toggle_at(i, &got));
+        CHECK(got == want[i]);
+    }
+}
+
+static void test_view_menu_index_out_of_range_refuses_and_writes_nothing(void) {
+    nf_view_toggle t = NF_VIEW_COVERS;
+    CHECK(!nf_menu_view_toggle_at(-1, &t));
+    CHECK(!nf_menu_view_toggle_at(5, &t));
+    CHECK(t == NF_VIEW_COVERS); // untouched
+    CHECK(nf_menu_view_toggle_at(0, NULL));
+    CHECK(!nf_menu_view_toggle_at(99, NULL));
+    CHECK(nf_menu_row_label(NF_MENU_VIEW, -1, NF_SORT_NAME, false, NF_FILTER_ALL,
+                            nf_view_flags_default()).isEmpty());
+    CHECK(nf_menu_row_label(NF_MENU_VIEW, 5, NF_SORT_NAME, false, NF_FILTER_ALL,
+                            nf_view_flags_default()).isEmpty());
+}
+
+// EVERY VIEW ROW STATES ITS OWN STATE, IN ITS OWN TEXT, in both states. This
+// panel has four grey levels and "slightly lighter" reads as "the same", which
+// is the same finding that puts "[not in library]" into a row's words -- so a
+// toggle whose state lived in styling would be a toggle a reader could not
+// read at all.
+static void test_view_rows_show_their_state_in_the_text(void) {
+    nf_view_flags def = nf_view_flags_default();
+    CHECK_EQ_STR(nf_menu_row_label(NF_MENU_VIEW, 0, NF_SORT_NAME, false, NF_FILTER_ALL, def),
+                 "filenames: truncated");
+    CHECK_EQ_STR(nf_menu_row_label(NF_MENU_VIEW, 1, NF_SORT_NAME, false, NF_FILTER_ALL, def),
+                 "extensions: shown");
+    CHECK_EQ_STR(nf_menu_row_label(NF_MENU_VIEW, 2, NF_SORT_NAME, false, NF_FILTER_ALL, def),
+                 "covers: on");
+    CHECK_EQ_STR(nf_menu_row_label(NF_MENU_VIEW, 3, NF_SORT_NAME, false, NF_FILTER_ALL, def),
+                 "hidden files: hidden");
+    CHECK_EQ_STR(nf_menu_row_label(NF_MENU_VIEW, 4, NF_SORT_NAME, false, NF_FILTER_ALL, def),
+                 "size: hidden");
+
+    nf_view_flags on;
+    on.fullNames = on.hideExtensions = on.hideCovers = on.showHidden = on.showSize = true;
+    CHECK_EQ_STR(nf_menu_row_label(NF_MENU_VIEW, 0, NF_SORT_NAME, false, NF_FILTER_ALL, on),
+                 "filenames: full");
+    CHECK_EQ_STR(nf_menu_row_label(NF_MENU_VIEW, 1, NF_SORT_NAME, false, NF_FILTER_ALL, on),
+                 "extensions: hidden");
+    CHECK_EQ_STR(nf_menu_row_label(NF_MENU_VIEW, 2, NF_SORT_NAME, false, NF_FILTER_ALL, on),
+                 "covers: off");
+    CHECK_EQ_STR(nf_menu_row_label(NF_MENU_VIEW, 3, NF_SORT_NAME, false, NF_FILTER_ALL, on),
+                 "hidden files: shown");
+    CHECK_EQ_STR(nf_menu_row_label(NF_MENU_VIEW, 4, NF_SORT_NAME, false, NF_FILTER_ALL, on),
+                 "size: shown");
+
+    // THE NEGATIVE CONTROL: every row's text must actually MOVE when its flag
+    // moves. Without this, a label built off the wrong field -- or off no
+    // field at all -- would satisfy every equality above for one of the two
+    // states and be wrong for the other, and a reader would be told "covers:
+    // on" on a screen with no covers on it.
+    for (int i = 0; i < 5; i++) {
+        QString a = nf_menu_row_label(NF_MENU_VIEW, i, NF_SORT_NAME, false, NF_FILTER_ALL, def);
+        QString b = nf_menu_row_label(NF_MENU_VIEW, i, NF_SORT_NAME, false, NF_FILTER_ALL, on);
+        CHECK(a != b);
+        // ...and the row is still recognisably about the same setting, so the
+        // difference is the STATE and not the whole row.
+        CHECK(a.section(QLatin1Char(':'), 0, 0) == b.section(QLatin1Char(':'), 0, 0));
+    }
+}
+
+// NO "* " MARK ON ANY VIEW ROW. The other two menus use it for "this is the
+// one in force", which is a question a set of independent toggles does not
+// ask -- and one glyph meaning two things on adjacent screens is how a reader
+// learns the wrong one. Also: no collapsible space runs, same rule and same
+// reason as the sort/filter rows'.
+static void test_view_rows_carry_no_active_mark_and_no_space_runs(void) {
+    for (int bits = 0; bits < 32; bits++) {
+        nf_view_flags v;
+        v.fullNames      = (bits & 1)  != 0;
+        v.hideExtensions = (bits & 2)  != 0;
+        v.hideCovers     = (bits & 4)  != 0;
+        v.showHidden     = (bits & 8)  != 0;
+        v.showSize       = (bits & 16) != 0;
+        for (int i = 0; i < 5; i++) {
+            QString row = nf_menu_row_label(NF_MENU_VIEW, i, NF_SORT_NAME, false,
+                                            NF_FILTER_ALL, v);
+            CHECK(!row.isEmpty());
+            CHECK(!row.startsWith(QLatin1Char('*')));
+            CHECK(!row.contains(QStringLiteral("  ")));
+            CHECK(row.contains(QStringLiteral(": ")));
+        }
+    }
+}
+
+// The bar cannot show five toggles in one slot, so it shows whether ANY of
+// them has been changed. The negative control is the whole test: flipping each
+// flag ON ITS OWN must reach "custom", or the bar would quietly keep saying
+// "default" for a mode that is not the default -- exactly the misattribution
+// this feature's logging exists to prevent, one level up.
+static void test_view_bar_label_says_custom_for_every_single_flip(void) {
+    CHECK_EQ_STR(nf_view_bar_label(nf_view_flags_default()), "view: default");
+
+    nf_view_toggle const all[] = { NF_VIEW_FILENAMES, NF_VIEW_EXTENSIONS,
+                                   NF_VIEW_COVERS, NF_VIEW_HIDDEN, NF_VIEW_SIZE };
+    for (int i = 0; i < 5; i++) {
+        nf_view_flags v = nf_view_flags_default();
+        bool *flag = nf_view_flag(&v, all[i]);
+        CHECK(flag != NULL);
+        if (!flag)
+            continue;
+        *flag = true;
+        CHECK_EQ_STR(nf_view_bar_label(v), "view: custom");
+        // ...and flipping it back reaches "default" again, so this is reading
+        // the flag rather than latching on the first change it ever saw.
+        *flag = false;
+        CHECK_EQ_STR(nf_view_bar_label(v), "view: default");
+    }
+}
+
+// The per-build log line is built out of the MENU'S OWN ROWS, so a screenshot
+// and the log can never disagree about what mode the browser was in. Checked
+// by containment rather than by restating the words, which would be the second
+// spelling this property exists to rule out.
+static void test_view_flags_summary_is_the_menu_rows(void) {
+    nf_view_flags v = nf_view_flags_default();
+    v.hideCovers = true;
+    v.showSize   = true;
+
+    QString summary = nf_view_flags_summary(v);
+    for (int i = 0; i < 5; i++) {
+        CHECK(summary.contains(nf_menu_row_label(NF_MENU_VIEW, i, NF_SORT_NAME, false,
+                                                 NF_FILTER_ALL, v)));
+    }
+    // All five, separated -- not one row and a truncation.
+    CHECK(summary.count(QStringLiteral(" | ")) == 4);
+    // The negative control: the summary must describe THIS mode, not the
+    // default one. "covers: on" is the default row and must be absent.
+    CHECK(summary.contains(QStringLiteral("covers: off")));
+    CHECK(!summary.contains(QStringLiteral("covers: on")));
+    // nh_log truncates at 256 bytes SILENTLY (CLAUDE.md), and nfview.cc adds a
+    // prefix and an items/page tail to this, so a summary anywhere near that
+    // limit would lose the last rows without saying so.
+    CHECK(summary.length() < 160);
+}
+
+// --- the page size, per mode --------------------------------------------
+
+// BOTH MODES' ARITHMETIC, restated as bounds rather than as the two answers
+// alone: the answers on their own would pass against a function that returned
+// two hardcoded numbers unrelated to the geometry, which is precisely the
+// thing this project has been burned by (a page size of 14, then 12, read off
+// a screenshot's margin rather than counted).
+static void test_items_per_page_for_both_modes(void) {
+    int const chrome = NF_CHROME_BARS * NF_CHROME_BAR_PX;   // 150
+    int const avail  = NF_CONTENT_AREA_PX - chrome;         // 1180
+    int const coverRow = NF_COVER_H_PX + NF_FONT_DESCENT_PX; // 99, since the cover is taller than the ascent
+
+    // The measured identity the text-row constant rests on: a text row is the
+    // font's ascent plus its descent, which is also why a cover no taller than
+    // the ascent would cost nothing. A re-measurement that broke this would
+    // otherwise be absorbed silently.
+    CHECK(NF_FONT_ASCENT_PX + NF_FONT_DESCENT_PX == NF_TEXT_ROW_PX);
+    CHECK(NF_COVER_H_PX > NF_FONT_ASCENT_PX);
+
+    int withCovers = nf_items_per_page(true);
+    CHECK(withCovers == 11);
+    CHECK(withCovers * coverRow + chrome <= NF_CONTENT_AREA_PX);        // 1239 <= 1330
+    CHECK((withCovers + 1) * coverRow + chrome > NF_CONTENT_AREA_PX);   // 1338 >  1330
+
+    int noCovers = nf_items_per_page(false);
+    CHECK(noCovers == 15);
+    CHECK(noCovers * NF_TEXT_ROW_PX + chrome <= NF_CONTENT_AREA_PX);      // 1275 <= 1330
+    CHECK((noCovers + 1) * NF_TEXT_ROW_PX + chrome > NF_CONTENT_AREA_PX); // 1350 >  1330
+
+    // THE NEGATIVE CONTROL: the two modes must differ. A function that ignored
+    // its argument would satisfy one of the two exact answers above and, if
+    // both happened to be written to the same number, every bound as well.
+    CHECK(withCovers != noCovers);
+    CHECK(noCovers > withCovers);
+    // Taller rows can never fit MORE of themselves.
+    CHECK(avail / coverRow <= avail / NF_TEXT_ROW_PX);
+}
+
+// --- human-readable sizes -----------------------------------------------
+
+// The unit boundaries, both sides of each, plus the rounding. Written as
+// literals rather than as expressions over the same constants the function
+// uses, so a changed divisor fails here instead of following along.
+static void test_format_size_units(void) {
+    CHECK_EQ_STR(nf_format_size(0),    QString(QStringLiteral("0%1B")).arg(nf_nbsp()).toUtf8().constData());
+    CHECK_EQ_STR(nf_format_size(512),  QString(QStringLiteral("512%1B")).arg(nf_nbsp()).toUtf8().constData());
+    CHECK_EQ_STR(nf_format_size(1023), QString(QStringLiteral("1023%1B")).arg(nf_nbsp()).toUtf8().constData());
+    CHECK_EQ_STR(nf_format_size(1024), QString(QStringLiteral("1.0%1KB")).arg(nf_nbsp()).toUtf8().constData());
+    CHECK_EQ_STR(nf_format_size(1536), QString(QStringLiteral("1.5%1KB")).arg(nf_nbsp()).toUtf8().constData());
+    CHECK_EQ_STR(nf_format_size(1024LL * 1024),      QString(QStringLiteral("1.0%1MB")).arg(nf_nbsp()).toUtf8().constData());
+    CHECK_EQ_STR(nf_format_size(1024LL * 1024 * 1024), QString(QStringLiteral("1.0%1GB")).arg(nf_nbsp()).toUtf8().constData());
+
+    // The reference card's own shape: a ~12 MB comic archive.
+    CHECK_EQ_STR(nf_format_size(12345678), QString(QStringLiteral("11.8%1MB")).arg(nf_nbsp()).toUtf8().constData());
+
+    // The rounding CARRY. 1024*1024 - 1 rounds to 1024.0 KB at one decimal
+    // place, which must read as "1.0 MB" and never as "1024.0 KB": an integer
+    // rounding that carried out of the fraction and was not renormalised is
+    // exactly the kind of arithmetic slip that looks right on every other
+    // input.
+    CHECK_EQ_STR(nf_format_size(1024LL * 1024 - 1), QString(QStringLiteral("1.0%1MB")).arg(nf_nbsp()).toUtf8().constData());
+
+    // A size far past anything on this card, to show nothing overflows on the
+    // way: ~8 EB is near qint64's ceiling.
+    CHECK(!nf_format_size(8000000000000000000LL).isEmpty());
+    CHECK(nf_format_size(8000000000000000000LL).endsWith(QStringLiteral("GB")));
+}
+
+// The space before the unit is a NON-BREAKING one, for the same reason every
+// other separator in nffmt.cc is: an ordinary space is a wrap opportunity and
+// a collapsible run, so the string would render at a width the plain twin did
+// not measure -- which is what clipped every row on 2026-09-04. The negative
+// control is the second line: an ASCII space must not appear at all.
+static void test_format_size_uses_a_non_breaking_space(void) {
+    QString s = nf_format_size(12345678);
+    CHECK(s.contains(nf_nbsp()));
+    CHECK(!s.contains(QLatin1Char(' ')));
+}
+
+// A negative size is refused, not clamped -- the same refuse-rather-than-
+// repair rule as nf_date_key_is_plausible's. Rendering it as "0 B" would hide
+// whatever produced it behind a plausible-looking answer, and the caller
+// (nf_row_suffix) simply omits an empty size.
+static void test_format_size_refuses_a_negative(void) {
+    CHECK(nf_format_size(-1).isEmpty());
+    CHECK(nf_format_size(-1024).isEmpty());
+    // ...and 0 is NOT refused: a zero-byte file is a real thing to find on a
+    // card, and this browser's job is to say what is there.
+    CHECK(!nf_format_size(0).isEmpty());
+}
+
+static nf_row nf_test_sized_row(bool isDir, bool hasRow, bool finished,
+                                int percentRead, qint64 size) {
+    nf_row r = nf_test_row(isDir, hasRow, finished, percentRead);
+    r.size = size;
+    return r;
+}
+
+// The size is an ADDITION to the state marker, never a replacement for it: a
+// file can be both 11.8 MB and [not in library], and the state marker is what
+// the row MEANS. It also has to be in the PLAIN twin, because that twin is
+// what the row's elision reserve is measured off (nfview.cc) -- a size drawn
+// without being paid for is the one-or-two characters of clipping NOTES.md
+// Task 13 records.
+static void test_row_suffix_shows_the_size_only_when_asked(void) {
+    nf_view_flags off = nf_view_flags_default();
+    nf_view_flags on  = nf_view_flags_default();
+    on.showSize = true;
+
+    nf_row const rows[] = {
+        nf_test_sized_row(false, false, false, -1, 12345678), // no library row
+        nf_test_sized_row(false, true,  true,   0, 12345678), // finished
+        nf_test_sized_row(false, true,  false, 40, 12345678), // (40%)
+        nf_test_sized_row(false, true,  false,  0, 12345678), // unread: no state marker
+    };
+    for (int i = 0; i < 4; i++) {
+        QString offMarkup, offPlain, onMarkup, onPlain;
+        nf_row_suffix(rows[i], off, &offMarkup, &offPlain);
+        nf_row_suffix(rows[i], on,  &onMarkup,  &onPlain);
+
+        // Hidden by default -- the default must be today's behaviour.
+        CHECK(!offPlain.contains(QStringLiteral("MB")));
+        // Shown when asked, and the STATE MARKER SURVIVES: the on form is the
+        // off form with the size inserted, never the size instead of it.
+        CHECK(onPlain.contains(QStringLiteral("11.8")));
+        CHECK(onPlain.endsWith(offPlain));
+        // Paid for: the reserve is measured off the plain twin, and it has to
+        // have grown by the size or the row would draw text it did not budget.
+        CHECK(onPlain.length() > offPlain.length());
+        // The twin invariant still holds with the size in it.
+        CHECK(nf_test_rendered(onMarkup) == onPlain);
+        CHECK(!onPlain.contains(QLatin1Char('&')));
+    }
+}
+
+// A FOLDER NEVER CARRIES A SIZE, even with the toggle on: a directory's
+// stat()'d size is a filesystem block size and not the sum of what is inside
+// it, so any number here would be a confident wrong answer -- the one kind
+// this project refuses to render.
+static void test_folder_rows_never_carry_a_size(void) {
+    nf_view_flags on = nf_view_flags_default();
+    on.showSize = true;
+
+    QString plain;
+    nf_row_suffix(nf_test_sized_row(true, false, false, -1, 4096), on, NULL, &plain);
+    CHECK_EQ_STR(plain, "/");
+
+    // The negative control: the same flags on a FILE of the same size do
+    // produce a size, so the silence above is the folder rule and not the
+    // toggle failing to arrive.
+    QString filePlain;
+    nf_row_suffix(nf_test_sized_row(false, true, false, 0, 4096), on, NULL, &filePlain);
+    CHECK(filePlain.contains(QStringLiteral("4.0")));
 }
 
 int main(void) {
@@ -1552,5 +1958,19 @@ int main(void) {
     test_menu_labels_have_no_collapsible_space_runs();
     test_selecting_a_different_key_keeps_the_direction();
     test_menu_lookups_accept_a_null_output();
+    test_zeroed_view_flags_are_the_defaults();
+    test_view_flag_maps_each_toggle_to_its_own_field();
+    test_view_menu_rows_are_the_documented_order();
+    test_view_menu_index_out_of_range_refuses_and_writes_nothing();
+    test_view_rows_show_their_state_in_the_text();
+    test_view_rows_carry_no_active_mark_and_no_space_runs();
+    test_view_bar_label_says_custom_for_every_single_flip();
+    test_view_flags_summary_is_the_menu_rows();
+    test_items_per_page_for_both_modes();
+    test_format_size_units();
+    test_format_size_uses_a_non_breaking_space();
+    test_format_size_refuses_a_negative();
+    test_row_suffix_shows_the_size_only_when_asked();
+    test_folder_rows_never_carry_a_size();
     NF_TEST_MAIN_END
 }

@@ -1,5 +1,49 @@
 #include "nffmt.h"
 
+// --- the view flags -----------------------------------------------------
+//
+// See nffmt.h for what each flag means, why every default is `false`, and why
+// `showHidden` is the one of the five that is allowed to change which rows
+// exist.
+
+nf_view_flags nf_view_flags_default(void) {
+    // Spelled through the macro, so the defaults exist in exactly one place
+    // and nfview.cc's file-scope copy (which MUST use the macro -- a function
+    // call at file scope is a dynamic initialiser) cannot drift from what
+    // every default argument in this project hands out.
+    nf_view_flags v = NF_VIEW_FLAGS_DEFAULT;
+    return v;
+}
+
+bool *nf_view_flag(nf_view_flags *view, nf_view_toggle toggle) {
+    if (!view)
+        return NULL;
+    // No `default:`, deliberately: this switch names every nf_view_toggle, so
+    // adding a toggle later fails the build here (-Wswitch, and both build
+    // paths use -Werror) until somebody says which field it flips. A
+    // `default:` would instead silently hand back NULL for the new toggle,
+    // i.e. a menu row that renders and does nothing when tapped.
+    switch (toggle) {
+        case NF_VIEW_FILENAMES:  return &view->fullNames;
+        case NF_VIEW_EXTENSIONS: return &view->hideExtensions;
+        case NF_VIEW_COVERS:     return &view->hideCovers;
+        case NF_VIEW_HIDDEN:     return &view->showHidden;
+        case NF_VIEW_SIZE:       return &view->showSize;
+    }
+    return NULL;
+}
+
+// The const read, defined in terms of the ONE mapping above rather than as a
+// second switch: two switches over the same enum are two things that can be
+// edited apart, and a view row labelled off the wrong field is precisely the
+// silent wrong answer this menu exists to prevent. The const_cast is safe --
+// `view` is a real, non-const object at every call site, and the pointer is
+// only ever read through here.
+static bool nf_view_flag_value(nf_view_flags const& view, nf_view_toggle toggle) {
+    bool *p = nf_view_flag(const_cast<nf_view_flags*>(&view), toggle);
+    return p ? *p : false;
+}
+
 // Hand-written rather than QCollator::setNumericMode, because QCollator needs
 // ICU and betting on ICU inside Kobo's Qt 5.2.1 is not a bet worth making.
 //
@@ -633,7 +677,101 @@ void nf_icon_badge(nf_icon_kind kind, QString *markup, QString *plain) {
         *markup = nf_to_markup(p);
 }
 
-void nf_row_suffix(nf_row const& row, QString *markup, QString *plain) {
+QString nf_format_size(qint64 bytes) {
+    // The refusal, not a clamp -- see nffmt.h. A negative size is not a small
+    // size, and "0 B" would hide whatever produced it.
+    if (bytes < 0)
+        return QString();
+
+    // 1024, not 1000, and "KB" rather than "KiB": binary multiples with the
+    // short names, which is what Kobo's own library rows show and therefore
+    // what a reader of this device already reads sizes in. Being consistent
+    // with the surrounding software matters more here than being correct
+    // about a unit suffix nobody on this panel is checking.
+    static qint64 const kUnit[] = { 1024LL * 1024 * 1024, 1024LL * 1024, 1024LL };
+    static char const *const kName[] = { "GB", "MB", "KB" };
+
+    for (int i = 0; i < 3; i++) {
+        if (bytes < kUnit[i])
+            continue;
+        qint64 unit  = kUnit[i];
+        qint64 whole = bytes / unit;
+        qint64 rem   = bytes % unit;
+        // Rounded to a tenth, in INTEGERS. `rem` is strictly below `unit`,
+        // i.e. below 2^30, so rem * 10 cannot come near overflowing a qint64
+        // -- which the obvious `bytes * 10 / unit` could, on a size this
+        // browser has no business rejecting just because it is large.
+        int tenth = (int)((rem * 10 + unit / 2) / unit);
+        if (tenth == 10) { // the rounding carried out of the fraction
+            whole++;
+            tenth = 0;
+        }
+        // ...and the carry can push `whole` to exactly 1024, i.e. one whole
+        // unit of the NEXT size up: 1 MiB - 1 byte lands in the KB branch and
+        // rounds to "1024.0 KB", which is arithmetically right and reads as a
+        // mistake. `whole` cannot exceed 1024 here -- the loop only reached
+        // this unit because `bytes` was below the previous one -- so the
+        // promotion is always to exactly 1.0 of it. No promotion exists above
+        // GB, where a large `whole` is simply the honest answer.
+        if (whole >= 1024 && i > 0)
+            return QStringLiteral("1.0%1%2").arg(nf_nbsp())
+                       .arg(QString::fromLatin1(kName[i - 1]));
+        return QStringLiteral("%1.%2%3%4").arg(whole).arg(tenth)
+                   .arg(nf_nbsp()).arg(QString::fromLatin1(kName[i]));
+    }
+
+    // Under 1 KB, including 0: whole bytes, no decimal. A "0.0 KB" row would
+    // be less informative than "512 B" and no shorter.
+    return QStringLiteral("%1%2B").arg(bytes).arg(nf_nbsp());
+}
+
+// The one state marker a FILE row carries, or nothing. Split out of
+// nf_row_suffix when the size suffix landed, so that "exactly one of these
+// three, in this priority order" stays a single `else if` chain with one
+// return path rather than becoming a chain nested inside another branch --
+// the priority IS the rule here, and it is easier to check when nothing else
+// shares the function.
+static QString nf_row_state_suffix(nf_row const& row) {
+    if (!row.hasRow) {
+        // A file with NO library row gets its reason spelled out in the
+        // label TEXT itself, not left to colour/style alone: this panel
+        // gives four grey levels, and "slightly lighter" reads as "the
+        // same", not "different". The reference card's own example is
+        // exactly one row -- Fullmetal Alchemist v26, a truncated file
+        // Nickel's own import rejected (NOTES.md) -- and it must render as
+        // clearly wrong, not silently vanish and leave a reader wondering
+        // where volume 26 went. Which is also why it must not be elided
+        // away: it is paid for out of the row budget before the name is.
+        return nf_suffix_sep() + QStringLiteral("[not in library]");
+    } else if (row.finished) {
+        // A file WITH a library row gets a progress marker: a percentage
+        // for in-progress books, a word for finished, and NOTHING for
+        // unread. "Finished" takes priority over any number sitting in
+        // percentRead -- a re-read that stopped partway through leaves a
+        // lower value there, and the word is the more informative answer
+        // regardless of what that number is.
+        //
+        // row.finished itself is DERIVED (nf_build_listing, nflist.cc) from
+        // row.readState, whose primary source is Content::getReadStatus()
+        // -- measured 0 = not started, 1 = in progress, 2 = finished
+        // (NOTES.md).
+        return nf_suffix_sep() + QStringLiteral("[finished]");
+    } else if (row.percentRead > 0) {
+        // 0% and -1 (unknown, including a firmware that moved the +140
+        // offset -- nf_volume_exists's own guard) both render as nothing,
+        // deliberately: Nickel's own BookWidget::getPercentReadString
+        // clamps display to [1,99] for the same reason an untouched book's
+        // own stored percentage is 0, not a real progress value (NOTES.md).
+        return nf_suffix_sep() + QStringLiteral("(%1%)").arg(row.percentRead);
+    }
+    // Nothing at all: an unread book with a library row. Deliberately not a
+    // word -- "unread" on the majority of rows would be noise, and its absence
+    // already means exactly that.
+    return QString();
+}
+
+void nf_row_suffix(nf_row const& row, nf_view_flags view,
+                   QString *markup, QString *plain) {
     QString p;
     if (row.isDir) {
         // A folder gets a trailing "/" as well as the folder icon. KEPT
@@ -655,37 +793,33 @@ void nf_row_suffix(nf_row const& row, QString *markup, QString *plain) {
         // it (nf_build_listing, nflist.cc: metadata is never fetched for a
         // directory row).
         p = QStringLiteral("/");
-    } else if (!row.hasRow) {
-        // A file with NO library row gets its reason spelled out in the
-        // label TEXT itself, not left to colour/style alone: this panel
-        // gives four grey levels, and "slightly lighter" reads as "the
-        // same", not "different". The reference card's own example is
-        // exactly one row -- Fullmetal Alchemist v26, a truncated file
-        // Nickel's own import rejected (NOTES.md) -- and it must render as
-        // clearly wrong, not silently vanish and leave a reader wondering
-        // where volume 26 went. Which is also why it must not be elided
-        // away: it is paid for out of the row budget before the name is.
-        p = nf_suffix_sep() + QStringLiteral("[not in library]");
-    } else if (row.finished) {
-        // A file WITH a library row gets a progress marker: a percentage
-        // for in-progress books, a word for finished, and NOTHING for
-        // unread. "Finished" takes priority over any number sitting in
-        // percentRead -- a re-read that stopped partway through leaves a
-        // lower value there, and the word is the more informative answer
-        // regardless of what that number is.
+        // ...and NO SIZE, even when the reader asked for sizes. A directory's
+        // stat()'d size is a filesystem block size, not the sum of what is
+        // inside it -- nf_row_before says the same thing on its own side about
+        // sorting folders by size -- so "4.0 KB" on a folder holding 3 GB of
+        // comics would be a confident wrong answer, which is the one kind this
+        // project refuses to render (the same rule as nf_date_key_is_plausible
+        // and the percentRead range guard). Computing a real one would mean
+        // walking the tree, which the browser deliberately never does.
+    } else {
+        // THE SIZE COMES FIRST, before whichever state marker follows, and it
+        // is an ADDITION to that marker rather than one more branch of the
+        // same either/or: a file can perfectly well be both 11.8 MB and
+        // [not in library], and hiding one behind the other would make the
+        // toggle look broken on exactly the rows it is most useful on.
         //
-        // row.finished itself is DERIVED (nf_build_listing, nflist.cc) from
-        // row.readState, whose primary source is Content::getReadStatus()
-        // -- measured 0 = not started, 1 = in progress, 2 = finished
-        // (NOTES.md).
-        p = nf_suffix_sep() + QStringLiteral("[finished]");
-    } else if (row.percentRead > 0) {
-        // 0% and -1 (unknown, including a firmware that moved the +140
-        // offset -- nf_volume_exists's own guard) both render as nothing,
-        // deliberately: Nickel's own BookWidget::getPercentReadString
-        // clamps display to [1,99] for the same reason an untouched book's
-        // own stored percentage is 0, not a real progress value (NOTES.md).
-        p = nf_suffix_sep() + QStringLiteral("(%1%)").arg(row.percentRead);
+        // First because the state marker is the louder, rarer signal and reads
+        // best at the end of the row, while a size is a routine attribute that
+        // belongs next to the name -- the same order a file manager's columns
+        // put them in. Both are paid for out of the elision reserve before the
+        // name is (nfview.cc), so neither can be the part that falls off the
+        // right edge; the order is about reading, not survival.
+        if (view.showSize) {
+            QString size = nf_format_size(row.size);
+            if (!size.isEmpty()) // empty only for a negative size -- see nf_format_size
+                p += nf_suffix_sep() + size;
+        }
+        p += nf_row_state_suffix(row);
     }
     if (plain)
         *plain = p;
@@ -767,6 +901,28 @@ QString nf_cover_path(QString const& imageId) {
                .arg(imageId);
 }
 
+int nf_items_per_page(bool covers) {
+    // An inline <img> sits on the TEXT BASELINE, so a row carrying one is
+    // max(ascent, imageHeight) + descent tall -- which is why this is a
+    // qMax and not a plain addition. A cover SHORTER than the ascent costs
+    // nothing at all in row height (the text already reserves that much), and
+    // then the two modes' page sizes coincide; today's 70 px cover is taller
+    // than the 46 px ascent, so they do not. Written this way so that lowering
+    // NF_COVER_H_PX below the ascent produces the right answer rather than a
+    // quietly pessimistic one.
+    int rowPx = covers ? (qMax(NF_FONT_ASCENT_PX, NF_COVER_H_PX) + NF_FONT_DESCENT_PX)
+                       : NF_TEXT_ROW_PX;
+    int avail = NF_CONTENT_AREA_PX - NF_CHROME_BARS * NF_CHROME_BAR_PX;
+    int n = avail / rowPx;
+    // The floor is what makes a pathological geometry degrade instead of
+    // disappear -- the same shape as nf_name_budget_px's. A page of zero items
+    // would render as an empty folder with working page arrows, which reads as
+    // "the card is broken" rather than as "the numbers above are wrong".
+    if (n < 1)
+        n = 1;
+    return n;
+}
+
 int nf_cover_width_px(int heightPx) {
     // Rounded rather than truncated: at NF_COVER_H_PX (76) the exact width
     // is 50.8, and truncating would squeeze every cover by most of a pixel
@@ -818,10 +974,11 @@ void nf_page_bar_labels(int page, int totalPages,
         *nextActive = hasNext;
 }
 
-// --- the sort and filter submenus ---------------------------------------
+// --- the sort, filter and view submenus ---------------------------------
 //
 // See nffmt.h for what the rows say, why the active one is marked in TEXT,
-// and why the row order is the cycle order these menus replaced.
+// and why the sort/filter row order is the cycle order those two menus
+// replaced.
 
 // THE ROW ORDER, once, as data rather than as a switch repeated per function:
 // the count, the value at an index and the label at an index all read the
@@ -839,13 +996,28 @@ static nf_filter_kind const NF_MENU_FILTER_ROWS[] = {
     NF_FILTER_FINISHED, NF_FILTER_IN_PROGRESS, NF_FILTER_NOT_STARTED,
 };
 
+// THE VIEW MENU'S ROW ORDER, same shape and same reasoning as the two above.
+// No cycle to preserve here -- this menu has no predecessor -- so the order is
+// chosen: the two that change what a LABEL says first (they interact with each
+// other, so they read best adjacent), then the one that changes the PAGE SIZE,
+// then the one that changes which rows EXIST, then the one that adds a
+// suffix. The one flag that is a genuine filter rather than a display choice
+// (`hidden files`) is deliberately not first, where a reader scanning the menu
+// would meet it before anything that explains the difference.
+static nf_view_toggle const NF_MENU_VIEW_ROWS[] = {
+    NF_VIEW_FILENAMES, NF_VIEW_EXTENSIONS, NF_VIEW_COVERS, NF_VIEW_HIDDEN,
+    NF_VIEW_SIZE,
+};
+
 #define NF_MENU_SORT_ROW_COUNT   ((int)(sizeof NF_MENU_SORT_ROWS / sizeof NF_MENU_SORT_ROWS[0]))
 #define NF_MENU_FILTER_ROW_COUNT ((int)(sizeof NF_MENU_FILTER_ROWS / sizeof NF_MENU_FILTER_ROWS[0]))
+#define NF_MENU_VIEW_ROW_COUNT   ((int)(sizeof NF_MENU_VIEW_ROWS / sizeof NF_MENU_VIEW_ROWS[0]))
 
 int nf_menu_row_count(nf_menu_kind menu) {
     switch (menu) {
         case NF_MENU_SORT:   return NF_MENU_SORT_ROW_COUNT;
         case NF_MENU_FILTER: return NF_MENU_FILTER_ROW_COUNT;
+        case NF_MENU_VIEW:   return NF_MENU_VIEW_ROW_COUNT;
         case NF_MENU_NONE:
         default:             return 0;
     }
@@ -864,6 +1036,14 @@ bool nf_menu_filter_at(int index, nf_filter_kind *filter) {
         return false;
     if (filter)
         *filter = NF_MENU_FILTER_ROWS[index];
+    return true;
+}
+
+bool nf_menu_view_toggle_at(int index, nf_view_toggle *toggle) {
+    if (index < 0 || index >= NF_MENU_VIEW_ROW_COUNT)
+        return false;
+    if (toggle)
+        *toggle = NF_MENU_VIEW_ROWS[index];
     return true;
 }
 
@@ -899,11 +1079,29 @@ QString nf_filter_name(nf_filter_kind filter) {
     }
 }
 
-// "^" reads as ascending (smallest/oldest/A first, pointing at the top of the
-// list) and "v" as descending, without needing a real glyph this panel may
-// not have.
+// THE DIRECTION, SPELLED OUT. This was "^" and "v" -- terse, and the owner's
+// objection is that direction is the one thing on this screen a reader should
+// not have to decode: a caret pointing at the top of the list reads as
+// "ascending" only once you have been told that it does, and a "v" next to a
+// word reads as a letter at least as readily as an arrow.
+//
+// Two forms, because the direction appears in two grammatical positions:
+//   nf_sort_dir_mark  "(asc)" / "(desc)"  -- a STATE marker, bracketed like
+//                                            the filter menu's "(active)"
+//   nf_sort_dir_word  "asc"   / "desc"    -- inside another bracket, in the
+//                                            active sort row's "(tap for
+//                                            desc)". "(tap for (desc))" reads
+//                                            as a typo, so the inner one
+//                                            drops its brackets.
+// Still plain ASCII: no glyph this panel's font may not carry, same as
+// "< BACK"/"< PREV". Still single spaces only, so the no-collapsible-run rule
+// (nffmt.h) holds.
+static QString nf_sort_dir_word(bool descending) {
+    return descending ? QStringLiteral("desc") : QStringLiteral("asc");
+}
+
 static QString nf_sort_dir_mark(bool descending) {
-    return descending ? QStringLiteral("v") : QStringLiteral("^");
+    return QStringLiteral("(%1)").arg(nf_sort_dir_word(descending));
 }
 
 QString nf_sort_bar_label(nf_sort_key key, bool descending) {
@@ -915,9 +1113,79 @@ QString nf_filter_bar_label(nf_filter_kind filter) {
     return QStringLiteral("filter: %1").arg(nf_filter_name(filter));
 }
 
+// --- the view toggles' vocabulary ---------------------------------------
+//
+// Each toggle owns TWO words -- what it is called, and what each of its two
+// states is called -- and both live here, in one switch each, for the same
+// reason nf_sort_key_name/nf_filter_name do: the menu row, the bar item and
+// the per-build log line all read them, so there is no second spelling to
+// drift. Neither switch has a `default:`, so adding a toggle fails the build
+// (-Wswitch, -Werror) until both words exist for it.
+//
+// THE STATE WORDS ARE THE TOGGLE'S OWN, not a shared on/off pair: "covers: on"
+// and "hidden files: shown" both mean "the non-default one", but "covers:
+// shown" and "hidden files: on" would each read as slightly wrong English,
+// and a menu a reader has to translate is a menu they will misread once.
+static QString nf_view_toggle_name(nf_view_toggle toggle) {
+    switch (toggle) {
+        case NF_VIEW_FILENAMES:  return QStringLiteral("filenames");
+        case NF_VIEW_EXTENSIONS: return QStringLiteral("extensions");
+        case NF_VIEW_COVERS:     return QStringLiteral("covers");
+        case NF_VIEW_HIDDEN:     return QStringLiteral("hidden files");
+        case NF_VIEW_SIZE:       return QStringLiteral("size");
+    }
+    return QString();
+}
+
+// `on` is the FLAG's value, i.e. always the non-default state -- see
+// nf_view_flags (nffmt.h) for why every flag's `false` is today's behaviour
+// and why the field names are spelled `hideExtensions`/`hideCovers` to keep
+// it that way.
+static QString nf_view_state_word(nf_view_toggle toggle, bool on) {
+    switch (toggle) {
+        case NF_VIEW_FILENAMES:  return on ? QStringLiteral("full")  : QStringLiteral("truncated");
+        case NF_VIEW_EXTENSIONS: return on ? QStringLiteral("hidden"): QStringLiteral("shown");
+        case NF_VIEW_COVERS:     return on ? QStringLiteral("off")   : QStringLiteral("on");
+        case NF_VIEW_HIDDEN:     return on ? QStringLiteral("shown") : QStringLiteral("hidden");
+        case NF_VIEW_SIZE:       return on ? QStringLiteral("shown") : QStringLiteral("hidden");
+    }
+    return QString();
+}
+
+QString nf_view_bar_label(nf_view_flags view) {
+    // Compared against the defaults FIELD BY FIELD through the same toggle
+    // table the menu lists, rather than with a memcmp: padding bytes in a
+    // struct of bools are not required to be zero, and a memcmp against a
+    // differently-constructed default could compare them. It also means a
+    // toggle added to the table is automatically part of this answer.
+    nf_view_flags def = nf_view_flags_default();
+    for (int i = 0; i < NF_MENU_VIEW_ROW_COUNT; i++) {
+        nf_view_toggle t = NF_MENU_VIEW_ROWS[i];
+        if (nf_view_flag_value(view, t) != nf_view_flag_value(def, t))
+            return QStringLiteral("view: custom");
+    }
+    return QStringLiteral("view: default");
+}
+
+QString nf_view_flags_summary(nf_view_flags view) {
+    QString out;
+    for (int i = 0; i < NF_MENU_VIEW_ROW_COUNT; i++) {
+        if (i)
+            out += QStringLiteral(" | ");
+        // THE MENU'S OWN ROW TEXT, not a second rendering of the same facts.
+        // The whole purpose of this line is to make a screenshot
+        // attributable to a mode (nffmt.h), and a log line that could say
+        // something the menu does not would defeat exactly that.
+        out += nf_menu_row_label(NF_MENU_VIEW, i, NF_SORT_NAME, false,
+                                 NF_FILTER_ALL, view);
+    }
+    return out;
+}
+
 QString nf_menu_row_label(nf_menu_kind menu, int index,
                           nf_sort_key activeKey, bool activeDesc,
-                          nf_filter_kind activeFilter) {
+                          nf_filter_kind activeFilter,
+                          nf_view_flags view) {
     if (menu == NF_MENU_SORT) {
         nf_sort_key key = NF_SORT_NAME;
         if (!nf_menu_sort_key_at(index, &key))
@@ -933,7 +1201,7 @@ QString nf_menu_row_label(nf_menu_kind menu, int index,
         // would say so.
         return QStringLiteral("* %1 %2 (tap for %3)")
                    .arg(name, nf_sort_dir_mark(activeDesc),
-                        nf_sort_dir_mark(!activeDesc));
+                        nf_sort_dir_word(!activeDesc));
     }
 
     if (menu == NF_MENU_FILTER) {
@@ -949,6 +1217,26 @@ QString nf_menu_row_label(nf_menu_kind menu, int index,
         // the only honest thing to promise -- a hint about what a tap does
         // would have to describe doing nothing.
         return QStringLiteral("* %1 (active)").arg(name);
+    }
+
+    if (menu == NF_MENU_VIEW) {
+        nf_view_toggle toggle = NF_VIEW_FILENAMES;
+        if (!nf_menu_view_toggle_at(index, &toggle))
+            return QString();
+        // "name: state", and NO "* " mark on any row: there is no active row
+        // to mark, because every row is a toggle carrying its own state
+        // rather than one of a set of which exactly one is in force. A mark
+        // here would have to mean "not the default", which is a different
+        // question from the one the other two menus' marks answer, and two
+        // meanings for the same glyph on adjacent screens is how a reader
+        // learns the wrong one.
+        //
+        // The STATE IS IN THE TEXT, which is the whole rule for this panel:
+        // four grey levels, on which "slightly lighter" reads as "the same"
+        // -- the same finding that puts "[not in library]" into a row's words
+        // rather than leaving it to colour (nf_row_suffix).
+        return QStringLiteral("%1: %2").arg(nf_view_toggle_name(toggle),
+                                            nf_view_state_word(toggle, nf_view_flag_value(view, toggle)));
     }
 
     return QString();

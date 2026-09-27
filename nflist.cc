@@ -1,19 +1,51 @@
 #include "nflist.h"
 
+// True if any two entries of `names` are the same string. Lifted out of the
+// label stage when the extension toggle landed, because that stage now has
+// TWO candidate label sets to check rather than one, and a second copy of a
+// nested loop is a second place to get the bounds wrong. Unique names must
+// stay distinguishable -- spec section 3.4.
+static bool nf_labels_collide(QStringList const& names) {
+    for (int a = 0; a < names.size(); a++) {
+        for (int b = a + 1; b < names.size(); b++) {
+            if (names.at(a) == names.at(b))
+                return true;
+        }
+    }
+    return false;
+}
+
 void nf_build_listing(QVector<nf_entry> const& entries,
                       nf_meta_fn meta, void *ctx,
                       QVector<nf_row> *out,
                       nf_filter_kind filter, nf_sort_key key, bool descending,
-                      bool *filteredToNothing) {
+                      bool *filteredToNothing, nf_view_flags view) {
     out->clear();
 
     // 1. Hide junk. FIRST, because everything downstream is computed over the
     //    set of rows that survive -- see the label stage.
+    //
+    //    `view.showHidden` suspends the DIRECTORY half of this rule, and it is
+    //    the one view flag allowed to change which rows exist (nflist.h): a
+    //    dot-directory or an .sdr sidecar cannot be "shown differently", only
+    //    listed or not. nf_is_hidden_dir itself is untouched and knows nothing
+    //    about the flag -- "shown" is precisely "the rule was not consulted",
+    //    not a second, looser copy of it.
+    //
+    //    It does NOT loosen the FILE half, and that is deliberate rather than
+    //    an oversight in a toggle whose label says "hidden files": the file
+    //    half is the book-extension allowlist (nf_is_book_name), a separate
+    //    layer answering a different question ("is this a book"), and
+    //    loosening it would show every .lua, .sqlite and .tmp on the card.
+    //    The flag's default must also stay exactly today's behaviour, and
+    //    today a dot-prefixed BOOK (".secret.cbz") is already listed, because
+    //    the allowlist admits it and nf_is_hidden_dir never sees a file. Both
+    //    of those are unchanged here.
     QVector<nf_entry> kept;
     for (int i = 0; i < entries.size(); i++) {
         nf_entry const& e = entries.at(i);
         if (e.isDir) {
-            if (!nf_is_hidden_dir(e.name))
+            if (view.showHidden || !nf_is_hidden_dir(e.name))
                 kept << e;
         } else if (nf_is_book_name(e.name)) {
             kept << e;
@@ -132,6 +164,14 @@ void nf_build_listing(QVector<nf_entry> const& entries,
     //    useful, so pooling them finds a common run of "" and silently disables
     //    stripping in any folder holding both kinds -- which on this card is the
     //    common case, Sandman having 11 folders and 3 files.
+    //
+    //    TWO VIEW FLAGS LAND HERE, and both are applied as CANDIDATE sets that
+    //    are accepted only if they survive the collision guard -- never
+    //    applied and then repaired. `names` starts as the raw on-disk names
+    //    (what every row already carries from stage 3) and is only ever
+    //    replaced wholesale by a candidate that is known good, so every
+    //    refusal below lands on exactly the behaviour that was in force
+    //    before that step.
     for (int pass = 0; pass < 2; pass++) {
         bool wantDir = (pass == 0);
         QStringList names;
@@ -142,26 +182,89 @@ void nf_build_listing(QVector<nf_entry> const& entries,
                 idx   << i;
             }
         }
-        if (names.size() < 2)
+        if (names.isEmpty())
             continue;
-        nf_strip_common(&names);
-        // Collision guard. nf_strip_common's per-row bracket truncation and
-        // trimming are NOT common to every row, so they could in principle
-        // make two labels equal. Unique names must stay distinguishable, so on
-        // any collision this set keeps its raw names. Spec section 3.4 -- the
-        // folder-on-row form of that rule belongs to v2's flat search results,
-        // where rows really can come from different folders.
-        bool collided = false;
-        for (int a = 0; a < names.size() && !collided; a++) {
-            for (int b = a + 1; b < names.size(); b++) {
-                if (names.at(a) == names.at(b)) {
-                    collided = true;
+
+        // 6a. TRUNCATION -- strip the run common to this set.
+        //
+        //     `view.fullNames` turns it off, and that is an EXPLICIT CHOICE by
+        //     the reader, not the same thing as one of nf_strip_common's own
+        //     refusals (a remainder under 2 characters, a remainder with no
+        //     letter, a collision). Those three are the function declining to
+        //     shorten a set it cannot shorten safely; this is the reader
+        //     saying they want the name as it is on disk even where it COULD
+        //     be shortened. Conflating the two would mean a reader who turned
+        //     truncation off could not tell it from a folder nf_strip_common
+        //     happened to refuse -- and, worse, would invite "fixing" the
+        //     refusals later to make the toggle feel more responsive.
+        //
+        //     The `< 2` early-out that used to guard this whole block guards
+        //     only this step now: a set of one has no common run to strip, but
+        //     it CAN still hide its extension below, and a one-file folder was
+        //     silently exempt from the extension toggle while the early-out
+        //     sat at the top.
+        if (!view.fullNames && names.size() >= 2) {
+            QStringList stripped = names;
+            nf_strip_common(&stripped);
+            // Collision guard. nf_strip_common's per-row bracket truncation and
+            // trimming are NOT common to every row, so they could in principle
+            // make two labels equal. Unique names must stay distinguishable, so
+            // on any collision this set keeps its raw names. Spec section 3.4 --
+            // the folder-on-row form of that rule belongs to v2's flat search
+            // results, where rows really can come from different folders.
+            if (!nf_labels_collide(stripped))
+                names = stripped;
+        }
+
+        // 6b. EXTENSIONS -- take a known book extension off whatever 6a left.
+        //
+        //     INDEPENDENT of 6a, and composed with it rather than fighting it:
+        //     "hidden" always REMOVES an extension that is still there, and
+        //     "shown" never ADDS one back. That asymmetry is deliberate and is
+        //     the only coherent reading -- in a uniform listing nf_strip_common
+        //     already takes the extension off as part of the common run the
+        //     reader asked to have stripped, and re-appending it under "shown"
+        //     would undo a piece of the truncation rather than reveal
+        //     anything. "shown" is therefore "today's behaviour", which is
+        //     what a default has to be.
+        //
+        //     Files only. A directory named "Comics.cbz" is a directory, and
+        //     nf_book_extension cannot tell -- the same trap nf_icon_kind_for
+        //     answers by checking isDir FIRST, answered here the same way.
+        //
+        //     THE COLLISION INTERACTION, which the extension toggle is the
+        //     first thing in this project to be able to cause on purpose:
+        //     "x.cbz" and "x.epub" both become "x". The existing guard's
+        //     answer to a collision is to fall back to RAW names, which here
+        //     would be the wrong trade -- it would throw away the truncation
+        //     the reader also asked for, to solve a problem truncation did not
+        //     cause. So this step backs out ONLY ITSELF: on a collision the
+        //     set keeps the extensions and keeps whatever 6a achieved. The
+        //     rows then read "x.cbz" / "x.epub", which is both distinguishable
+        //     and honest about why.
+        //
+        //     A bare label that is empty or all whitespace is refused for the
+        //     whole set on the same all-or-nothing basis (a file literally
+        //     named ".cbz" is the case), because a row with no text at all is
+        //     strictly worse than one with an extension on it.
+        if (view.hideExtensions && !wantDir) {
+            QStringList bare;
+            bool usable = true;
+            for (int k = 0; k < names.size(); k++) {
+                QString n = names.at(k);
+                QString ext = nf_book_extension(n);
+                if (!ext.isEmpty())
+                    n = n.left(n.length() - ext.length());
+                if (n.trimmed().isEmpty()) {
+                    usable = false;
                     break;
                 }
+                bare << n;
             }
+            if (usable && !nf_labels_collide(bare))
+                names = bare;
         }
-        if (collided)
-            continue;
+
         for (int k = 0; k < idx.size(); k++)
             (*out)[idx.at(k)].label = names.at(k);
     }

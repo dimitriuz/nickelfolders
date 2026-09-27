@@ -102,53 +102,20 @@
 // every ContentID this file builds starts with.
 #define NF_ROOT "/mnt/onboard"
 
-// Items shown per page, and the one constant in this file that is pure
-// arithmetic over device-measured geometry rather than a judgement call. Every
-// term below was measured on this panel (Kobo Libra 2, firmware 4.38.23684);
-// none of it is estimated, because every layout number this project ever
-// guessed turned out wrong -- NF_COVER_H_PX was 76 by eyeball and clipped its
-// own rows, and the page size was 14 and then 12 against a row count read off
-// a screenshot's margin rather than counted.
+// ITEMS SHOWN PER PAGE now comes from nf_items_per_page (nffmt.h), which
+// COMPUTES it from the measured panel geometry for the mode `covers` selects
+// -- 11 with covers on, 15 with them off. It used to be an NF_ITEMS_PER_PAGE
+// macro right here, with the arithmetic written out in this comment and
+// NF_COVER_H_PX's own comment (nffmt.h) carrying the same numbers from the
+// cover side; the `covers` view toggle needed a per-mode answer anyway, and
+// moving the quotient next to the constant it depends on made it
+// host-testable at the same time. Both arithmetics, both modes, and the
+// reason the page size depends on the MODE and never on what happened to land
+// on a given PAGE, are in nf_items_per_page's own comment.
 //
-//   1330 px   the content area between the first row and the bottom margin
-//             (NOTES.md; 1680 visible panel px less Nickel's own chrome)
-//     75 px   a text-or-icon row
-//     99 px   a row carrying a COVER. An inline <img> sits on the TEXT
-//             BASELINE, so such a row is max(ascent, coverHeight) + descent
-//             tall: ascent 46, descent ~29, NF_COVER_H_PX 70 -> 70 + 29.
-//
-// THE WORST CASE IS A PAGE OF NOTHING BUT COVERS, because that is the tallest
-// a page of N items can be -- an icon-only page is shorter and simply leaves
-// white space, which is the deliberate trade (a page size that varied with how
-// many covers happened to land on it would make the row count jump around as
-// you page through one folder).
-//
-// The chrome is TWO rows now, not five: one command bar across the top
-// (BACK | sort | filter) and one page bar pinned to the bottom (PREV | page
-// N/M | NEXT), each a single row of independently tappable TouchLabels in a
-// horizontal layout rather than a full-width row apiece. Both are
-// unconditional -- see the page bar's own comment for why its ends stay
-// present-but-inert rather than disappearing -- so there is no
-// fewer-chrome-rows case to make this number conditional on.
-//
-//   N * 99 + 2 * 75 <= 1330   ->   N <= (1330 - 150) / 99 = 11.92   ->   11
-//
-// 11 * 99 + 150 = 1239, with 91 px to spare -- less than one row of either
-// height, so 11 is the real ceiling here and not a conservative pick. 12
-// would need 1338 and overflow by 8.
-//
-// THAT IS TWO ROWS BACK, NOT THREE. Dropping three full-width chrome rows
-// frees 3 * 75 = 225 px, which is three more ITEM rows only if items are text
-// rows; against the 99 px cover rows that bound this number it is 2.27, and
-// the fraction is not spendable. The brief's "about three" is right for the
-// wrong page.
-//
-// COUPLED TO NF_COVER_H_PX (nffmt.h) -- change either one and you must redo
-// the arithmetic above; its comment carries the same numbers from the cover
-// side. A first device screenshot must COUNT the item rows on a full page: if
-// it shows fewer than 11, the 1330/75/99 terms are what to re-measure, not
-// this quotient.
-#define NF_ITEMS_PER_PAGE 11
+// A first device screenshot must still COUNT the item rows on a full page, in
+// BOTH modes. If either shows fewer than nf_items_per_page returns, the
+// 1330/75/99 terms in nffmt.h are what to re-measure, not this file.
 
 // PAGINATION, not scrolling -- a deliberate choice, not a shortcut, and
 // the reasoning is load-bearing enough to spell out here so nobody
@@ -278,6 +245,25 @@ static nf_sort_key    nf_browser_sort_key  = NF_SORT_NAME;
 static bool           nf_browser_sort_desc = false;
 static nf_filter_kind nf_browser_filter    = NF_FILTER_ALL;
 
+// The five view toggles (nf_view_flags, nffmt.h), and the same POD-with-a-
+// constant-initialiser discipline as the three statics above, for the same
+// load-bearing reason: NF_VIEW_FLAGS_DEFAULT is a brace-enclosed list of
+// `false`s that the compiler folds at link time, not a constructor call
+// needing a runtime _GLOBAL__sub_I entry that NickelHook's nh_init would race
+// (see nf_browser_active_dialog's own comment for the crash that established
+// the rule). It is a MACRO and not nf_view_flags_default() for exactly that
+// reason -- a function call here would be a dynamic initialiser -- and
+// nffmt.cc's own nf_view_flags_default is defined in terms of the same macro
+// so the two cannot drift. Every field being `false` also means a .bss-zeroed
+// copy reads as today's behaviour rather than as a mode nobody asked for.
+//
+// PERSISTS across navigation, exactly like the sort key and the filter, and
+// for the same reason: a reader who turned covers off or asked for full
+// filenames means it for the browser, not for one folder. And, unlike
+// nf_browser_menu, it is NOT reset by nf_browser_show either -- a trigger
+// means "show me the listing", not "undo the way I set this up".
+static nf_view_flags nf_browser_view = NF_VIEW_FLAGS_DEFAULT;
+
 // THE BROWSER'S MODE: browsing the item listing (NF_MENU_NONE), or showing
 // one of the two submenus in place of it. Tapping `sort:`/`filter:` in the
 // command bar used to CYCLE to the next value, which took up to eight taps to
@@ -309,6 +295,7 @@ static char const *nf_menu_name(nf_menu_kind menu) {
     switch (menu) {
         case NF_MENU_SORT:   return "SORT MENU";
         case NF_MENU_FILTER: return "FILTER MENU";
+        case NF_MENU_VIEW:   return "VIEW MENU";
         case NF_MENU_NONE:
         default:             return "BROWSE";
     }
@@ -433,6 +420,14 @@ static QString nf_sort_row_label(void) {
 
 static QString nf_filter_row_label(void) {
     return nf_filter_bar_label(nf_browser_filter);
+}
+
+// The third bar item. It cannot show its setting the way the two above do --
+// five toggles, one ~316 px slot -- so it says whether anything has been
+// changed at all and leaves the detail to the menu one tap away
+// (nf_view_bar_label, nffmt.cc, which has the full reasoning).
+static QString nf_view_row_label(void) {
+    return nf_view_bar_label(nf_browser_view);
 }
 
 static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool resetPage);
@@ -586,7 +581,7 @@ static void nf_browser_back(void *mwc, N3Dialog *dialog) {
 // the borrowed set (15x26 / 50x50 / 80x80) could not have.
 //
 // 40 is the SAFE BUDGET, not an aesthetic pick: the panel's measured capacity
-// is 17 rows on 1680 visible px, NF_ITEMS_PER_PAGE is keyed to that, and every
+// is 17 rows on 1680 visible px, nf_items_per_page is keyed to that, and every
 // px of row height risks it. 40 was already the forced <img> height of the
 // borrowed set and the device did NOT grow rows at it, which is the whole
 // reason it is reused here rather than raised. Do not raise it without a
@@ -1348,7 +1343,8 @@ static QString nf_row_leading_markup(nf_icon_kind kind, QString const& coverPath
         // but ascent is 46 px on this device, which made the cover 31x46, so
         // close to the type icon it replaced that the feature stopped earning
         // its row. The owner chose the other fix: let the row grow and take
-        // the cost in items per page (12 -> 9, NF_ITEMS_PER_PAGE).
+        // the cost in items per page (12 -> 9, and 11 after the two chrome
+        // bars landed -- nf_items_per_page, nffmt.h).
         //
         // So the row IS taller than a text row now, by design, and the page
         // size is what absorbs it. `fm` stays a parameter because the charged
@@ -1376,9 +1372,9 @@ static QString nf_row_leading_markup(nf_icon_kind kind, QString const& coverPath
         // WIDTH AND HEIGHT ARE FORCED, and that is what keeps the 12-rows-per-
         // page budget: an unsized <img> lays out at the JPEG's native 149x223
         // and would nearly triple the row height, silently costing items off
-        // every page (NF_ITEMS_PER_PAGE's own comment, and NF_COVER_H_PX's in
+        // every page (nf_items_per_page's own comment, and NF_COVER_H_PX's in
         // nffmt.h, for why that number is the owner's and what to do if a
-        // screenshot shows fewer than 12).
+        // screenshot shows fewer rows than it returns).
         return QStringLiteral("<img src=\"%1\" width=\"%2\" height=\"%3\">&nbsp;")
                    .arg(coverPath.toHtmlEscaped()).arg(w).arg(h);
     }
@@ -1397,11 +1393,11 @@ static QString nf_row_leading_markup(nf_icon_kind kind, QString const& coverPath
 // --- the two chrome bars -----------------------------------------------
 //
 // The chrome used to be FIVE full-width rows stacked above the items --
-// "<< BACK", "page N/M", "NEXT PAGE >", "sort: name ^", "filter: all" -- one
+// "<< BACK", "page N/M", "NEXT PAGE >", "sort: name (asc)", "filter: all" -- one
 // TouchLabel each, one per line of the panel. It is now two horizontal bars:
-// a command bar across the top (BACK | sort | filter) and a page bar pinned
+// a command bar across the top (BACK | sort | filter | view) and a page bar pinned
 // to the bottom (PREV | page N/M | NEXT). Three rows of panel come back,
-// which is what paid for NF_ITEMS_PER_PAGE going 9 -> 11 (see its own
+// which is what paid for the page size going 9 -> 11 (see nf_items_per_page's own
 // arithmetic above; against 99 px cover rows those 225 px buy two items, not
 // three).
 //
@@ -1481,9 +1477,9 @@ struct nf_bar_item {
     char const *name;
 };
 
-// Four is what the command bar will want once file operations land (BACK,
-// sort, filter, plus whatever they add); six leaves both bars room to grow
-// without this becoming the thing that has to be edited. Overflow is dropped
+// Four is what the command bar holds today (BACK, sort, filter, view); six
+// leaves both bars room to grow -- file operations are the next task -- without
+// this becoming the thing that has to be edited. Overflow is dropped
 // from the LOG only, never from the bar -- see nf_bar_record.
 #define NF_BAR_MAX_ITEMS 6
 
@@ -1512,7 +1508,8 @@ static void nf_bar_record(nf_bar_item *items, int *n, QWidget *w, char const *na
 // means setContent is not laying the content out, which is itself the finding.
 static void nf_log_bar_geometry(char const *bar, nf_bar_item const *items, int n, int contentW) {
     // 160, not 256: nh_log truncates at 256 bytes SILENTLY (CLAUDE.md), and
-    // the prefix below spends some of that. Three items cost ~75 characters.
+    // the prefix below spends some of that. An item costs ~23 characters, so
+    // the command bar's four fit with room; NF_BAR_MAX_ITEMS' six would too.
     char line[160];
     line[0] = '\0';
     int off = 0;
@@ -1542,7 +1539,7 @@ static void nf_log_bar_geometry(char const *bar, nf_bar_item const *items, int n
 // width log line below -- 1264 -> 1196), and a NESTED layout gets its own
 // copy of them. Left at the default, each bar would be inset by another 34
 // px top and bottom, i.e. ~68 px taller than the row it contains -- which
-// would quietly break NF_ITEMS_PER_PAGE's arithmetic, since that counts each
+// would quietly break nf_items_per_page's arithmetic, since that counts each
 // bar as one 75 px row. The bars sit inside the outer QVBoxLayout, which
 // already pays the horizontal margins for them.
 //
@@ -1609,7 +1606,7 @@ static void nf_build_listing_content(void *mwc, N3Dialog *dialog, QString const 
     bool filteredToNothing = false;
     nf_build_listing(raw, &nf_row_meta, &ctx, &rows,
                      nf_browser_filter, nf_browser_sort_key, nf_browser_sort_desc,
-                     &filteredToNothing);
+                     &filteredToNothing, nf_browser_view);
 
     // COVER PATHS, resolved for the WHOLE listing and not just for the twelve
     // rows this page will draw. Two reasons, and the second is the important
@@ -1630,40 +1627,53 @@ static void nf_build_listing_content(void *mwc, N3Dialog *dialog, QString const 
     // row are skipped before any path is built). That is cheap next to the
     // getById round trip each of those rows already made, and it holds no
     // handle -- see nf_cover_path_for_row.
+    //
+    // SKIPPED ENTIRELY when the reader has turned covers off: every entry
+    // stays empty, so every row falls back to its type icon through
+    // nf_row_leading_markup's existing no-cover branch, and not one stat()
+    // happens. The tally is not printed either -- over a listing with covers
+    // off it would balance trivially (0 shown) and say nothing, which is
+    // worse than silence because a partition that always adds up is not a
+    // check. The one line below says why it is missing, so a log with no
+    // cover tally is never mistaken for a cover tally that failed to run.
     QVector<QString> coverPaths(rows.size());
-    int nCover = 0, nNoCoverFile = 0, nNoRow = 0, nDirs = 0, nBlankImageId = 0;
-    for (int i = 0; i < rows.size(); i++) {
-        nf_row const &cr = rows.at(i);
-        if (cr.isDir) {
-            nDirs++;
-            continue;
+    if (nf_browser_view.hideCovers) {
+        nh_log("covers: OFF by the view setting -- no cover paths resolved, no stat() made, every row draws its type icon");
+    } else {
+        int nCover = 0, nNoCoverFile = 0, nNoRow = 0, nDirs = 0, nBlankImageId = 0;
+        for (int i = 0; i < rows.size(); i++) {
+            nf_row const &cr = rows.at(i);
+            if (cr.isDir) {
+                nDirs++;
+                continue;
+            }
+            if (!cr.hasRow) {
+                nNoRow++;
+                continue;
+            }
+            coverPaths[i] = nf_cover_path_for_row(cr);
+            if (coverPaths.at(i).isEmpty()) {
+                nNoCoverFile++;
+                // Counted separately because it is a DIFFERENT fact: a blank
+                // ImageId means the library row itself names no image, where an
+                // empty path with a non-blank id means the JPEG has not been
+                // rendered yet. If this number ever equals nNoCoverFile for a
+                // whole card, the ImageId read is what to look at, not the path
+                // scheme.
+                if (cr.imageId.isEmpty())
+                    nBlankImageId++;
+            } else {
+                nCover++;
+            }
         }
-        if (!cr.hasRow) {
-            nNoRow++;
-            continue;
-        }
-        coverPaths[i] = nf_cover_path_for_row(cr);
-        if (coverPaths.at(i).isEmpty()) {
-            nNoCoverFile++;
-            // Counted separately because it is a DIFFERENT fact: a blank
-            // ImageId means the library row itself names no image, where an
-            // empty path with a non-blank id means the JPEG has not been
-            // rendered yet. If this number ever equals nNoCoverFile for a
-            // whole card, the ImageId read is what to look at, not the path
-            // scheme.
-            if (cr.imageId.isEmpty())
-                nBlankImageId++;
-        } else {
-            nCover++;
-        }
+        // The four buckets partition the listing exactly -- nCover +
+        // nNoCoverFile + nNoRow + nDirs == rows.size() -- which is what makes
+        // this checkable at a glance instead of merely informative. The total is
+        // printed alongside them so a partition that stops adding up is visible
+        // in the same line rather than needing a second one.
+        nh_log("covers: %d shown, %d file(s) with a row but no cover file (%d of those with a blank ImageId), %d file(s) with no library row, %d folder(s) -- %d row(s) total",
+               nCover, nNoCoverFile, nBlankImageId, nNoRow, nDirs, rows.size());
     }
-    // The four buckets partition the listing exactly -- nCover +
-    // nNoCoverFile + nNoRow + nDirs == rows.size() -- which is what makes
-    // this checkable at a glance instead of merely informative. The total is
-    // printed alongside them so a partition that stops adding up is visible
-    // in the same line rather than needing a second one.
-    nh_log("covers: %d shown, %d file(s) with a row but no cover file (%d of those with a blank ImageId), %d file(s) with no library row, %d folder(s) -- %d row(s) total",
-           nCover, nNoCoverFile, nBlankImageId, nNoRow, nDirs, rows.size());
 
     // Pagination bounds. totalPages is at least 1 even for an empty listing,
     // so "page 1/1" (below) is always a sensible thing to compute, never a
@@ -1672,15 +1682,27 @@ static void nf_build_listing_content(void *mwc, N3Dialog *dialog, QString const 
     // directory change, and PREV/NEXT below never step it out of range),
     // but a stale value surviving some path this file does not currently
     // have is a clamp, not a crash, which is cheap insurance to keep.
-    int totalPages = (rows.size() + NF_ITEMS_PER_PAGE - 1) / NF_ITEMS_PER_PAGE;
+    //
+    // THE PAGE SIZE NOW DEPENDS ON THE MODE (nf_items_per_page, nffmt.h): 11
+    // with covers on, 15 with them off, because an icon row is 75 px where a
+    // cover row is 99. Read ONCE, here, into a local -- every use below is the
+    // same number for this build, and calling the function three times would
+    // invite a future version of it that could answer differently mid-build.
+    //
+    // Turning covers ON shrinks the page, which can leave nf_browser_page past
+    // the end -- the clamp two lines down already handles it, and is the same
+    // clamp a filter that shrinks the listing relies on (nf_menu_select's own
+    // comment). Nothing extra is needed for the toggle.
+    int itemsPerPage = nf_items_per_page(!nf_browser_view.hideCovers);
+    int totalPages = (rows.size() + itemsPerPage - 1) / itemsPerPage;
     if (totalPages < 1)
         totalPages = 1;
     if (nf_browser_page >= totalPages)
         nf_browser_page = totalPages - 1;
     if (nf_browser_page < 0)
         nf_browser_page = 0;
-    int startIdx = nf_browser_page * NF_ITEMS_PER_PAGE;
-    int endIdx   = qMin(startIdx + NF_ITEMS_PER_PAGE, rows.size());
+    int startIdx = nf_browser_page * itemsPerPage;
+    int endIdx   = qMin(startIdx + itemsPerPage, rows.size());
     // hasPrev/hasNext are NOT computed here any more: the page bar asks
     // nf_page_bar_labels (nffmt.h) for both the labels and the two active
     // flags in one call, so "is this end live" has one answer, made in the
@@ -1744,7 +1766,7 @@ static void nf_build_listing_content(void *mwc, N3Dialog *dialog, QString const 
         // 2026-09-04 measurement that moved them there is recorded.
         QString suffixMarkup;
         QString suffixPlain;
-        nf_row_suffix(r, &suffixMarkup, &suffixPlain);
+        nf_row_suffix(r, nf_browser_view, &suffixMarkup, &suffixPlain);
 
         QLabel *rowLabel = reinterpret_cast<QLabel*>(row);
 
@@ -1989,7 +2011,7 @@ static void nf_build_listing_content(void *mwc, N3Dialog *dialog, QString const 
     // themselves (QLabel's vertical size policy can grow), so before this the
     // rows on a short page were stretched taller than a full page's rows. Now
     // every page's rows are the same height whatever the page holds, which is
-    // also what makes NF_ITEMS_PER_PAGE's 75/99 px terms mean one thing
+    // also what makes nf_items_per_page's 75/99 px terms mean one thing
     // rather than two.
     layout->addStretch(1);
 
@@ -2046,7 +2068,7 @@ static void nf_build_listing_content(void *mwc, N3Dialog *dialog, QString const 
     // The whole bar is still unconditional, including on a single-page
     // listing, where it renders as the counter alone with blank slots either
     // side. A bar that was sometimes absent would make the height of the item
-    // area depend on the folder, and NF_ITEMS_PER_PAGE's arithmetic counts
+    // area depend on the folder, and nf_items_per_page's arithmetic counts
     // exactly two chrome rows on every page.
     //
     // `path` is captured by value in both handlers, and nf_browser_go is
@@ -2131,10 +2153,11 @@ static void nf_build_listing_content(void *mwc, N3Dialog *dialog, QString const 
            qPrintable(path), rows.size(), nf_browser_page + 1, totalPages, endIdx - startIdx);
 }
 
-// Opens `menu`, or -- if it is the one already open -- closes it. Both
-// command-bar items run this, so "tap sort: again to put it away" and "tap
-// filter: while the sort menu is up to switch to it" are ONE rule rather than
-// two, and there is no second place for the mode to be set from a bar tap.
+// Opens `menu`, or -- if it is the one already open -- closes it. All three
+// command-bar menu items run this, so "tap sort: again to put it away" and
+// "tap filter: while the sort menu is up to switch to it" are ONE rule rather
+// than three, and there is no second place for the mode to be set from a bar
+// tap.
 //
 // Nothing about the listing changes here: the sort key, the direction, the
 // filter, the directory and the page are all untouched, so closing a menu
@@ -2149,12 +2172,15 @@ static void nf_browser_open_menu(void *mwc, N3Dialog *dialog, QString const &pat
 }
 
 // What tapping option `index` of `menu` does. Split out of the row loop's
-// lambda so the two menus' rules sit next to each other and the one asymmetry
-// between them is visible in one place: the sort menu's ALREADY-ACTIVE row
+// lambda so the three menus' rules sit next to each other and the asymmetries
+// between them are visible in one place: the sort menu's ALREADY-ACTIVE row
 // toggles direction, which is the only way direction is reachable now that
 // tapping `sort:` opens a menu instead of cycling -- and which the active
-// row's own text promises ("* date ^ (tap for v)", nffmt.cc). The filter menu
-// has no second axis, so its already-active row just closes.
+// row's own text promises ("* date (asc) (tap for desc)", nffmt.cc). The
+// filter menu has no second axis, so its already-active row just closes. The
+// VIEW menu has no active row at all: every one of its rows is a toggle, so
+// every tap flips something and there is no "select the one already selected"
+// case to answer.
 //
 // Both paths end in the same two steps: back to BROWSE, then rebuild with
 // resetPage=FALSE. FALSE, not true, is the whole "return to the page you were
@@ -2189,6 +2215,27 @@ static void nf_menu_select(void *mwc, N3Dialog *dialog, QString const &path,
         }
         nf_browser_filter = filter;
         nh_log("browser: filter -- now %s", qPrintable(nf_filter_row_label()));
+    } else if (menu == NF_MENU_VIEW) {
+        nf_view_toggle toggle = NF_VIEW_FILENAMES;
+        if (!nf_menu_view_toggle_at(index, &toggle)) {
+            nh_log("browser: view menu row %d is out of range -- ignoring the tap", index);
+            return;
+        }
+        // nf_view_flag (nffmt.cc) is the ONE place a toggle maps onto a field,
+        // so this file has no switch of its own to fall out of step with the
+        // menu's labels. A NULL is the same refusal the index check above is:
+        // a toggle this build does not know must flip nothing rather than
+        // flip something.
+        bool *flag = nf_view_flag(&nf_browser_view, toggle);
+        if (!flag) {
+            nh_log("browser: view menu row %d maps to no flag -- ignoring the tap", index);
+            return;
+        }
+        *flag = !*flag;
+        // The WHOLE flag set, not just the one that moved: the point of this
+        // line is that the next content build's rows can be attributed to a
+        // mode, and one flag's new value does not say what mode that is.
+        nh_log("browser: view -- %s", qPrintable(nf_view_flags_summary(nf_browser_view)));
     } else {
         nh_log("browser: a menu row fired with no menu open -- ignoring it");
         return;
@@ -2208,7 +2255,7 @@ static void nf_menu_select(void *mwc, N3Dialog *dialog, QString const &path,
 // on this route (nfview.h, review finding I-3). The page bar goes because
 // paging through a five- or eight-row menu is meaningless. That leaves one
 // chrome row instead of two here, i.e. MORE vertical room than the listing
-// has, so the longest menu (eight filter rows against NF_ITEMS_PER_PAGE's
+// has, so the longest menu (eight filter rows against nf_items_per_page's
 // eleven) fits with room to spare and there is no pagination to build. If a
 // menu ever grows past what one screen holds, the log line at the end is what
 // says so -- it prints both the count built and the count wanted, rather than
@@ -2234,8 +2281,13 @@ static void nf_build_menu_content(void *mwc, N3Dialog *dialog, QString const &pa
     // cycle -- so the shape is worth naming wherever a `continue` appears.
     for (int i = 0; i < want; i++) {
         QPushButton *shim = NULL;
+        // `what` is only ever a string literal (nf_new_touch_row), which is
+        // why this is a nested ternary rather than a built string -- and the
+        // three names are what a failed-allocation log line says went missing.
         QLabel *item = nf_new_touch_row(content,
-                                        menu == NF_MENU_SORT ? "sort menu" : "filter menu",
+                                        menu == NF_MENU_SORT   ? "sort menu" :
+                                        menu == NF_MENU_FILTER ? "filter menu" :
+                                                                 "view menu",
                                         &shim);
         if (!item) {
             // Already logged by nf_new_touch_row. NOT fatal and NOT a break:
@@ -2245,7 +2297,8 @@ static void nf_build_menu_content(void *mwc, N3Dialog *dialog, QString const &pa
         }
 
         QString label = nf_menu_row_label(menu, i, nf_browser_sort_key,
-                                          nf_browser_sort_desc, nf_browser_filter);
+                                          nf_browser_sort_desc, nf_browser_filter,
+                                          nf_browser_view);
 
         // THE SAME width arithmetic every item row uses, less the two terms a
         // menu row does not have (no leading image, no suffix) -- so the
@@ -2332,6 +2385,21 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
     // fail, so the line is present even for a build that then goes wrong.
     nh_log("browser: building %s content for '%s' (page %d)",
            nf_menu_name(nf_browser_menu), qPrintable(path), nf_browser_page);
+    // THE VIEW FLAGS, once per content build, for exactly the reason the mode
+    // line above exists and then some: a screenshot taken under a changed flag
+    // is indistinguishable from a rendering bug, and this project has already
+    // discarded a WORKING fix on precisely that mistake -- a flag was set, the
+    // browser re-triggered, and the screenshot showed rows built under the
+    // previous setting (which is also why a re-trigger now rebuilds rather
+    // than merely re-pushing, nf_browser_show). With five independent toggles
+    // there are 32 modes, so "which one was this screenshot?" is a question
+    // that has to be answerable from the log and cannot be answered from the
+    // picture. The items-per-page number rides along because it is DERIVED
+    // from one of them and is the single easiest thing to check a screenshot
+    // against: count the rows.
+    nh_log("browser: view -- %s (%d items/page)",
+           qPrintable(nf_view_flags_summary(nf_browser_view)),
+           nf_items_per_page(!nf_browser_view.hideCovers));
 
     QWidget *content = new QWidget();
     QVBoxLayout *layout = new QVBoxLayout(content);
@@ -2360,7 +2428,7 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
 
     // --- THE COMMAND BAR, one row across the top ------------------------
     //
-    //     < BACK        sort: name ^        filter: all
+    //     < BACK      sort: name (asc)      filter: all      view: default
     //
     // Three independently tappable TouchLabels in one horizontal layout,
     // where there used to be three full-width rows (plus the page indicator
@@ -2379,7 +2447,7 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
     // submenu that could be entered and not left would be a dead end on the
     // owner's daily-use device -- the same dead end getDialog's own X button
     // already is on this route. The two labels still read the CURRENT setting
-    // ("sort: name ^") while a menu is open, so the bar is both the status
+    // ("sort: name (asc)") while a menu is open, so the bar is both the status
     // and the way back out of the menu it opened.
     //
     // ORDER AND LABELS ARE UNCHANGED from the stacked rows this replaces --
@@ -2389,9 +2457,10 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
     // eight taps to reach a specific one, and they now open a submenu over
     // the item list instead (nf_build_menu_content).
     //
-    // ROOM FOR MORE, conceptually: file operations are the next task, and a
-    // fourth item drops into this bar as another equal slot with no
-    // arithmetic to redo (NF_ITEMS_PER_PAGE counts bars, not bar items).
+    // ROOM FOR MORE, and the `view:` item below is the first thing to take
+    // some: it dropped in as a fourth equal slot with no arithmetic to redo
+    // (nf_items_per_page counts bars, not bar items), exactly as this note
+    // predicted. File operations are the next task and go the same way.
     // Nothing is reserved for them here -- an empty placeholder control would
     // be a tap target that does nothing.
     QHBoxLayout *cmdBar   = nf_new_bar_layout();
@@ -2428,19 +2497,21 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
         }
     }
 
-    // Sort and filter. Each item shows the setting in force and OPENS THAT
+    // Sort, filter and view. Each item shows its setting and OPENS THAT
     // SETTING'S SUBMENU on a tap -- or closes it, if it is the one already
     // open (nf_browser_open_menu, which is the single place a bar tap sets
-    // the mode). Neither one changes the listing by itself any more: nothing
+    // the mode). None of the three changes the listing by itself: nothing
     // about the row set, the directory or the page moves until an option row
     // in the menu is tapped, which is what makes BACK out of a menu a genuine
     // "changed my mind" rather than an undo.
     //
-    // The old behaviour these replace was a CYCLE -- one tap advanced to the
-    // next value -- and its cost was the whole reason for this task: five
-    // sort keys times two directions and eight filter values means up to
-    // eight taps to reach a specific one, each of them a full rebuild of the
-    // listing on the way past.
+    // The old behaviour sort and filter replace was a CYCLE -- one tap
+    // advanced to the next value -- and its cost was the whole reason those
+    // menus exist: five sort keys times two directions and eight filter
+    // values means up to eight taps to reach a specific one, each of them a
+    // full rebuild of the listing on the way past. `view:` never had a cycle
+    // and never could have had one: five INDEPENDENT toggles do not form a
+    // sequence, which is why they went straight to a menu.
     {
         QPushButton *shim = NULL;
         QLabel *item = nf_new_touch_row(content, "sort", &shim);
@@ -2460,7 +2531,25 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
             QObject::connect(shim, &QPushButton::clicked, [mwc, dialog, path] {
                 nf_browser_open_menu(mwc, dialog, path, NF_MENU_FILTER);
             });
-            nf_bar_add(cmdBar, cmdItems, &nCmdItems, item, "filter", Qt::AlignRight);
+            nf_bar_add(cmdBar, cmdItems, &nCmdItems, item, "filter", Qt::AlignHCenter);
+        }
+    }
+    // The fourth item, and the one the "ROOM FOR MORE" note above predicted:
+    // it drops into the bar as another equal slot with nothing to recompute,
+    // because nf_items_per_page counts BARS, not bar items. What DID have to
+    // move is the filter item's own alignment -- it was the right-hand end of
+    // a three-slot bar and is now a middle slot, so it centres like `sort:`
+    // and this item takes the right edge. Four slots of ~316 px each, against
+    // labels of 60-150 px, so nothing is close to its slot's minimum.
+    {
+        QPushButton *shim = NULL;
+        QLabel *item = nf_new_touch_row(content, "view", &shim);
+        if (item) {
+            item->setText(nf_view_row_label());
+            QObject::connect(shim, &QPushButton::clicked, [mwc, dialog, path] {
+                nf_browser_open_menu(mwc, dialog, path, NF_MENU_VIEW);
+            });
+            nf_bar_add(cmdBar, cmdItems, &nCmdItems, item, "view", Qt::AlignRight);
         }
     }
 
@@ -2493,6 +2582,12 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
         title = QStringLiteral("Sort by");
     else if (nf_browser_menu == NF_MENU_FILTER)
         title = QStringLiteral("Filter by");
+    else if (nf_browser_menu == NF_MENU_VIEW)
+        // "View", not "View by": the other two titles complete the sentence
+        // their rows start ("Sort by" + "date"), and a view row is not the
+        // object of anything -- it is a setting with its own state written on
+        // it.
+        title = QStringLiteral("View");
     else
         title = (path == QStringLiteral(NF_ROOT))
             ? QStringLiteral("NickelFolders")
@@ -2570,10 +2665,11 @@ bool nf_browser_show(void) {
     // navigation abandons the dialog while a menu is up (tapping Home while
     // browsing, the same case nf_browser_active_dialog's re-push exists for).
     // Without this line the next trigger would build a sort menu at the root
-    // and the reader would have no idea why. The sort key, the direction and
-    // the filter deliberately do NOT reset with it -- they are preferences
-    // about how any listing is read (see their own comment), where the mode
-    // is a transient answer to "what is on screen right now".
+    // and the reader would have no idea why. The sort key, the direction, the
+    // filter and the five view flags deliberately do NOT reset with it --
+    // they are preferences about how any listing is read (see their own
+    // comments), where the mode is a transient answer to "what is on screen
+    // right now".
     nf_browser_menu = NF_MENU_NONE;
 
     if (nf_browser_active_dialog) {

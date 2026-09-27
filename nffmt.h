@@ -124,6 +124,80 @@ struct nf_row {
                readState(NF_READ_UNKNOWN), finished(false), size(0), mtime(0) {}
 };
 
+// --- the view flags -----------------------------------------------------
+//
+// What the browser SHOWS, as opposed to what it lists. Five independent
+// toggles the reader flips in the `view:` submenu (nf_menu_kind's
+// NF_MENU_VIEW, below), threaded through the pure layer so that every
+// decision each one makes -- the label, the truncation, the extension, the
+// size text, the page size -- is host-testable, and only the rendering is
+// left on the untestable side.
+//
+// THEY ARE DISPLAY CONCERNS AND MUST NOT CHANGE WHICH ROWS EXIST, with ONE
+// deliberate exception: `showHidden` is a genuine filter, because there is no
+// way to "display" an entry the listing stage dropped. Everything else
+// changes only how a surviving row is drawn or how many of them fit on a
+// page. tests/test_nflist.cc pins that separation directly -- flipping the
+// four display flags must leave the row SET identical, name for name.
+//
+// EVERY FLAG'S `false` IS TODAY'S BEHAVIOUR, and that polarity is
+// load-bearing rather than cosmetic. This struct is POD with no constructor
+// precisely so a copy of it can sit at file scope in nfview.cc without a
+// dynamic initialiser -- the construct that once boot-looped this mod into
+// NickelHook's SHARED failsafe (CLAUDE.md) -- which means a .bss-zeroed copy
+// is a real possibility to design for rather than to rule out. All-false
+// being the default makes a zeroed struct read as "the browser as it has
+// always behaved", never as a mode nobody asked for. The same reasoning as
+// NF_READ_UNKNOWN, NF_ICON_UNKNOWN and NF_MENU_NONE all being their enum's
+// zero value; test_zeroed_view_flags_are_the_defaults pins it.
+//
+// Hence the names: `hideExtensions`/`hideCovers` rather than
+// `showExtensions`/`showCovers`, which would have read better in isolation
+// and would have made zero mean "no extensions, no covers".
+struct nf_view_flags {
+    bool fullNames;      // false: labels are truncated (nf_strip_common runs). true: the name as it is on disk
+    bool hideExtensions; // false: a known book extension stays on the label
+    bool hideCovers;     // false: a row shows the book's cover where Nickel has rendered one
+    bool showHidden;     // false: nf_is_hidden_dir applies. THE ONE FLAG THAT FILTERS
+    bool showSize;       // false: no size on a file row
+};
+
+// The defaults, as a CONSTANT INITIALISER. A macro rather than a function
+// because nfview.cc's file-scope copy of this must be initialised without
+// running any code at all -- a function call there would be a dynamic
+// initialiser, i.e. exactly the `_GLOBAL__sub_I` entry CLAUDE.md forbids and
+// `nm libnfolders.so | grep GLOBAL__sub_I` checks for. Every field is spelled
+// out, in order, because GCC 4.9 rejects a designated initializer that SKIPS
+// one (CLAUDE.md) and because a short aggregate would silently acquire a new
+// field's value from nowhere if this struct ever grows.
+#define NF_VIEW_FLAGS_DEFAULT { false, false, false, false, false }
+
+// The same defaults as a VALUE, for default arguments and for callers that
+// want to say what they mean. Defined in terms of the macro above, so there
+// is one place the defaults are spelled.
+nf_view_flags nf_view_flags_default(void);
+
+// One toggle per row of the view submenu, in the order the menu lists them
+// (NF_MENU_VIEW_ROWS, nffmt.cc). Unlike nf_sort_key/nf_filter_kind there is
+// no "none" value and no zero-value trap to design around: a toggle is only
+// ever produced by nf_menu_view_toggle_at, which refuses an out-of-range
+// index rather than handing back a default.
+enum nf_view_toggle {
+    NF_VIEW_FILENAMES,   // truncated / full
+    NF_VIEW_EXTENSIONS,  // shown / hidden
+    NF_VIEW_COVERS,      // on / off
+    NF_VIEW_HIDDEN,      // hidden / shown  -- the one that filters
+    NF_VIEW_SIZE,        // hidden / shown
+};
+
+// THE ONE PLACE a toggle maps onto a field of nf_view_flags, handed back as a
+// pointer so that flipping one is `*flag = !*flag` at the call site rather
+// than a second switch over the same enum living in nfview.cc. Returns NULL
+// for a toggle this build does not know, so a nonsense value can never flip
+// the WRONG flag -- the same refuse-rather-than-guess rule as
+// nf_menu_sort_key_at's.
+bool *nf_view_flag(nf_view_flags *view, nf_view_toggle toggle);
+
 // Orders two names the way a reader expects when they contain numbers.
 // Returns <0, 0 or >0. See nffmt.cc for why this is hand-written rather than
 // QCollator.
@@ -315,6 +389,12 @@ bool nf_is_book_name(QString const& name);
 
 // True for a directory v1 hides. An extension allowlist does not touch
 // directories, so they need their own rule.
+//
+// This function is unchanged by the `hidden files` view toggle and knows
+// nothing about it: the toggle decides whether nf_build_listing CONSULTS this
+// rule at all (nflist.cc, stage 1), not what the rule says. One rule, one
+// place, and "shown" is then exactly "the rule was not applied" rather than a
+// second, looser copy of it that could drift.
 bool nf_is_hidden_dir(QString const& name);
 
 // --- row icons ----------------------------------------------------------
@@ -414,10 +494,14 @@ nf_icon_kind nf_icon_kind_for(QString const& name, bool isDir);
 // follows from it
 // (nf_cover_width_px) and the elision reserve is charged from the same
 // number that is emitted (nfview.cc).
-// COUPLED TO NF_ITEMS_PER_PAGE (nfview.cc) -- change one and you must
-// recompute the other. Both are keyed to the same measured panel geometry:
-// 1330 px of content area between the first row and the bottom margin, and
-// ~75 px per text row (17 rows total, NOTES.md).
+// COUPLED TO nf_items_per_page (below) -- which now COMPUTES the page size
+// from this constant rather than restating it, so changing this one number
+// carries the page size with it. The two used to live in different files
+// (this, and an NF_ITEMS_PER_PAGE macro in nfview.cc) with each comment
+// pointing at the other and the arithmetic written out twice; the `covers`
+// toggle needed a per-mode page size anyway, and moving the quotient onto
+// this side of the boundary made it host-testable at the same time. What is
+// still NOT automatic is the ARITHMETIC IN THE COMMENTS: redo it there.
 //
 // An inline <img> sits on the TEXT BASELINE, so a row holding one is
 // `max(ascent, coverHeight) + descent` tall. Measured on this device
@@ -495,6 +579,77 @@ QString nf_cover_path(QString const& imageId);
 // would read as "no cover" while the row still paid for the height).
 int nf_cover_width_px(int heightPx);
 
+// --- the page size, per MODE --------------------------------------------
+//
+// Every term below is DEVICE-MEASURED on this panel (Kobo Libra 2, firmware
+// 4.38.23684) and none of it is estimated, because every layout number this
+// project ever guessed turned out wrong -- NF_COVER_H_PX was 76 by eyeball
+// and clipped its own rows, and the page size was 14 and then 12 against a
+// row count read off a screenshot's margin rather than counted.
+#define NF_CONTENT_AREA_PX 1330  // between the first row and the bottom margin
+                                 // (1680 visible panel px less Nickel's own
+                                 // chrome -- NOTES.md)
+#define NF_FONT_ASCENT_PX  46    // the row font's ascent, measured 2026-09-27
+#define NF_FONT_DESCENT_PX 29    // ...and its descent
+#define NF_TEXT_ROW_PX     75    // a text-or-icon row. Measured, and equal to
+                                 // ascent + descent -- a test pins that
+                                 // identity, so a re-measurement that broke it
+                                 // would be visible rather than absorbed
+#define NF_CHROME_BAR_PX   75    // one horizontal chrome bar, same height as a
+                                 // text row
+#define NF_CHROME_BARS     2     // the command bar on top and the page bar
+                                 // pinned to the bottom. Both UNCONDITIONAL --
+                                 // see the page bar's own comment (nfview.cc)
+                                 // for why its ends stay present-but-inert
+                                 // rather than disappearing -- so there is no
+                                 // fewer-bars case to make this conditional on
+
+// How many item rows fit on one page, for the mode `covers` selects.
+//
+// THE PAGE SIZE DEPENDS ON THE MODE, NOT ON THE PAGE. That distinction is the
+// whole design and it is easy to collapse by accident later, so: a page of
+// cover rows is taller than a page of icon rows, so the two MODES get
+// different budgets -- but within one mode every page gets the same number,
+// even a page that happens to hold no covers at all. A page size that varied
+// with how many covers HAPPENED to land on a given page was considered and
+// deliberately rejected: the row count would jump around as a reader pages
+// through a single folder, which is worse than the white space an icon-heavy
+// page leaves under the covers-on budget.
+//
+// THE ARITHMETIC, both modes, from the constants above:
+//
+//   covers ON.  An inline <img> sits on the TEXT BASELINE, so a row carrying
+//   one is max(ascent, coverHeight) + descent tall: max(46, 70) + 29 = 99.
+//   The worst case is a page of nothing but covers, because that is the
+//   tallest a page of N items can be.
+//
+//       N * 99 + 2 * 75 <= 1330  ->  N <= (1330 - 150) / 99 = 11.92  ->  11
+//       11 * 99 + 150 = 1239, 91 px to spare (less than one row of either
+//       height, so 11 is the real ceiling and not a conservative pick).
+//       12 would need 1338 and overflow by 8.
+//
+//   covers OFF. Every row is a 75 px text-or-icon row, so the worst case and
+//   the ordinary case are the same page.
+//
+//       N * 75 + 2 * 75 <= 1330  ->  N <= (1330 - 150) / 75 = 15.73  ->  15
+//       15 * 75 + 150 = 1275, 55 px to spare.
+//       16 would need 1350 and overflow by 20.
+//
+// So turning covers off buys FOUR more items per page, not the one or two a
+// glance at the numbers suggests -- which is most of the reason the toggle is
+// worth having at all.
+//
+// Floored at 1: a firmware whose rows were taller than the whole content area
+// must still show one item rather than an empty listing with working page
+// arrows. COUPLED TO NF_COVER_H_PX above -- change it and this follows
+// automatically, which is the point of computing rather than hardcoding; what
+// must be REDONE by hand is the arithmetic in this comment.
+//
+// A first device screenshot must COUNT the item rows on a full page, in BOTH
+// modes: if either shows fewer than this returns, the 1330/75/99 terms are
+// what to re-measure, not this quotient.
+int nf_items_per_page(bool covers);
+
 // --- the two-form label pieces ------------------------------------------
 //
 // Every fragment nfview.cc appends to a row label exists in TWO forms: the
@@ -529,11 +684,46 @@ inline QChar nf_nbsp(void) { return QChar(0x00a0); }
 // written out a second time.
 void nf_icon_badge(nf_icon_kind kind, QString *markup, QString *plain);
 
-// The trailing suffix for one row: the folder marker, the "not in library"
-// reason, or the reading-progress marker. Exactly one of them, in that
-// priority order, or nothing -- see nffmt.cc for what each one means and
-// why the order is what it is. Either output pointer may be NULL.
-void nf_row_suffix(nf_row const& row, QString *markup, QString *plain);
+// A file size a reader can read: "512 B", "1.5 KB", "11.8 MB", "1.2 GB".
+// EMPTY for a negative size, which is a refusal rather than a repair -- the
+// same rule as nf_date_key_is_plausible's: a negative size is not a size, and
+// rendering it as "0 B" would hide whatever produced it behind a
+// plausible-looking answer. A size of 0 IS rendered ("0 B"): a zero-byte file
+// is a real thing to find on a card, and this browser's whole job is to say
+// what is actually there.
+//
+// INTEGER ARITHMETIC ONLY, no floating point and no maths runtime -- same
+// reasoning as nf_cover_width_px's rounding. One decimal place for KB and
+// above, none for bytes, so a column of sizes reads consistently.
+//
+// THE SPACE BEFORE THE UNIT IS A U+00A0, like every other separator this file
+// builds (nf_nbsp, above), for two reasons that are the same reason: an
+// ordinary space is a wrap opportunity, so "11.8 MB" could break across the
+// row edge, and rich text collapses runs of ordinary whitespace, so the width
+// this string MEASURES at could stop being the width it RENDERS at. That
+// mismatch, in exactly these suffixes, is what clipped every row on
+// 2026-09-04.
+QString nf_format_size(qint64 bytes);
+
+// The trailing suffix for one row: the size (if `view` asks for it) followed
+// by the folder marker, the "not in library" reason, or the reading-progress
+// marker. Exactly one of those three, in that priority order, or nothing --
+// see nffmt.cc for what each one means and why the order is what it is.
+// Either output pointer may be NULL.
+//
+// `view` is taken whole rather than as a bare `bool showSize` so that a
+// future suffix driven by another toggle has somewhere to read it from
+// without changing every call site again -- and because nfview.cc holds
+// exactly this struct, so nothing at the call site has to be unpacked.
+//
+// ONE FUNCTION DECIDES BOTH THE MARKUP AND THE WIDTH, and the size suffix is
+// inside it for that reason alone: the row's elision reserve is measured off
+// the PLAIN twin this function returns (nfview.cc), so a size appended
+// anywhere else would be drawn without being paid for and would push the same
+// one-or-two characters off the right edge that NOTES.md Task 13 records at
+// length.
+void nf_row_suffix(nf_row const& row, nf_view_flags view,
+                   QString *markup, QString *plain);
 
 // What is left of a row's width for the NAME, once the leading icon and the
 // trailing suffix have both been paid for. Floored (never below
@@ -613,6 +803,13 @@ enum nf_menu_kind {
     NF_MENU_NONE,
     NF_MENU_SORT,
     NF_MENU_FILTER,
+    // The five view toggles (nf_view_flags, above). A SIBLING of the two
+    // above rather than a new mechanism: same TouchLabel rows, same command
+    // bar over it, same BACK-closes-it routing, same return-to-the-page-you
+    // -were-on. What differs is only that each row is a TOGGLE rather than a
+    // selection -- so there is no single "active" row to mark, and each row
+    // states its own state instead.
+    NF_MENU_VIEW,
 };
 
 // How many rows `menu` has. 0 for NF_MENU_NONE.
@@ -626,9 +823,18 @@ int nf_menu_row_count(nf_menu_kind menu);
 QString nf_sort_key_name(nf_sort_key key);
 QString nf_filter_name(nf_filter_kind filter);
 
-// The command bar's own two labels: "sort: name ^" and "filter: all". "^" is
-// ascending and "v" descending -- plain ASCII, e-ink-safe, no glyph this
-// panel's font may not carry, and the same convention as "< BACK"/"< PREV".
+// The command bar's own three labels: "sort: name (asc)", "filter: all" and
+// "view: default".
+//
+// THE DIRECTION IS SPELLED OUT -- "(asc)" and "(desc)", not the "^" and "v"
+// this used to carry. The owner's reason: the carets are terse, and the
+// direction is the one thing on this bar that should not have to be decoded.
+// Still plain ASCII, so still e-ink-safe with no glyph this panel's font may
+// not carry, and still the same convention as "< BACK"/"< PREV". The
+// cycle and selection semantics are untouched by that change; only the words
+// moved, and tests pin the literals on both sides (the bar label and the
+// menu's own active row) so the two cannot drift apart again.
+//
 // "date" is the FILE's own mtime and "added"/"read" are the LIBRARY's two
 // dates; three one-word names for three genuinely different questions, all
 // short enough not to eat the bar slot's width budget the way "date added"
@@ -638,12 +844,33 @@ QString nf_filter_name(nf_filter_kind filter);
 QString nf_sort_bar_label(nf_sort_key key, bool descending);
 QString nf_filter_bar_label(nf_filter_kind filter);
 
-// What row `index` of the sort / filter menu selects. False, with no write,
-// for an index outside 0..count-1 -- so a caller can never turn a nonsense
-// index into a confident wrong setting, the same refusal-rather-than-repair
-// rule as nf_date_key_is_plausible's.
+// The view bar item, which cannot show its setting the way the other two do:
+// there are FIVE independent toggles and one bar slot, and at four slots that
+// slot is ~316 px. So it says whether ANYTHING has been changed --
+// "view: default" or "view: custom" -- which is the question a reader
+// actually needs answered from the bar (why does this folder look odd?), with
+// the menu one tap away for which one. Spelling the five states out here
+// would either not fit or would elide to something that could not be read at
+// all.
+QString nf_view_bar_label(nf_view_flags view);
+
+// All five view rows joined with " | ", for the one log line every content
+// build carries (nfview.cc). Built out of nf_menu_row_label itself rather
+// than out of a second set of words, so the log line and the menu can never
+// disagree about what mode the browser is in -- which is the entire point of
+// logging it: a screenshot taken under a changed flag is otherwise
+// indistinguishable from a rendering bug, and this project has already
+// discarded a working fix once because a stale screenshot was read as "it
+// does not work".
+QString nf_view_flags_summary(nf_view_flags view);
+
+// What row `index` of the sort / filter / view menu selects. False, with no
+// write, for an index outside 0..count-1 -- so a caller can never turn a
+// nonsense index into a confident wrong setting, the same
+// refusal-rather-than-repair rule as nf_date_key_is_plausible's.
 bool nf_menu_sort_key_at(int index, nf_sort_key *key);
 bool nf_menu_filter_at(int index, nf_filter_kind *filter);
+bool nf_menu_view_toggle_at(int index, nf_view_toggle *toggle);
 
 // The text row `index` of `menu` shows, given the currently active settings.
 // EMPTY for an out-of-range index or for NF_MENU_NONE.
@@ -660,15 +887,28 @@ bool nf_menu_filter_at(int index, nf_filter_kind *filter);
 // only way direction is reachable now that tapping `sort:` opens a menu
 // instead of cycling:
 //
-//     name                     an inactive key -- tapping it selects it
-//     * date ^ (tap for v)     the active key, ascending
-//     * date v (tap for ^)     the active key, descending
+//     name                            an inactive key -- tapping it selects it
+//     * date (asc) (tap for desc)     the active key, ascending
+//     * date (desc) (tap for asc)     the active key, descending
+//
+// The direction is spelled out rather than carried by "^"/"v" -- see
+// nf_sort_bar_label above for the owner's reason. The word a tap moves TO is
+// written WITHOUT its brackets ("tap for desc", not "tap for (desc)"): the
+// brackets belong to the state marker, and nesting one bracketed word inside
+// another reads as a typo rather than as emphasis.
 //
 // Tapping a DIFFERENT key selects it and KEEPS the current direction, so the
-// mark on the newly active row is the same arrow the old one carried. The
+// mark on the newly active row is the same word the old one carried. The
 // active FILTER row reads "* epub (active)" instead: a filter has no
 // direction, so tapping it again simply closes the menu, and the parenthesis
 // says what the row is rather than what a tap does.
+//
+// A VIEW ROW IS A TOGGLE, so it has no active/inactive distinction at all and
+// carries no "* " mark: every row states its own state in its own TEXT --
+// "covers: on", "size: hidden" -- because that is the only channel this panel
+// reliably has. Styling is not an option: four grey levels, on which
+// "slightly lighter" reads as "the same", which is the same finding that puts
+// "[not in library]" into a row's words (nf_row_suffix, above).
 //
 // SINGLE SPACES ONLY, everywhere, and that is a rendering constraint rather
 // than a style: these labels are set as PLAIN text (nfview.cc), but a run of
@@ -676,8 +916,15 @@ bool nf_menu_filter_at(int index, nf_filter_kind *filter);
 // -- the same measure-versus-render mismatch that clipped every row on
 // 2026-09-04 (nf_nbsp above). A test pins it so the two can never diverge
 // silently.
+//
+// `view` is REQUIRED rather than defaulted, unlike nf_build_listing's own
+// late-added arguments: those default to v1's behaviour, which is a
+// defensible no-op, whereas a view row built against defaulted flags would
+// state a mode the browser is not in -- a confident wrong answer in the one
+// place a reader looks to find out what mode they are in.
 QString nf_menu_row_label(nf_menu_kind menu, int index,
                           nf_sort_key activeKey, bool activeDesc,
-                          nf_filter_kind activeFilter);
+                          nf_filter_kind activeFilter,
+                          nf_view_flags view);
 
 #endif

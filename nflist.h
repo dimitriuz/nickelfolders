@@ -49,12 +49,34 @@ typedef void (*nf_meta_fn)(void *ctx, QString const& name, nf_row *row);
 // does not distinguish WHICH filter emptied the listing, and does not need to:
 // there is one filter row and one `filter` argument, so whichever value is
 // active is the one to name in the message (nfview.cc).
+//
+// `view` (nffmt.h) reaches exactly two stages, and the split is the whole
+// point of the type:
+//
+//   stage 1, hide junk     `showHidden` -- THE ONE VIEW FLAG THAT CHANGES
+//                          WHICH ROWS EXIST, because an entry the listing
+//                          dropped cannot be "displayed" differently. It is
+//                          a filter and is documented as one.
+//   stage 6, labels        `fullNames` and `hideExtensions`, both purely
+//                          about what a surviving row SAYS.
+//
+// The other two (`hideCovers`, `showSize`) never reach this function at all:
+// they are decided per row while rendering (nfview.cc) and per page by
+// nf_items_per_page, and there is nothing for a listing stage to do with
+// them. tests/test_nflist.cc pins the separation from the other side -- the
+// four display flags must leave the row SET identical, name for name.
+//
+// DEFAULTED, like the four arguments before it, to v1's original behaviour:
+// nf_view_flags' defaults are all-false and all-false is exactly what this
+// function did before the flags existed, so every existing caller and every
+// existing test keeps compiling and keeps its old behaviour unchanged.
 void nf_build_listing(QVector<nf_entry> const& entries,
                       nf_meta_fn meta, void *ctx,
                       QVector<nf_row> *out,
                       nf_filter_kind filter = NF_FILTER_ALL,
                       nf_sort_key key = NF_SORT_NAME,
                       bool descending = false,
-                      bool *filteredToNothing = 0);
+                      bool *filteredToNothing = 0,
+                      nf_view_flags view = nf_view_flags_default());
 
 #endif
