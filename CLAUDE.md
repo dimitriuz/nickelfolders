@@ -280,7 +280,21 @@ afterward.
   written call signature, never a real C++ class or a redeclared method. A real
   class turns a libnickel layout change into a silent miscompile; the opaque
   form keeps every layout assumption in one place and written down.
-- **No C++ standard library runtime.** Qt and libc only. The C++ *language* is
+- **No C++ standard library runtime.** Qt and libc only, with ONE measured
+  exception that is already shipping and is documented rather than hidden:
+  `libnfolders.so` imports `__cxa_guard_acquire`/`_release`/`_abort` from
+  `CXXABI_1.3`, emitted for the **function-local statics** this file
+  recommends as the fix for the file-scope rule below. They resolve because
+  `libstdc++.so.6.0.12` is mapped into Nickel's own process (measured
+  2026-09-27 in `/proc/$(pidof nickel)/maps`) — Nickel is C++/Qt, so it
+  cannot not be. Check with `nm -u libnfolders.so | grep cxa_guard`.
+  The two rules are in tension and the tension is real: the prescribed cure
+  for a file-scope dynamic initialiser emits exactly these. Prefer POD
+  file-scope state where you can, accept the guards where a function-local
+  static is genuinely the right tool, and do NOT let anything else from
+  libstdc++ in — the reason for the rule (no ABI guarantee, Kobo can change
+  it) still holds for everything with an actual ABI surface, which these
+  three guard functions do not have. The C++ *language* is
   fine (classes, `override`); anything needing stdlib runtime support or
   compiling templates into the library is not, because libstdc++ gives no ABI
   guarantee and Kobo can change it. NickelHook's README is explicit about this.
