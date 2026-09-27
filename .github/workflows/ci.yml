@@ -28,7 +28,12 @@ jobs:
   host-tests:
     runs-on: ubuntu-latest
     steps:
+      # Submodules are needed even for the HOST tests: the Makefile includes
+      # NickelHook/NickelHook.mk unconditionally, before it knows which target
+      # is being built, so a checkout without them dies at the include.
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       # The Makefile finds Qt through pkg-config rather than hardcoded paths,
       # so this is the whole dependency list.
