@@ -40,6 +40,18 @@
 // this route's pushView never populates, so it does nothing here (see
 // nfview.cc/nfnickel.h).
 //
+// The screen has THREE MODES, not two screens: the item listing, and the
+// two submenus that tapping `sort:`/`filter:` in the command bar opens over
+// it (those items used to CYCLE to the next value, which took up to eight
+// taps to reach a specific one). A submenu is the same dialog with different
+// content swapped in -- no second dialog, no second push, nothing on the
+// window stack -- so the reader's directory and page survive it untouched,
+// and BACK out of one returns to exactly the screen it replaced. BACK
+// disambiguates in ONE function (nf_browser_back): a submenu is a case
+// inside it, not a second path, because the whole reason the screen's two
+// independent exits share that function is that there is then one place to
+// read "where am I" from.
+//
 // Directory listing is QDir::entryInfoList against ONE directory, never
 // recursive, never held past the single Qt signal handler that runs it
 // (CLAUDE.md's /mnt/onboard file-handle constraint). Per-file metadata

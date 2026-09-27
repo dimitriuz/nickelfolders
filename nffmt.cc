@@ -799,16 +799,157 @@ void nf_page_bar_labels(int page, int totalPages,
     bool hasNext = page < totalPages - 1;
 
     // ASCII only, same as every other piece of chrome this mod draws
-    // ("<< BACK", "sort: name ^"): the arrow is "<" and ">", not a glyph this
+    // ("< BACK", "sort: name ^"): the arrow is "<" and ">", not a glyph this
     // panel's font may not carry.
+    //
+    // An unavailable end is an EMPTY string, not "no prev"/"no next" -- see
+    // nffmt.h for why the words went and what keeps the counter from sliding
+    // now that they are gone (the three equal-width slots, which never
+    // depended on the text in the first place).
     if (prev)
-        *prev = hasPrev ? QStringLiteral("< PREV") : QStringLiteral("no prev");
+        *prev = hasPrev ? QStringLiteral("< PREV") : QString();
     if (prevActive)
         *prevActive = hasPrev;
     if (pageText)
         *pageText = QStringLiteral("page %1/%2").arg(page + 1).arg(totalPages);
     if (next)
-        *next = hasNext ? QStringLiteral("NEXT >") : QStringLiteral("no next");
+        *next = hasNext ? QStringLiteral("NEXT >") : QString();
     if (nextActive)
         *nextActive = hasNext;
+}
+
+// --- the sort and filter submenus ---------------------------------------
+//
+// See nffmt.h for what the rows say, why the active one is marked in TEXT,
+// and why the row order is the cycle order these menus replaced.
+
+// THE ROW ORDER, once, as data rather than as a switch repeated per function:
+// the count, the value at an index and the label at an index all read the
+// same array, so the three cannot disagree about what row 3 is. Plain arrays
+// of an enum type with constant initialisers -- no constructor to run, so
+// they cost nothing at load and `nm libnfolders.so | grep GLOBAL__sub_I`
+// stays empty, which is why there is no QString table here (CLAUDE.md's
+// file-scope rule, and the crash that produced it).
+static nf_sort_key const NF_MENU_SORT_ROWS[] = {
+    NF_SORT_NAME, NF_SORT_SIZE, NF_SORT_DATE, NF_SORT_ADDED, NF_SORT_READ,
+};
+
+static nf_filter_kind const NF_MENU_FILTER_ROWS[] = {
+    NF_FILTER_ALL, NF_FILTER_CBZ, NF_FILTER_CBR, NF_FILTER_PDF, NF_FILTER_EPUB,
+    NF_FILTER_FINISHED, NF_FILTER_IN_PROGRESS, NF_FILTER_NOT_STARTED,
+};
+
+#define NF_MENU_SORT_ROW_COUNT   ((int)(sizeof NF_MENU_SORT_ROWS / sizeof NF_MENU_SORT_ROWS[0]))
+#define NF_MENU_FILTER_ROW_COUNT ((int)(sizeof NF_MENU_FILTER_ROWS / sizeof NF_MENU_FILTER_ROWS[0]))
+
+int nf_menu_row_count(nf_menu_kind menu) {
+    switch (menu) {
+        case NF_MENU_SORT:   return NF_MENU_SORT_ROW_COUNT;
+        case NF_MENU_FILTER: return NF_MENU_FILTER_ROW_COUNT;
+        case NF_MENU_NONE:
+        default:             return 0;
+    }
+}
+
+bool nf_menu_sort_key_at(int index, nf_sort_key *key) {
+    if (index < 0 || index >= NF_MENU_SORT_ROW_COUNT)
+        return false;
+    if (key)
+        *key = NF_MENU_SORT_ROWS[index];
+    return true;
+}
+
+bool nf_menu_filter_at(int index, nf_filter_kind *filter) {
+    if (index < 0 || index >= NF_MENU_FILTER_ROW_COUNT)
+        return false;
+    if (filter)
+        *filter = NF_MENU_FILTER_ROWS[index];
+    return true;
+}
+
+QString nf_sort_key_name(nf_sort_key key) {
+    switch (key) {
+        case NF_SORT_SIZE:  return QStringLiteral("size");
+        case NF_SORT_DATE:  return QStringLiteral("date");
+        case NF_SORT_ADDED: return QStringLiteral("added");
+        case NF_SORT_READ:  return QStringLiteral("read");
+        case NF_SORT_NAME:
+        default:            return QStringLiteral("name");
+    }
+}
+
+// The read-state names are spelled out in words ("finished", "in progress",
+// "not started") rather than shortened to match the four lowercase format
+// abbreviations above them: those abbreviations are the formats' own file
+// extensions, which a reader already knows, whereas an abbreviated read state
+// would be this mod inventing a vocabulary. This word is also what the
+// "everything here was filtered out" message quotes back (nfview.cc), so it
+// has to read as a sentence fragment, not as a code.
+QString nf_filter_name(nf_filter_kind filter) {
+    switch (filter) {
+        case NF_FILTER_CBZ:         return QStringLiteral("cbz");
+        case NF_FILTER_CBR:         return QStringLiteral("cbr");
+        case NF_FILTER_PDF:         return QStringLiteral("pdf");
+        case NF_FILTER_EPUB:        return QStringLiteral("epub");
+        case NF_FILTER_FINISHED:    return QStringLiteral("finished");
+        case NF_FILTER_IN_PROGRESS: return QStringLiteral("in progress");
+        case NF_FILTER_NOT_STARTED: return QStringLiteral("not started");
+        case NF_FILTER_ALL:
+        default:                    return QStringLiteral("all");
+    }
+}
+
+// "^" reads as ascending (smallest/oldest/A first, pointing at the top of the
+// list) and "v" as descending, without needing a real glyph this panel may
+// not have.
+static QString nf_sort_dir_mark(bool descending) {
+    return descending ? QStringLiteral("v") : QStringLiteral("^");
+}
+
+QString nf_sort_bar_label(nf_sort_key key, bool descending) {
+    return QStringLiteral("sort: %1 %2").arg(nf_sort_key_name(key),
+                                             nf_sort_dir_mark(descending));
+}
+
+QString nf_filter_bar_label(nf_filter_kind filter) {
+    return QStringLiteral("filter: %1").arg(nf_filter_name(filter));
+}
+
+QString nf_menu_row_label(nf_menu_kind menu, int index,
+                          nf_sort_key activeKey, bool activeDesc,
+                          nf_filter_kind activeFilter) {
+    if (menu == NF_MENU_SORT) {
+        nf_sort_key key = NF_SORT_NAME;
+        if (!nf_menu_sort_key_at(index, &key))
+            return QString();
+        QString name = nf_sort_key_name(key);
+        if (key != activeKey)
+            return name;
+        // The active row carries three things a tap needs to be predictable:
+        // the "* " mark (this is the one in force), the CURRENT direction, and
+        // the direction a tap will move it to. The last of those is the whole
+        // discoverability argument -- with cycling gone, tapping the already-
+        // active key is the only way to reverse, and nothing else on screen
+        // would say so.
+        return QStringLiteral("* %1 %2 (tap for %3)")
+                   .arg(name, nf_sort_dir_mark(activeDesc),
+                        nf_sort_dir_mark(!activeDesc));
+    }
+
+    if (menu == NF_MENU_FILTER) {
+        nf_filter_kind filter = NF_FILTER_ALL;
+        if (!nf_menu_filter_at(index, &filter))
+            return QString();
+        QString name = nf_filter_name(filter);
+        if (filter != activeFilter)
+            return name;
+        // No "(tap for ...)" twin here, deliberately: a filter has no second
+        // axis, so tapping the active row re-selects the same value and
+        // closes the menu. Saying "(active)" states what the row IS, which is
+        // the only honest thing to promise -- a hint about what a tap does
+        // would have to describe doing nothing.
+        return QStringLiteral("* %1 (active)").arg(name);
+    }
+
+    return QString();
 }

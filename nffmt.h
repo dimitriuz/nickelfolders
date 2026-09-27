@@ -552,25 +552,26 @@ int nf_name_budget_px(int rowWidth, int iconWidth, int suffixWidth);
 // TouchLabel and a panel to lay out on), which is exactly why the part that
 // can be tested is separated from the part that cannot.
 //
-// BOTH ENDS ARE ALWAYS PRESENT, never omitted: a control that disappears on
-// the first and last page makes the bar's own layout jump as a reader pages
-// through a folder, and the three slots are fixed-width precisely so it does
-// not. So an unavailable end returns a label AND `false` for its active
-// flag; nfview.cc renders the inactive form as a plain QLabel rather than a
-// TouchLabel, so it is not merely un-wired but not a tap target at all.
+// AN UNAVAILABLE END IS NOT SHOWN AT ALL: this returns an EMPTY label and
+// `false` for that end's active flag. It used to return the words "no
+// prev"/"no next", which existed for one reason only -- to stop the bar's
+// layout jumping as a reader pages through a folder, leaving the page counter
+// sliding around under their thumb. The owner asked for the words gone.
 //
-// HOW "INERT" IS CONVEYED, and why it is not styling: this panel has four
-// grey levels and "slightly lighter" does not read as "different" on it --
-// the same finding that puts "[not in library]" in a row's TEXT rather than
-// leaving it to colour (nf_row_suffix, above). So the inactive form differs
-// in the CHARACTERS: the arrow -- the whole affordance -- is gone, the case
-// drops to lowercase, and the word "no" says which direction is unavailable.
-// Three independent differences, none of which depends on a grey level.
+// THE PROPERTY THEY EXISTED FOR IS KEPT, and it was never the text that was
+// holding it up: the bar is three slots of EQUAL STRETCH (nfview.cc's
+// nf_bar_add, addWidget(w, 1)), so the counter's slot is the middle third of
+// the bar whatever the other two contain. An empty end therefore moves
+// nothing. What nfview.cc must not do is REMOVE the end from the layout --
+// a hidden QWidget reports isEmpty() to its layout, and what a box layout
+// then does with the slot is a Qt internal no layout guarantee should rest
+// on. Its own comment has that trap, and the geometry that rules out the
+// symmetric-stretch alternative, written out in full.
 //
-// "no prev"/"no next" rather than "first page"/"last page", deliberately:
-// a label reading "first page" beside a page counter is exactly what a
-// jump-to-the-start control would say, so it would invite the tap it is
-// there to refuse. "no prev" cannot be read as a control at all.
+// The empty label is also why the two flags still exist and are still
+// separate from it: "there is no previous page" is a fact a caller has to act
+// on (do not allocate a TouchLabel, do not wire a tap), and it can no longer
+// be read back off a label that says so in words.
 //
 // `page` is 0-based (nf_browser_page's own convention) and `pageText` is
 // 1-based ("page 1/4" for page == 0), because a counter a reader sees is
@@ -583,5 +584,100 @@ void nf_page_bar_labels(int page, int totalPages,
                         QString *prev, bool *prevActive,
                         QString *pageText,
                         QString *next, bool *nextActive);
+
+// --- the sort and filter submenus ---------------------------------------
+//
+// Tapping `sort:` or `filter:` in the command bar used to CYCLE to the next
+// value. With five sort keys times two directions and eight filter values,
+// reaching a specific one took up to eight taps. Both now open a SUBMENU
+// instead: the ITEM LIST is replaced, in place, by one row per option, using
+// the same TouchLabel rows the listing uses.
+//
+// What those rows SAY is here rather than in nfview.cc, for the reason the
+// rest of this header exists: it is a pure function of the menu, the row
+// index and the currently active setting, so it is the one part of the
+// submenus a host test can run. What stays in nfview.cc is the part that
+// cannot be tested off-device at all -- allocating Nickel's own TouchLabel
+// per row, wiring its tap, and swapping the content widget.
+//
+// THE ROW ORDER IS THE OLD CYCLE ORDER, deliberately: the owner has learned
+// `name -> size -> date -> added -> read` and `all -> cbz -> cbr -> pdf ->
+// epub -> finished -> in progress -> not started` on hardware, so the menus
+// list them in exactly that sequence and that mental model survives. A menu
+// that reordered them (alphabetically, say) would be a second vocabulary for
+// the same set.
+enum nf_menu_kind {
+    // The item listing is showing. The ZERO value on purpose, the same
+    // reasoning as NF_READ_UNKNOWN and NF_ICON_UNKNOWN: a zeroed or .bss
+    // browser mode then reads as "browsing", never as a menu nobody opened.
+    NF_MENU_NONE,
+    NF_MENU_SORT,
+    NF_MENU_FILTER,
+};
+
+// How many rows `menu` has. 0 for NF_MENU_NONE.
+int nf_menu_row_count(nf_menu_kind menu);
+
+// One word per sort key and per filter value, and the ONE place either
+// vocabulary is spelled. The command bar's labels (below) and the menu rows
+// both read from these, so "the word in the bar" and "the word in the menu"
+// cannot drift apart -- which is the only thing that tells a reader that
+// tapping `date` in the menu is what makes the bar read `sort: date ^`.
+QString nf_sort_key_name(nf_sort_key key);
+QString nf_filter_name(nf_filter_kind filter);
+
+// The command bar's own two labels: "sort: name ^" and "filter: all". "^" is
+// ascending and "v" descending -- plain ASCII, e-ink-safe, no glyph this
+// panel's font may not carry, and the same convention as "< BACK"/"< PREV".
+// "date" is the FILE's own mtime and "added"/"read" are the LIBRARY's two
+// dates; three one-word names for three genuinely different questions, all
+// short enough not to eat the bar slot's width budget the way "date added"
+// and "date last read" would. "read" is the reading DATE, not the read STATE
+// -- read state lives on the filter side ("filter: finished"), and the two
+// never both show a word from the other's vocabulary.
+QString nf_sort_bar_label(nf_sort_key key, bool descending);
+QString nf_filter_bar_label(nf_filter_kind filter);
+
+// What row `index` of the sort / filter menu selects. False, with no write,
+// for an index outside 0..count-1 -- so a caller can never turn a nonsense
+// index into a confident wrong setting, the same refusal-rather-than-repair
+// rule as nf_date_key_is_plausible's.
+bool nf_menu_sort_key_at(int index, nf_sort_key *key);
+bool nf_menu_filter_at(int index, nf_filter_kind *filter);
+
+// The text row `index` of `menu` shows, given the currently active settings.
+// EMPTY for an out-of-range index or for NF_MENU_NONE.
+//
+// AN INACTIVE ROW IS THE BARE WORD -- "size", "epub" -- and nothing else.
+//
+// THE ACTIVE ROW IS MARKED IN THE TEXT, never by styling: this panel has four
+// grey levels and "slightly lighter" does not read as "different" on it,
+// which is the same finding that puts "[not in library]" in a row's words
+// rather than leaving it to colour (nf_row_suffix, above). So the active row
+// carries a leading "* " that no other row has.
+//
+// THE ACTIVE SORT ROW ALSO SAYS WHAT TAPPING IT WILL DO, because that is the
+// only way direction is reachable now that tapping `sort:` opens a menu
+// instead of cycling:
+//
+//     name                     an inactive key -- tapping it selects it
+//     * date ^ (tap for v)     the active key, ascending
+//     * date v (tap for ^)     the active key, descending
+//
+// Tapping a DIFFERENT key selects it and KEEPS the current direction, so the
+// mark on the newly active row is the same arrow the old one carried. The
+// active FILTER row reads "* epub (active)" instead: a filter has no
+// direction, so tapping it again simply closes the menu, and the parenthesis
+// says what the row is rather than what a tap does.
+//
+// SINGLE SPACES ONLY, everywhere, and that is a rendering constraint rather
+// than a style: these labels are set as PLAIN text (nfview.cc), but a run of
+// two spaces would collapse to one the moment anything set them as rich text
+// -- the same measure-versus-render mismatch that clipped every row on
+// 2026-09-04 (nf_nbsp above). A test pins it so the two can never diverge
+// silently.
+QString nf_menu_row_label(nf_menu_kind menu, int index,
+                          nf_sort_key activeKey, bool activeDesc,
+                          nf_filter_kind activeFilter);
 
 #endif

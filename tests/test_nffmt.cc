@@ -1177,40 +1177,43 @@ static void test_page_bar_middle_page_has_both_ends(void) {
     CHECK_EQ_STR(next,     "NEXT >");
 }
 
-// THE POINT OF THE WHOLE HELPER: an unavailable end is still a label. A
-// caller that had to render "nothing" at the ends would make the bar's
-// layout jump between pages, which is precisely what the fixed three slots
-// exist to prevent.
-static void test_page_bar_ends_are_never_empty(void) {
+// AN UNAVAILABLE END IS NOT SHOWN AT ALL. It used to read "no prev"/"no
+// next" -- words that existed only to keep the bar's layout from jumping
+// between pages. The owner asked for them gone, and the property they were
+// standing in for is held by the three equal-width SLOTS instead, which never
+// depended on the text (nffmt.h, and nfview.cc's own page-bar comment for the
+// setVisible(false) trap that would break it).
+static void test_page_bar_inert_ends_render_as_nothing(void) {
     QString prev, pageText, next;
     bool prevActive = true, nextActive = true;
     nf_page_bar_labels(0, 1, &prev, &prevActive, &pageText, &next, &nextActive);
     CHECK(!prevActive);
     CHECK(!nextActive);
-    CHECK(!prev.isEmpty());
-    CHECK(!next.isEmpty());
+    CHECK(prev.isEmpty());
+    CHECK(next.isEmpty());
     CHECK_EQ_STR(pageText, "page 1/1");
 }
 
-// "Inert" is carried by the CHARACTERS, not by a grey level this panel
-// cannot reliably show (nffmt.h). So the inactive forms must not merely
-// differ from the active ones -- they must drop the arrow, which is the
-// affordance itself.
-static void test_page_bar_inert_ends_drop_the_arrow(void) {
+// The flags are now the ONLY way a caller can tell an unavailable end from an
+// available one -- there is no label left to read it off -- so the active
+// forms have to be non-empty and carry their arrow, or "empty means inert"
+// would be vacuous.
+static void test_page_bar_active_ends_are_the_only_ones_with_an_arrow(void) {
     QString prev, next;
     bool prevActive = true, nextActive = true;
     nf_page_bar_labels(0, 1, &prev, &prevActive, NULL, &next, &nextActive);
-    CHECK(!prev.contains(QLatin1Char('<')));
-    CHECK(!next.contains(QLatin1Char('>')));
-    CHECK_EQ_STR(prev, "no prev");
-    CHECK_EQ_STR(next, "no next");
+    CHECK(prev.isEmpty());
+    CHECK(next.isEmpty());
 
-    // ...and the ACTIVE forms must carry one, or there is nothing for the
-    // inactive form to be missing.
     QString aPrev, aNext;
-    nf_page_bar_labels(1, 3, &aPrev, NULL, NULL, &aNext, NULL);
+    bool aPrevActive = false, aNextActive = false;
+    nf_page_bar_labels(1, 3, &aPrev, &aPrevActive, NULL, &aNext, &aNextActive);
+    CHECK(aPrevActive);
+    CHECK(aNextActive);
     CHECK(aPrev.contains(QLatin1Char('<')));
     CHECK(aNext.contains(QLatin1Char('>')));
+    CHECK_EQ_STR(aPrev, "< PREV");
+    CHECK_EQ_STR(aNext, "NEXT >");
 }
 
 // The two edges of a multi-page listing, which is where a fencepost error
@@ -1257,6 +1260,200 @@ static void test_page_bar_clamps_a_nonsense_page(void) {
     CHECK_EQ_STR(pageText, "page 1/1");
     CHECK(!prevActive);
     CHECK(!nextActive);
+}
+
+// --- the sort and filter submenus ---------------------------------------
+
+// THE ROW ORDER IS THE OLD TAP-CYCLE ORDER. The owner learned
+// `name -> size -> date -> added -> read` on hardware while the bar item
+// cycled; the menu that replaced the cycle lists them in exactly that
+// sequence, so the mental model survives. A reordering here would be silent
+// on a screenshot and obvious only after a wrong tap.
+static void test_sort_menu_rows_are_the_old_cycle_order(void) {
+    nf_sort_key want[] = { NF_SORT_NAME, NF_SORT_SIZE, NF_SORT_DATE,
+                           NF_SORT_ADDED, NF_SORT_READ };
+    CHECK(nf_menu_row_count(NF_MENU_SORT) == 5);
+    for (int i = 0; i < 5; i++) {
+        nf_sort_key got = NF_SORT_READ; // NOT the first expected value, so a
+                                        // function that wrote nothing at all
+                                        // cannot pass row 0 by accident
+        CHECK(nf_menu_sort_key_at(i, &got));
+        CHECK(got == want[i]);
+    }
+}
+
+static void test_filter_menu_rows_are_the_old_cycle_order(void) {
+    nf_filter_kind want[] = { NF_FILTER_ALL, NF_FILTER_CBZ, NF_FILTER_CBR,
+                              NF_FILTER_PDF, NF_FILTER_EPUB, NF_FILTER_FINISHED,
+                              NF_FILTER_IN_PROGRESS, NF_FILTER_NOT_STARTED };
+    CHECK(nf_menu_row_count(NF_MENU_FILTER) == 8);
+    for (int i = 0; i < 8; i++) {
+        nf_filter_kind got = NF_FILTER_NOT_STARTED; // ditto, not row 0's value
+        CHECK(nf_menu_filter_at(i, &got));
+        CHECK(got == want[i]);
+    }
+}
+
+// An out-of-range index must REFUSE rather than repair: a caller that turned
+// a nonsense index into a confident setting would change the reader's sort
+// key on a tap that hit nothing. Same rule as nf_date_key_is_plausible's.
+static void test_menu_index_out_of_range_refuses_and_writes_nothing(void) {
+    nf_sort_key key = NF_SORT_DATE;
+    CHECK(!nf_menu_sort_key_at(-1, &key));
+    CHECK(!nf_menu_sort_key_at(5, &key));
+    CHECK(key == NF_SORT_DATE); // untouched
+
+    nf_filter_kind filter = NF_FILTER_PDF;
+    CHECK(!nf_menu_filter_at(-1, &filter));
+    CHECK(!nf_menu_filter_at(8, &filter));
+    CHECK(filter == NF_FILTER_PDF); // untouched
+
+    CHECK(nf_menu_row_count(NF_MENU_NONE) == 0);
+    CHECK(nf_menu_row_label(NF_MENU_NONE, 0, NF_SORT_NAME, false, NF_FILTER_ALL).isEmpty());
+    CHECK(nf_menu_row_label(NF_MENU_SORT, -1, NF_SORT_NAME, false, NF_FILTER_ALL).isEmpty());
+    CHECK(nf_menu_row_label(NF_MENU_SORT, 5, NF_SORT_NAME, false, NF_FILTER_ALL).isEmpty());
+    CHECK(nf_menu_row_label(NF_MENU_FILTER, 8, NF_SORT_NAME, false, NF_FILTER_ALL).isEmpty());
+}
+
+// EXACTLY ONE row is marked, in either menu, whatever the active value is.
+// Two marks or none would both render as a menu that does not say what is in
+// force -- which on this panel is unrecoverable, because the mark is text and
+// there is no styling fallback behind it (nffmt.h).
+static void test_menu_marks_exactly_one_active_row(void) {
+    nf_sort_key keys[] = { NF_SORT_NAME, NF_SORT_SIZE, NF_SORT_DATE,
+                           NF_SORT_ADDED, NF_SORT_READ };
+    for (int k = 0; k < 5; k++) {
+        int marked = 0;
+        for (int i = 0; i < 5; i++)
+            if (nf_menu_row_label(NF_MENU_SORT, i, keys[k], false, NF_FILTER_ALL)
+                    .startsWith(QLatin1Char('*')))
+                marked++;
+        CHECK(marked == 1);
+    }
+
+    nf_filter_kind filters[] = { NF_FILTER_ALL, NF_FILTER_CBZ, NF_FILTER_CBR,
+                                 NF_FILTER_PDF, NF_FILTER_EPUB, NF_FILTER_FINISHED,
+                                 NF_FILTER_IN_PROGRESS, NF_FILTER_NOT_STARTED };
+    for (int f = 0; f < 8; f++) {
+        int marked = 0;
+        for (int i = 0; i < 8; i++)
+            if (nf_menu_row_label(NF_MENU_FILTER, i, NF_SORT_NAME, false, filters[f])
+                    .startsWith(QLatin1Char('*')))
+                marked++;
+        CHECK(marked == 1);
+    }
+}
+
+// An inactive row is the BARE word -- nothing else, so the mark on the active
+// one is a difference a reader can see at a glance rather than a decoration
+// every row carries.
+static void test_inactive_menu_rows_are_the_bare_word(void) {
+    CHECK_EQ_STR(nf_menu_row_label(NF_MENU_SORT, 1, NF_SORT_NAME, false, NF_FILTER_ALL), "size");
+    CHECK_EQ_STR(nf_menu_row_label(NF_MENU_SORT, 4, NF_SORT_NAME, true,  NF_FILTER_ALL), "read");
+    CHECK_EQ_STR(nf_menu_row_label(NF_MENU_FILTER, 4, NF_SORT_NAME, false, NF_FILTER_ALL), "epub");
+    CHECK_EQ_STR(nf_menu_row_label(NF_MENU_FILTER, 7, NF_SORT_NAME, false, NF_FILTER_ALL), "not started");
+}
+
+// THE ACTIVE SORT ROW SAYS WHAT TAPPING IT WILL DO. With cycling gone,
+// tapping the already-active key is the ONLY way to reverse direction, and
+// nothing else on screen says so -- so the row itself has to, and it has to
+// name the direction a tap moves TO, not just the one in force.
+static void test_active_sort_row_shows_the_direction_and_the_tap(void) {
+    QString asc = nf_menu_row_label(NF_MENU_SORT, 2, NF_SORT_DATE, false, NF_FILTER_ALL);
+    CHECK_EQ_STR(asc, "* date ^ (tap for v)");
+
+    QString desc = nf_menu_row_label(NF_MENU_SORT, 2, NF_SORT_DATE, true, NF_FILTER_ALL);
+    CHECK_EQ_STR(desc, "* date v (tap for ^)");
+
+    // The two must differ in BOTH marks, or the row would be announcing a tap
+    // that does not move anywhere.
+    CHECK(asc != desc);
+
+    // A filter has no direction, so its active row promises nothing about a
+    // tap -- it states what the row is.
+    CHECK_EQ_STR(nf_menu_row_label(NF_MENU_FILTER, 5, NF_SORT_NAME, false, NF_FILTER_FINISHED),
+                 "* finished (active)");
+}
+
+// ONE VOCABULARY. The word in the menu row and the word in the command bar
+// have to be the same one, or nothing tells a reader that tapping `added` is
+// what makes the bar read `sort: added ^`.
+static void test_the_bar_and_the_menu_share_one_vocabulary(void) {
+    CHECK_EQ_STR(nf_sort_bar_label(NF_SORT_NAME, false),  "sort: name ^");
+    CHECK_EQ_STR(nf_sort_bar_label(NF_SORT_READ, true),   "sort: read v");
+    CHECK_EQ_STR(nf_filter_bar_label(NF_FILTER_ALL),      "filter: all");
+    CHECK_EQ_STR(nf_filter_bar_label(NF_FILTER_NOT_STARTED), "filter: not started");
+
+    for (int i = 0; i < 5; i++) {
+        nf_sort_key key = NF_SORT_NAME;
+        CHECK(nf_menu_sort_key_at(i, &key));
+        QString word = nf_sort_key_name(key);
+        // the row that selects this key spells the word, and so does the bar
+        // label that selecting it produces
+        CHECK(nf_menu_row_label(NF_MENU_SORT, i, key, false, NF_FILTER_ALL).contains(word));
+        CHECK(nf_sort_bar_label(key, false).contains(word));
+    }
+    for (int i = 0; i < 8; i++) {
+        nf_filter_kind filter = NF_FILTER_ALL;
+        CHECK(nf_menu_filter_at(i, &filter));
+        CHECK(nf_filter_bar_label(filter).contains(nf_filter_name(filter)));
+    }
+}
+
+// NO COLLAPSIBLE SPACE RUNS, in any label, in any state. These are set as
+// PLAIN text today -- but a run of two spaces silently becomes one the moment
+// anything renders them as rich text, and the measured width would then stop
+// matching the drawn width. That exact mismatch (U+0020 measured, `&nbsp;`
+// rendered) is what clipped every row on 2026-09-04, so the shape is barred
+// here rather than being relied on not to happen.
+static void test_menu_labels_have_no_collapsible_space_runs(void) {
+    nf_sort_key keys[] = { NF_SORT_NAME, NF_SORT_SIZE, NF_SORT_DATE,
+                           NF_SORT_ADDED, NF_SORT_READ };
+    for (int k = 0; k < 5; k++) {
+        for (int d = 0; d < 2; d++) {
+            for (int i = 0; i < 5; i++) {
+                QString s = nf_menu_row_label(NF_MENU_SORT, i, keys[k], d != 0, NF_FILTER_ALL);
+                CHECK(!s.contains(QStringLiteral("  ")));
+                CHECK(!s.isEmpty());
+            }
+        }
+    }
+    nf_filter_kind filters[] = { NF_FILTER_ALL, NF_FILTER_CBZ, NF_FILTER_CBR,
+                                 NF_FILTER_PDF, NF_FILTER_EPUB, NF_FILTER_FINISHED,
+                                 NF_FILTER_IN_PROGRESS, NF_FILTER_NOT_STARTED };
+    for (int f = 0; f < 8; f++) {
+        for (int i = 0; i < 8; i++) {
+            QString s = nf_menu_row_label(NF_MENU_FILTER, i, NF_SORT_NAME, false, filters[f]);
+            CHECK(!s.contains(QStringLiteral("  ")));
+            CHECK(!s.isEmpty());
+        }
+    }
+    // ...and the bar labels, which are set the same way.
+    CHECK(!nf_sort_bar_label(NF_SORT_ADDED, true).contains(QStringLiteral("  ")));
+    CHECK(!nf_filter_bar_label(NF_FILTER_IN_PROGRESS).contains(QStringLiteral("  ")));
+}
+
+// Selecting a DIFFERENT key keeps the direction, which is what makes the
+// menu's own active-row text true after the selection: the newly active row
+// must carry the same arrow the old one did. Pure restatement of the rule the
+// browser implements, pinned here because the browser's half is untestable.
+static void test_selecting_a_different_key_keeps_the_direction(void) {
+    // descending, active key = size; select `added` (row 3)
+    nf_sort_key picked = NF_SORT_NAME;
+    CHECK(nf_menu_sort_key_at(3, &picked));
+    CHECK(picked == NF_SORT_ADDED);
+    CHECK_EQ_STR(nf_menu_row_label(NF_MENU_SORT, 3, picked, true, NF_FILTER_ALL),
+                 "* added v (tap for ^)");
+    CHECK_EQ_STR(nf_sort_bar_label(picked, true), "sort: added v");
+}
+
+// Same contract as nf_row_suffix/nf_icon_badge: a caller that wants only one
+// of the outputs must not have to supply the rest.
+static void test_menu_lookups_accept_a_null_output(void) {
+    CHECK(nf_menu_sort_key_at(0, NULL));
+    CHECK(nf_menu_filter_at(0, NULL));
+    CHECK(!nf_menu_sort_key_at(99, NULL));
+    CHECK(!nf_menu_filter_at(99, NULL));
 }
 
 // Same contract as nf_row_suffix/nf_icon_badge: a caller that wants only one
@@ -1340,10 +1537,20 @@ int main(void) {
     test_cover_path_inserts_the_id_verbatim();
     test_cover_width_keeps_the_native_aspect();
     test_page_bar_middle_page_has_both_ends();
-    test_page_bar_ends_are_never_empty();
-    test_page_bar_inert_ends_drop_the_arrow();
+    test_page_bar_inert_ends_render_as_nothing();
+    test_page_bar_active_ends_are_the_only_ones_with_an_arrow();
     test_page_bar_first_and_last_page();
     test_page_bar_clamps_a_nonsense_page();
     test_page_bar_accepts_null_outputs();
+    test_sort_menu_rows_are_the_old_cycle_order();
+    test_filter_menu_rows_are_the_old_cycle_order();
+    test_menu_index_out_of_range_refuses_and_writes_nothing();
+    test_menu_marks_exactly_one_active_row();
+    test_inactive_menu_rows_are_the_bare_word();
+    test_active_sort_row_shows_the_direction_and_the_tap();
+    test_the_bar_and_the_menu_share_one_vocabulary();
+    test_menu_labels_have_no_collapsible_space_runs();
+    test_selecting_a_different_key_keeps_the_direction();
+    test_menu_lookups_accept_a_null_output();
     NF_TEST_MAIN_END
 }

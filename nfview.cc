@@ -241,10 +241,17 @@ static char nf_browser_cwd[PATH_MAX];
 // every descend, every BACK/ascend step, and the initial root call all
 // pass true, because all three move nf_browser_cwd to a DIFFERENT
 // directory, whose page 0 has no relationship to whatever page the
-// previous directory happened to be showing. The page bar's PREV/NEXT are
-// the one caller that passes false: they change the page WITHIN the same
-// directory nf_browser_cwd already names, so resetting here would make
-// NEXT always land back on page 0.
+// previous directory happened to be showing.
+//
+// Everything that stays in the SAME directory passes false, and there are
+// now four such callers: the page bar's PREV/NEXT (a different slice of the
+// same listing), opening a submenu, closing one with BACK, and selecting an
+// option in one. The last three are the "return to the page you were on"
+// requirement, and they need nothing but this: the page is simply not
+// touched while a menu is up. The ONE case where a selection invalidates it
+// -- a filter that shrinks the listing past the current page -- is handled
+// by nf_browser_go's existing clamp (see there), which is reused rather than
+// duplicated precisely because it is already the one place this is bounded.
 static int nf_browser_page = 0;
 
 // Sort key/direction and type filter -- the state the two new chrome rows
@@ -270,6 +277,42 @@ static int nf_browser_page = 0;
 static nf_sort_key    nf_browser_sort_key  = NF_SORT_NAME;
 static bool           nf_browser_sort_desc = false;
 static nf_filter_kind nf_browser_filter    = NF_FILTER_ALL;
+
+// THE BROWSER'S MODE: browsing the item listing (NF_MENU_NONE), or showing
+// one of the two submenus in place of it. Tapping `sort:`/`filter:` in the
+// command bar used to CYCLE to the next value, which took up to eight taps to
+// reach a specific one; it now opens a menu, and this is the whole of the
+// extra state that needs.
+//
+// Same POD-with-a-constant-initialiser discipline as the three statics above
+// and for the same load-bearing reason: `= NF_MENU_NONE` is a constant the
+// compiler folds into .data at link time, not a constructor call needing a
+// runtime _GLOBAL__sub_I entry that NickelHook's nh_init would race (see
+// nf_browser_active_dialog's own comment for the crash that established the
+// rule). NF_MENU_NONE is nf_menu_kind's ZERO value (nffmt.h), so even a
+// .bss-zeroed copy of this reads as "browsing" rather than as a menu nobody
+// opened.
+//
+// DOES NOT PERSIST the way the sort key and filter do: it is reset to
+// NF_MENU_NONE by nf_browser_show on every trigger, because "show me the
+// browser" means the listing, never whichever menu happened to be up when
+// Nickel last navigated away from a dialog it did not destroy.
+static nf_menu_kind   nf_browser_menu      = NF_MENU_NONE;
+
+// The mode's name for the one log line every content build carries. This is
+// the cheap check whose FAILURE MODE IS SILENCE, which is the kind this
+// project adds in advance: "the submenu opened but the rows are the
+// listing's" looks like an ordinary rendering bug on a screenshot and like
+// one wrong word in the log. Same idea as the MEASURED/PRE-LAYOUT marker on
+// the bar-geometry lines, one level down.
+static char const *nf_menu_name(nf_menu_kind menu) {
+    switch (menu) {
+        case NF_MENU_SORT:   return "SORT MENU";
+        case NF_MENU_FILTER: return "FILTER MENU";
+        case NF_MENU_NONE:
+        default:             return "BROWSE";
+    }
+}
 
 // --- construction ------------------------------------------------------
 
@@ -370,106 +413,26 @@ static QVector<nf_entry> nf_browser_scan_dir(QString const &path) {
     return entries;
 }
 
-// Cycles nf_browser_sort_key/nf_browser_sort_desc as ONE combined ten-state
-// sequence on a single tap -- name-ascending, name-descending, size-
-// ascending, size-descending, date-ascending, date-descending, added-
-// ascending, added-descending, read-ascending, read-descending, back to
-// name-ascending -- rather than needing two separate rows for what the task
-// brief frames as two orthogonal choices (key, direction). Direction flips
-// first and key advances only every second tap, so a reader sees both
-// directions of whichever key they just picked before it moves on.
+// The command bar's two labels, for the CURRENT state. The strings, and the
+// vocabulary both they and the submenu rows spell, live in nffmt.cc
+// (nf_sort_bar_label/nf_filter_bar_label) -- a menu row reading "date" has to
+// be the same word the bar reads back as "sort: date ^", and one place to
+// spell it is the only way that holds. These two wrappers remain only to bind
+// the file-scope state, so no call site has to repeat it.
 //
-// The two library-date keys come AFTER name/size/date, in that order, so the
-// tap sequence the owner has already learned on hardware is unchanged and the
-// new keys are appended past the end of it rather than inserted into the
-// middle -- the same rule the read-state filters followed onto
-// nf_browser_cycle_filter below.
-static void nf_browser_cycle_sort(void) {
-    if (!nf_browser_sort_desc) {
-        nf_browser_sort_desc = true;
-        return;
-    }
-    nf_browser_sort_desc = false;
-    switch (nf_browser_sort_key) {
-        case NF_SORT_NAME:  nf_browser_sort_key = NF_SORT_SIZE;  break;
-        case NF_SORT_SIZE:  nf_browser_sort_key = NF_SORT_DATE;  break;
-        case NF_SORT_DATE:  nf_browser_sort_key = NF_SORT_ADDED; break;
-        case NF_SORT_ADDED: nf_browser_sort_key = NF_SORT_READ;  break;
-        case NF_SORT_READ:
-        default:            nf_browser_sort_key = NF_SORT_NAME;  break;
-    }
-}
-
-// Cycles nf_browser_filter through all -> cbz -> cbr -> pdf -> epub ->
-// finished -> in progress -> not started -> all.
-//
-// The three read-state options come AFTER the five format ones, in that order,
-// so the tap sequence the owner has already learned on hardware (all -> cbz ->
-// cbr -> pdf -> epub) is unchanged and the new options are appended past the
-// end of it rather than inserted into the middle. Eight states on one row is a
-// long cycle -- but a second chrome row would cost an item row out of the
-// panel's measured budget of 17, which is a worse trade than a few extra taps
-// (nffmt.h, nf_filter_kind).
-static void nf_browser_cycle_filter(void) {
-    switch (nf_browser_filter) {
-        case NF_FILTER_ALL:         nf_browser_filter = NF_FILTER_CBZ;         break;
-        case NF_FILTER_CBZ:         nf_browser_filter = NF_FILTER_CBR;         break;
-        case NF_FILTER_CBR:         nf_browser_filter = NF_FILTER_PDF;         break;
-        case NF_FILTER_PDF:         nf_browser_filter = NF_FILTER_EPUB;        break;
-        case NF_FILTER_EPUB:        nf_browser_filter = NF_FILTER_FINISHED;    break;
-        case NF_FILTER_FINISHED:    nf_browser_filter = NF_FILTER_IN_PROGRESS; break;
-        case NF_FILTER_IN_PROGRESS: nf_browser_filter = NF_FILTER_NOT_STARTED; break;
-        case NF_FILTER_NOT_STARTED:
-        default:                     nf_browser_filter = NF_FILTER_ALL;         break;
-    }
-}
-
-// Plain ASCII, e-ink-safe, matching the "^"/"v"-style affordance the task
-// brief itself suggests ("sort: name ^") and the same convention as this
-// file's other ASCII chrome ("< BACK", "< PREV"). "^" reads as
-// ascending (smallest/oldest/A first, pointing at the top of the list) and
-// "v" as descending, without needing a real glyph this panel may not have.
-// "date" is the FILE's own mtime and "added"/"read" are the LIBRARY's two
-// dates; three one-word names for three genuinely different questions, all
-// short enough not to eat the row's width budget the way "date added" and
-// "date last read" would. "read" is the reading date, not the read STATE --
-// the filter row is where read state lives ("filter: finished"), and the two
-// rows are never both showing a word from the other's vocabulary.
+// The two CYCLE functions that used to sit here are gone with the cycling
+// itself: tapping `sort:` or `filter:` opens a submenu now (nf_browser_menu,
+// above; nf_build_menu_content, below), and the order those menus list their
+// options in is the order these cycles used to step through -- pinned in
+// nffmt.cc's own NF_MENU_SORT_ROWS/NF_MENU_FILTER_ROWS tables and tested
+// there, so the tap sequence the owner learned on hardware survives as a
+// reading order.
 static QString nf_sort_row_label(void) {
-    QString keyName;
-    switch (nf_browser_sort_key) {
-        case NF_SORT_SIZE:  keyName = QStringLiteral("size");  break;
-        case NF_SORT_DATE:  keyName = QStringLiteral("date");  break;
-        case NF_SORT_ADDED: keyName = QStringLiteral("added"); break;
-        case NF_SORT_READ:  keyName = QStringLiteral("read");  break;
-        case NF_SORT_NAME:
-        default:            keyName = QStringLiteral("name");  break;
-    }
-    return QStringLiteral("sort: %1 %2").arg(keyName,
-        nf_browser_sort_desc ? QStringLiteral("v") : QStringLiteral("^"));
+    return nf_sort_bar_label(nf_browser_sort_key, nf_browser_sort_desc);
 }
 
-// The read-state names are spelled out in words ("finished", "in progress",
-// "not started") rather than shortened to match the four lowercase format
-// abbreviations above them: the abbreviations are the formats' own file
-// extensions, which a reader already knows, whereas an abbreviated read state
-// would be this mod inventing a vocabulary. This string is also what the
-// "everything here was filtered out" message quotes back (below), so it has to
-// read as a sentence fragment, not a code.
 static QString nf_filter_row_label(void) {
-    QString filterName;
-    switch (nf_browser_filter) {
-        case NF_FILTER_CBZ:         filterName = QStringLiteral("cbz");         break;
-        case NF_FILTER_CBR:         filterName = QStringLiteral("cbr");         break;
-        case NF_FILTER_PDF:         filterName = QStringLiteral("pdf");         break;
-        case NF_FILTER_EPUB:        filterName = QStringLiteral("epub");        break;
-        case NF_FILTER_FINISHED:    filterName = QStringLiteral("finished");    break;
-        case NF_FILTER_IN_PROGRESS: filterName = QStringLiteral("in progress"); break;
-        case NF_FILTER_NOT_STARTED: filterName = QStringLiteral("not started"); break;
-        case NF_FILTER_ALL:
-        default:                     filterName = QStringLiteral("all");         break;
-    }
-    return QStringLiteral("filter: %1").arg(filterName);
+    return nf_filter_bar_label(nf_browser_filter);
 }
 
 static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool resetPage);
@@ -477,10 +440,35 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
 // Shared by the guaranteed BACK row and N3Dialog's own backTapped() signal
 // -- same "one function, not two forks to audit for drift" reasoning as
 // nf_pop_native_view, except this one does NOT always pop: which action it
-// takes depends on nf_browser_cwd, read fresh on every call, so it is
-// always asking "where am I NOW", never a value captured at some earlier
-// row-build time.
+// takes depends on nf_browser_menu and nf_browser_cwd, BOTH read fresh on
+// every call, so it is always asking "where am I NOW", never a value
+// captured at some earlier row-build time.
+//
+// THE SUBMENU CASE IS A CASE INSIDE THIS FUNCTION, not a second path, and
+// that is deliberate: the whole reason the screen's two independent exits
+// share one function is that there is then one place to read "where am I"
+// from, rather than two near-duplicates to audit for drift (nfview.h, review
+// finding I-3). An open submenu is one more answer to that question, so it
+// belongs here with the others.
 static void nf_browser_back(void *mwc, N3Dialog *dialog) {
+    // CASE 1: a submenu is open. Close it, change NOTHING else, and do NOT go
+    // up a directory -- the reader opened a menu and changed their mind, which
+    // is not a request to leave the folder they are in.
+    //
+    // Nothing is selected and nothing is applied: the sort key, the direction,
+    // the filter, the directory and the page are all exactly what they were
+    // when the menu opened (nf_browser_page in particular is untouched while a
+    // menu is up), so the rebuild below lands on the same screen the menu
+    // replaced. resetPage is false for that reason.
+    if (nf_browser_menu != NF_MENU_NONE) {
+        nh_log("browser: BACK closes the %s -- nothing selected, the listing is unchanged",
+               nf_menu_name(nf_browser_menu));
+        nf_browser_menu = NF_MENU_NONE;
+        nf_browser_go(mwc, dialog, QString::fromUtf8(nf_browser_cwd), false);
+        return;
+    }
+
+    // CASE 2, unchanged: up one level, popping the dialog only at the root.
     QString cwd = QString::fromUtf8(nf_browser_cwd);
     if (cwd == QStringLiteral(NF_ROOT)) {
         nh_log("browser: BACK at the root -- leaving");
@@ -1586,28 +1574,26 @@ static void nf_bar_add(QHBoxLayout *bar, nf_bar_item *items, int *n,
     nf_bar_record(items, n, item, name);
 }
 
-// Builds a fresh content widget (rows for `path`'s own directory listing)
-// and swaps it into the ALREADY-EXISTING `dialog` via N3Dialog::setContent
-// -- this is the whole navigation model (nfview.h): one N3Dialog for the
-// lifetime of a browse session, rows rebuilt in place, never a second
-// dialog pushed per level. setContent itself deleteLater()s whatever
-// content was there before (nfnickel.h), so the previous screen's rows and
-// their shim buttons are cleaned up by Qt, not by this function.
-static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool resetPage) {
-    // Recorded BEFORE anything below can fail, so BACK's own "where am I"
-    // read is always this directory once this function has been entered --
-    // matching every row/BACK handler being wired only after the listing
-    // for THIS path has been built, never before.
-    snprintf(nf_browser_cwd, sizeof nf_browser_cwd, "%s", qPrintable(path));
-
-    // See nf_browser_page's own comment: every real navigation (descend,
-    // ascend, the initial root call) passes resetPage=true here; only the
-    // page bar's PREV/NEXT pass false, because they call back into this
-    // SAME function for the SAME path just to render a different slice of
-    // the same listing.
-    if (resetPage)
-        nf_browser_page = 0;
-
+// BROWSE mode's half of the content build: the directory listing, its item
+// rows and the page bar, added to the `layout` nf_browser_go has already put
+// the command bar into.
+//
+// SPLIT OUT OF nf_browser_go, verbatim, when the submenus landed. The two
+// modes share the command bar and the row-width arithmetic and share nothing
+// else, so the alternative was one function with the whole listing build
+// wrapped in an `if` -- 300 lines of measured, device-verified code re-
+// indented for no reason other than the brace. Moving it into a function of
+// its own left every line, every log and every step order exactly as the
+// 2026-09-27 device run measured them; the only thing that changed is the
+// page bar (see there), and that change is this task's own.
+//
+// `pageItems`/`nPageItems` are the CALLER'S array, not locals, because the
+// page bar's geometry may only be READ after setContent -- which happens
+// after this function has returned. nf_browser_go's own comment at the end
+// has why that ordering is the whole point of those two log lines.
+static void nf_build_listing_content(void *mwc, N3Dialog *dialog, QString const &path,
+                                     QWidget *content, QVBoxLayout *layout, int rowWidth,
+                                     nf_bar_item *pageItems, int *nPageItems) {
     QString const *db = nf_db_name();
     NFMetaCtx ctx;
     ctx.dirPath = path;
@@ -1699,129 +1685,6 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
     // nf_page_bar_labels (nffmt.h) for both the labels and the two active
     // flags in one call, so "is this end live" has one answer, made in the
     // one place a host test can reach it.
-
-    QWidget *content = new QWidget();
-    QVBoxLayout *layout = new QVBoxLayout(content);
-
-    // The width every item row's label is elided against -- see
-    // nf_row_width_px for both paths and why the dialog is what gets read.
-    //
-    // Logged ONCE PER NAVIGATION rather than once per process (the way
-    // nf_icons_generate is) precisely BECAUSE the answer changes: the
-    // first listing is built before pushView has sized the dialog, so it is
-    // always the fallback, and a once-per-process log would therefore only
-    // ever record the fallback and never the real measurement. One line per
-    // navigation is still one line, not one per row, and the transition from
-    // fallback to measured is visible in the log rather than invisible.
-    char const *widthSource = "unset";
-    int  rawDialogWidth     = 0;
-    int  rowWidth           = nf_row_width_px(dialog, layout, &widthSource, &rawDialogWidth);
-    QMargins layoutMargins  = layout->contentsMargins();
-    nh_log("browser: row width %d px -- %s (N3Dialog::width() read back %d, last content widget %d, our layout margins %d+%d, panel clamp %d)",
-           rowWidth, widthSource, rawDialogWidth,
-           nf_browser_active_content
-               ? reinterpret_cast<QWidget*>(nf_browser_active_content)->width() : -1,
-           layoutMargins.left(), layoutMargins.right(),
-           NF_PANEL_VISIBLE_WIDTH_PX);
-
-    // --- THE COMMAND BAR, one row across the top ------------------------
-    //
-    //     < BACK        sort: name ^        filter: all
-    //
-    // Three independently tappable TouchLabels in one horizontal layout,
-    // where there used to be three full-width rows (plus the page indicator
-    // and NEXT PAGE, now in the bottom bar). See the "two chrome bars"
-    // comment above nf_new_touch_row for why each item must be its own
-    // TouchLabel rather than one label with hot zones.
-    //
-    // The `|` separators in the brief's sketch are NOT drawn: a literal "|"
-    // would either be its own TouchLabel (a tap target that does nothing) or
-    // live inside a neighbour's text (widening that control's label for no
-    // reason). The separation is the three equal-width slots and the
-    // left/centre/right text alignment instead.
-    //
-    // ORDER AND LABELS ARE UNCHANGED from the stacked rows this replaces --
-    // BACK, then sort, then filter, with the same strings and the same cycle
-    // on each tap. The owner has learned those tap sequences on hardware;
-    // this task moves where the controls sit, not what they do.
-    //
-    // ROOM FOR MORE, conceptually: file operations are the next task, and a
-    // fourth item drops into this bar as another equal slot with no
-    // arithmetic to redo (NF_ITEMS_PER_PAGE counts bars, not bar items).
-    // Nothing is reserved for them here -- an empty placeholder control would
-    // be a tap target that does nothing.
-    QHBoxLayout *cmdBar   = nf_new_bar_layout();
-    nf_bar_item  cmdItems[NF_BAR_MAX_ITEMS];
-    int          nCmdItems = 0;
-
-    // BACK: the GUARANTEED exit, independent of N3Dialog's own backTapped()
-    // signal (wired once, in nf_browser_show, to this exact same
-    // nf_browser_back) -- review finding I-3, carried over from the
-    // trivial-screen milestone: getDialog wires the dialog's X
-    // (closeTapped()) to a controller-stack call pushView never populates, so
-    // the X does nothing on this route (see N3Dialog__disableCloseButton
-    // below, which removes it). If backTapped() ALSO failed to fire for any
-    // reason, this screen would have no way off it short of a power cycle, on
-    // the owner's daily-use device -- this control does not depend on
-    // N3Dialog's own signal at all, so it is the one most worth trusting if
-    // anything else here is wrong.
-    //
-    // FIRST in the bar, and still the first thing built, for that reason.
-    // Routed through nf_browser_back, the SAME function backTapped() calls --
-    // up one level, popping the dialog only at the root -- so there are not
-    // two forks of that logic to audit for drift.
-    {
-        QPushButton *shim = NULL;
-        QLabel *item = nf_new_touch_row(content, "BACK", &shim);
-        if (item) {
-            item->setText(QStringLiteral("< BACK"));
-            QObject::connect(shim, &QPushButton::clicked, [mwc, dialog] {
-                nf_browser_back(mwc, dialog);
-            });
-            nf_bar_add(cmdBar, cmdItems, &nCmdItems, item, "BACK", Qt::AlignLeft);
-        } else {
-            nh_log("browser: no BACK control this time (backTapped()/the back arrow is still wired)");
-        }
-    }
-
-    // Sort and filter. Tapping either changes what THIS directory shows,
-    // which is a bigger change to the row set than a page turn -- so unlike
-    // PREV/NEXT (resetPage=false, same directory, different slice), both of
-    // these pass resetPage=TRUE: a filter can turn a 3-page listing into a
-    // 1-page one, and landing on whatever page NUMBER happened to be current
-    // would be an arbitrary slice of a now-different listing rather than the
-    // meaningful "same place" it is for BACK/descend.
-    {
-        QPushButton *shim = NULL;
-        QLabel *item = nf_new_touch_row(content, "sort", &shim);
-        if (item) {
-            item->setText(nf_sort_row_label());
-            QObject::connect(shim, &QPushButton::clicked, [mwc, dialog, path] {
-                nf_browser_cycle_sort();
-                nh_log("browser: sort -- now %s", qPrintable(nf_sort_row_label()));
-                nf_browser_go(mwc, dialog, path, true); // resetPage -- see this block's own comment
-            });
-            nf_bar_add(cmdBar, cmdItems, &nCmdItems, item, "sort", Qt::AlignHCenter);
-        }
-    }
-    {
-        QPushButton *shim = NULL;
-        QLabel *item = nf_new_touch_row(content, "filter", &shim);
-        if (item) {
-            item->setText(nf_filter_row_label());
-            QObject::connect(shim, &QPushButton::clicked, [mwc, dialog, path] {
-                nf_browser_cycle_filter();
-                nh_log("browser: filter -- now %s", qPrintable(nf_filter_row_label()));
-                nf_browser_go(mwc, dialog, path, true); // resetPage -- see this block's own comment
-            });
-            nf_bar_add(cmdBar, cmdItems, &nCmdItems, item, "filter", Qt::AlignRight);
-        }
-    }
-
-    // ABOVE every item row, never interleaved with them -- the same principle
-    // the stacked chrome followed ("whatever gets clipped first should be the
-    // least useful row"), now with only two things that could ever be clipped.
-    layout->addLayout(cmdBar);
 
     // Spec sections 3.6/6.3: an empty ROW SET reads one of two ways, and
     // conflating them tells a reader who filtered to PDF and got nothing
@@ -2135,30 +1998,56 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
     //     < PREV        page 2/4        NEXT >
     //
     // The three labels come from nf_page_bar_labels (nffmt.h) -- pure and
-    // host-tested, because the one real DECISION here (what the ends say when
+    // host-tested, because the one real DECISION here (what the ends do when
     // there is no such page) is the part that can be tested off-device, and
     // the layout is the part that cannot.
     //
-    // BOTH ENDS ARE ALWAYS PRESENT. A control that disappears on the first
-    // and last page makes the bar's own layout jump as a reader pages through
-    // a folder, and it leaves the page counter sliding around under their
-    // thumb. So an unavailable end is rendered INERT rather than omitted:
-    //   - the label loses its arrow and reads "no prev"/"no next", which is
-    //     how inert is conveyed -- in the CHARACTERS, because this panel has
-    //     four grey levels and "slightly lighter" does not read as
-    //     "different" on it (the same finding that puts "[not in library]" in
-    //     a row's text rather than leaving it to colour);
-    //   - and it is built as a PLAIN QLabel, not as an unconnected
-    //     TouchLabel, so it is not a tap target at all rather than one that
-    //     silently does nothing. That also skips a 256-byte allocation and a
-    //     gesture registration for a control that cannot act.
+    // AN UNAVAILABLE END IS NOT SHOWN AT ALL. It used to read "no prev"/"no
+    // next", and those words were there for exactly one reason: to stop the
+    // bar's layout jumping as a reader pages through a folder, which would
+    // leave the page counter sliding around under their thumb. The owner
+    // asked for the words gone. THE PROPERTY THEY EXISTED FOR IS KEPT -- and
+    // it was never the text holding it up.
     //
-    // The whole bar is unconditional, including on a single-page listing
-    // (where it reads "no prev | page 1/1 | no next"). The stacked chrome
-    // used to hide its page indicator in that case, on the grounds that
-    // "page 1/1" says nothing -- but a bar that is sometimes absent makes the
-    // height of the item area depend on the folder, and NF_ITEMS_PER_PAGE's
-    // arithmetic counts exactly two chrome rows on every page.
+    // WIDTH IS RESERVED, BY THE SLOT, and that is the more robust of the two
+    // ways to satisfy it:
+    //   - This bar is three slots of EQUAL STRETCH (nf_bar_add's
+    //     addWidget(w, 1)) and nothing else, so Qt's layout engine hands each
+    //     one a third of the bar and the counter's slot is the middle third
+    //     whatever the other two contain -- its geometry does not read their
+    //     text at all. The one condition is that no item's minimum size
+    //     exceeds its own third, and at ~399 px a slot against labels of
+    //     60-150 px that is not close; it is stated because it is the only
+    //     way this could stop being true.
+    //   - A `[prev] [stretch] [page] [stretch] [next]` arrangement is the
+    //     alternative, and it is the WEAKER one: working the geometry through,
+    //     the middle item's centre lands at `W/2 + (prev - next)/2`, i.e. it
+    //     is centred only while the two ENDS ARE THE SAME WIDTH AS EACH OTHER.
+    //     "< PREV" on the left against an empty right-hand end is precisely
+    //     the case this change creates, so the arrangement that sounds like it
+    //     solves this is the one that fails on the very page it has to work
+    //     on. Equal stretch has no such term in it.
+    //
+    // INVISIBLE MUST NOT MEAN REMOVED FROM THE LAYOUT. That is the trap on
+    // the route that looks obvious: a hidden widget's QWidgetItem reports
+    // isEmpty(), and what a box layout then does with its slot is a Qt
+    // internal this project would be betting a layout guarantee on, sight
+    // unseen, on a Qt (5.2.1) it cannot run a host test against. An empty
+    // TEXT needs none of that answered -- the widget is present, visible and
+    // laid out exactly as a widget with text is; it simply draws nothing. So
+    // setVisible(false) is not used here, deliberately, and this paragraph is
+    // why rather than an oversight.
+    //
+    // A plain QLabel for an unavailable end, never an unconnected TouchLabel:
+    // an end that cannot act must not be a tap target at all, rather than one
+    // that silently does nothing. It also skips a 256-byte allocation and a
+    // gesture registration for a control with nothing to do.
+    //
+    // The whole bar is still unconditional, including on a single-page
+    // listing, where it renders as the counter alone with blank slots either
+    // side. A bar that was sometimes absent would make the height of the item
+    // area depend on the folder, and NF_ITEMS_PER_PAGE's arithmetic counts
+    // exactly two chrome rows on every page.
     //
     // `path` is captured by value in both handlers, and nf_browser_go is
     // called with resetPage=FALSE: this is a page change WITHIN the current
@@ -2169,9 +2058,8 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
     nf_page_bar_labels(nf_browser_page, totalPages,
                        &prevLabel, &prevActive, &pageLabel, &nextLabel, &nextActive);
 
-    QHBoxLayout *pageBar   = nf_new_bar_layout();
-    nf_bar_item  pageItems[NF_BAR_MAX_ITEMS];
-    int          nPageItems = 0;
+    QHBoxLayout *pageBar = nf_new_bar_layout();
+    *nPageItems = 0;
 
     {
         QLabel *item = NULL;
@@ -2189,28 +2077,29 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
             }
         }
         // Two ways to get here without a live control: there IS no previous
-        // page (the ordinary case -- the inert label, see this bar's own
-        // comment), or the TouchLabel allocation failed (already logged by
-        // nf_new_touch_row). A plain QLabel covers both, and the SLOT is held
-        // open either way so a missing control never slides the counter out
-        // from under the reader's eye. The failed-allocation slot is left
-        // BLANK rather than labelled "< PREV": a label that looks like a
-        // control and cannot receive a tap is worse than a gap.
+        // page (the ordinary case -- nf_page_bar_labels hands back an empty
+        // label for it), or the TouchLabel allocation failed (already logged
+        // by nf_new_touch_row). A plain QLabel covers both and the SLOT is
+        // held open either way, so neither one slides the counter out from
+        // under the reader's eye. BLANK in both cases: a label that looks like
+        // a control and cannot receive a tap is worse than a gap.
         if (!item)
             item = new QLabel(content);
-        item->setText((prevActive && !live) ? QString() : prevLabel);
-        nf_bar_add(pageBar, pageItems, &nPageItems, item,
-                   live ? "PREV" : (prevActive ? "prev(alloc failed)" : "prev(inert)"),
+        item->setText(live ? prevLabel : QString());
+        nf_bar_add(pageBar, pageItems, nPageItems, item,
+                   live ? "PREV" : (prevActive ? "prev(alloc failed)" : "prev(blank)"),
                    Qt::AlignLeft);
     }
 
     // The counter: informational only, never a tap target, so a plain QLabel
     // needs none of TouchLabel's gesture machinery -- same as the stacked
-    // chrome's own page indicator.
+    // chrome's own page indicator. It is also the one item in this bar that
+    // always has text, which is what keeps the bar a full row tall now that
+    // the ends can be empty.
     {
         QLabel *item = new QLabel(content);
         item->setText(pageLabel);
-        nf_bar_add(pageBar, pageItems, &nPageItems, item, "page", Qt::AlignHCenter);
+        nf_bar_add(pageBar, pageItems, nPageItems, item, "page", Qt::AlignHCenter);
     }
 
     {
@@ -2228,23 +2117,387 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
                 });
             }
         }
-        if (!item) // inert, or a blank held-open slot -- see PREV's own comment
+        if (!item) // blank, or a blank held-open slot -- see PREV's own comment
             item = new QLabel(content);
-        item->setText((nextActive && !live) ? QString() : nextLabel);
-        nf_bar_add(pageBar, pageItems, &nPageItems, item,
-                   live ? "NEXT" : (nextActive ? "next(alloc failed)" : "next(inert)"),
+        item->setText(live ? nextLabel : QString());
+        nf_bar_add(pageBar, pageItems, nPageItems, item,
+                   live ? "NEXT" : (nextActive ? "next(alloc failed)" : "next(blank)"),
                    Qt::AlignRight);
     }
 
     layout->addLayout(pageBar);
 
-    QString title = (path == QStringLiteral(NF_ROOT))
-        ? QStringLiteral("NickelFolders")
-        : QFileInfo(path).fileName();
-    N3Dialog__setTitle(dialog, title);
-
     nh_log("browser: showing '%s' (%d row(s), page %d/%d, %d shown)",
            qPrintable(path), rows.size(), nf_browser_page + 1, totalPages, endIdx - startIdx);
+}
+
+// Opens `menu`, or -- if it is the one already open -- closes it. Both
+// command-bar items run this, so "tap sort: again to put it away" and "tap
+// filter: while the sort menu is up to switch to it" are ONE rule rather than
+// two, and there is no second place for the mode to be set from a bar tap.
+//
+// Nothing about the listing changes here: the sort key, the direction, the
+// filter, the directory and the page are all untouched, so closing a menu
+// this way lands on exactly the screen that was showing before it opened --
+// the same guarantee BACK gives (nf_browser_back's own first case).
+// resetPage is false for that reason.
+static void nf_browser_open_menu(void *mwc, N3Dialog *dialog, QString const &path,
+                                 nf_menu_kind menu) {
+    nf_browser_menu = (nf_browser_menu == menu) ? NF_MENU_NONE : menu;
+    nh_log("browser: command bar tap -- mode is now %s", nf_menu_name(nf_browser_menu));
+    nf_browser_go(mwc, dialog, path, false); // same directory, same page
+}
+
+// What tapping option `index` of `menu` does. Split out of the row loop's
+// lambda so the two menus' rules sit next to each other and the one asymmetry
+// between them is visible in one place: the sort menu's ALREADY-ACTIVE row
+// toggles direction, which is the only way direction is reachable now that
+// tapping `sort:` opens a menu instead of cycling -- and which the active
+// row's own text promises ("* date ^ (tap for v)", nffmt.cc). The filter menu
+// has no second axis, so its already-active row just closes.
+//
+// Both paths end in the same two steps: back to BROWSE, then rebuild with
+// resetPage=FALSE. FALSE, not true, is the whole "return to the page you were
+// on" requirement -- nf_browser_page is untouched while a menu is open, so it
+// is still the page the reader left. The one case where the change invalidates
+// it (a filter that shrinks the listing past the current page) is handled by
+// nf_browser_go's OWN clamp, which is reused rather than duplicated here
+// precisely because it already exists and is already the one place the page
+// is bounded. The old behaviour -- a sort or filter tap resetting to page 0 --
+// is what this replaces.
+static void nf_menu_select(void *mwc, N3Dialog *dialog, QString const &path,
+                           nf_menu_kind menu, int index) {
+    if (menu == NF_MENU_SORT) {
+        nf_sort_key key = NF_SORT_NAME;
+        if (!nf_menu_sort_key_at(index, &key)) {
+            // Unreachable while the row loop below only wires indices it
+            // built, and answered anyway rather than acted on: a nonsense
+            // index must not become a confident wrong sort key.
+            nh_log("browser: sort menu row %d is out of range -- ignoring the tap", index);
+            return;
+        }
+        if (key == nf_browser_sort_key)
+            nf_browser_sort_desc = !nf_browser_sort_desc;
+        else
+            nf_browser_sort_key = key; // direction KEPT -- what the row's label promises
+        nh_log("browser: sort -- now %s", qPrintable(nf_sort_row_label()));
+    } else if (menu == NF_MENU_FILTER) {
+        nf_filter_kind filter = NF_FILTER_ALL;
+        if (!nf_menu_filter_at(index, &filter)) {
+            nh_log("browser: filter menu row %d is out of range -- ignoring the tap", index);
+            return;
+        }
+        nf_browser_filter = filter;
+        nh_log("browser: filter -- now %s", qPrintable(nf_filter_row_label()));
+    } else {
+        nh_log("browser: a menu row fired with no menu open -- ignoring it");
+        return;
+    }
+
+    nf_browser_menu = NF_MENU_NONE;
+    nf_browser_go(mwc, dialog, path, false); // same directory, same page -- see above
+}
+
+// SORT/FILTER mode's half of the content build: one tappable row per option,
+// in place of the item listing, added to the `layout` nf_browser_go has
+// already put the command bar into.
+//
+// THE COMMAND BAR STAYS AND THE PAGE BAR GOES. The bar stays because BACK
+// lives in it and BACK is this screen's guaranteed exit -- a menu that could
+// be entered and not left would be the same dead end the X button already is
+// on this route (nfview.h, review finding I-3). The page bar goes because
+// paging through a five- or eight-row menu is meaningless. That leaves one
+// chrome row instead of two here, i.e. MORE vertical room than the listing
+// has, so the longest menu (eight filter rows against NF_ITEMS_PER_PAGE's
+// eleven) fits with room to spare and there is no pagination to build. If a
+// menu ever grows past what one screen holds, the log line at the end is what
+// says so -- it prints both the count built and the count wanted, rather than
+// silently cutting the last option off the bottom.
+//
+// PLAIN TEXT, not rich text, and that is the one real difference from an item
+// row: a menu label carries no <img>, no suffix and no card data, so nothing
+// here needs escaping, nothing needs a non-breaking space, and the two-form
+// measure/render split the item rows need (nffmt.h) has nothing to keep in
+// step. setTextFormat is still set EXPLICITLY, for the same reason the item
+// rows set theirs: Qt::AutoText decides by INSPECTING THE STRING, and no
+// row's rendering may depend on what the string happens to contain.
+static void nf_build_menu_content(void *mwc, N3Dialog *dialog, QString const &path,
+                                  QWidget *content, QVBoxLayout *layout, int rowWidth) {
+    nf_menu_kind menu = nf_browser_menu;
+    int          want = nf_menu_row_count(menu);
+    int          built = 0;
+
+    // The increment is in the for-header, NOT the last statement of the body,
+    // which is why the `continue` below is safe. A `continue` in a loop whose
+    // increment is the last body statement hung Nickel's GUI thread once in
+    // this project -- no crash, PID unchanged, the device needed a power
+    // cycle -- so the shape is worth naming wherever a `continue` appears.
+    for (int i = 0; i < want; i++) {
+        QPushButton *shim = NULL;
+        QLabel *item = nf_new_touch_row(content,
+                                        menu == NF_MENU_SORT ? "sort menu" : "filter menu",
+                                        &shim);
+        if (!item) {
+            // Already logged by nf_new_touch_row. NOT fatal and NOT a break:
+            // one missing option is better than a menu that stops halfway,
+            // and the tally below is what says one is gone.
+            continue;
+        }
+
+        QString label = nf_menu_row_label(menu, i, nf_browser_sort_key,
+                                          nf_browser_sort_desc, nf_browser_filter);
+
+        // THE SAME width arithmetic every item row uses, less the two terms a
+        // menu row does not have (no leading image, no suffix) -- so the
+        // MEASURED/FALLBACK marker nf_browser_go has already logged for this
+        // build describes this half too, rather than describing a number
+        // nothing here spends. nf_name_budget_px is reused for its floor
+        // alone, which is the only part of it that can bite here.
+        //
+        // ElideRight rather than the item rows' ElideMiddle: a head-and-tail
+        // elision exists to tell two long FILENAMES apart, where these are
+        // this mod's own short words and the head is what identifies them.
+        // Unreachable today at ~20 characters against a ~1196 px row, and
+        // kept so a firmware with a much larger row font degrades instead of
+        // overflowing. There is no second sizeHint pass like the item rows'
+        // either: the four terms it corrects for (an <img> box, a suffix
+        // twin, an italic stylesheet, a `&nbsp;` separator) are all things a
+        // menu row does not have.
+        QFontMetrics fm(item->font());
+        int textWidth = rowWidth - nf_row_label_inset_px(item, fm);
+        item->setTextFormat(Qt::PlainText);
+        item->setText(fm.elidedText(label, Qt::ElideRight,
+                                    nf_name_budget_px(textWidth, 0, 0)));
+        item->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+
+        // Captured by VALUE, same as the item rows' handlers and for the same
+        // reason: these lambdas only run off a LATER tap, i.e. a separate
+        // invocation of the Qt event loop, long after this function's locals
+        // are gone.
+        int index = i;
+        QObject::connect(shim, &QPushButton::clicked, [mwc, dialog, path, menu, index] {
+            nf_menu_select(mwc, dialog, path, menu, index);
+        });
+
+        layout->addWidget(item);
+        built++;
+    }
+
+    // Pins the menu to the TOP the same way the listing's own stretch pins
+    // its page bar to the bottom: without it a QVBoxLayout hands the spare
+    // vertical space to the widgets themselves (QLabel's vertical size policy
+    // can grow), so a five-row sort menu would render as five rows stretched
+    // down the whole panel.
+    layout->addStretch(1);
+
+    nh_log("browser: showing the %s -- %d of %d option row(s) built, over '%s'",
+           nf_menu_name(menu), built, want, qPrintable(path));
+}
+
+// Builds a fresh content widget for `path` and swaps it into the ALREADY-
+// EXISTING `dialog` via N3Dialog::setContent -- this is the whole navigation
+// model (nfview.h): one N3Dialog for the lifetime of a browse session, rows
+// rebuilt in place, never a second dialog pushed per level. setContent itself
+// deleteLater()s whatever content was there before (nfnickel.h), so the
+// previous screen's rows and their shim buttons are cleaned up by Qt, not by
+// this function.
+//
+// WHAT the content is depends on nf_browser_menu: the directory listing
+// (nf_build_listing_content) or one of the two submenus
+// (nf_build_menu_content). Both halves get the SAME command bar and the SAME
+// row-width arithmetic, and both are the same content swap into the same
+// dialog -- a submenu is not a second screen, not a second dialog and not a
+// second navigation stack, which is exactly why BACK out of one changes
+// nothing about where the reader is (nf_browser_back's own first case).
+static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool resetPage) {
+    // Recorded BEFORE anything below can fail, so BACK's own "where am I"
+    // read is always this directory once this function has been entered --
+    // matching every row/BACK handler being wired only after the listing
+    // for THIS path has been built, never before.
+    snprintf(nf_browser_cwd, sizeof nf_browser_cwd, "%s", qPrintable(path));
+
+    // See nf_browser_page's own comment: every real navigation (descend,
+    // ascend, the initial root call) passes resetPage=true here, because all
+    // three move to a DIFFERENT directory. Everything that stays in the same
+    // directory passes false -- the page bar's PREV/NEXT, opening or closing
+    // a submenu, and selecting an option in one -- because none of those is a
+    // navigation and the reader's page is part of where they are.
+    if (resetPage)
+        nf_browser_page = 0;
+
+    // ONE LINE PER CONTENT BUILD, naming the mode. The failure this exists to
+    // catch is a silent one: "the submenu opened but the rows are the
+    // listing's", or the reverse, renders as a perfectly plausible screen and
+    // shows up nowhere else at all. Logged here, before anything below can
+    // fail, so the line is present even for a build that then goes wrong.
+    nh_log("browser: building %s content for '%s' (page %d)",
+           nf_menu_name(nf_browser_menu), qPrintable(path), nf_browser_page);
+
+    QWidget *content = new QWidget();
+    QVBoxLayout *layout = new QVBoxLayout(content);
+
+    // The width every row's label is elided against -- item rows and submenu
+    // option rows alike -- see nf_row_width_px for all three sources and why
+    // the dialog is what gets read.
+    //
+    // Logged ONCE PER NAVIGATION rather than once per process (the way
+    // nf_icons_generate is) precisely BECAUSE the answer changes: the
+    // first listing is built before pushView has sized the dialog, so it is
+    // always the fallback, and a once-per-process log would therefore only
+    // ever record the fallback and never the real measurement. One line per
+    // navigation is still one line, not one per row, and the transition from
+    // fallback to measured is visible in the log rather than invisible.
+    char const *widthSource = "unset";
+    int  rawDialogWidth     = 0;
+    int  rowWidth           = nf_row_width_px(dialog, layout, &widthSource, &rawDialogWidth);
+    QMargins layoutMargins  = layout->contentsMargins();
+    nh_log("browser: row width %d px -- %s (N3Dialog::width() read back %d, last content widget %d, our layout margins %d+%d, panel clamp %d)",
+           rowWidth, widthSource, rawDialogWidth,
+           nf_browser_active_content
+               ? reinterpret_cast<QWidget*>(nf_browser_active_content)->width() : -1,
+           layoutMargins.left(), layoutMargins.right(),
+           NF_PANEL_VISIBLE_WIDTH_PX);
+
+    // --- THE COMMAND BAR, one row across the top ------------------------
+    //
+    //     < BACK        sort: name ^        filter: all
+    //
+    // Three independently tappable TouchLabels in one horizontal layout,
+    // where there used to be three full-width rows (plus the page indicator
+    // and NEXT PAGE, now in the bottom bar). See the "two chrome bars"
+    // comment above nf_new_touch_row for why each item must be its own
+    // TouchLabel rather than one label with hot zones.
+    //
+    // The `|` separators in the brief's sketch are NOT drawn: a literal "|"
+    // would either be its own TouchLabel (a tap target that does nothing) or
+    // live inside a neighbour's text (widening that control's label for no
+    // reason). The separation is the three equal-width slots and the
+    // left/centre/right text alignment instead.
+    //
+    // BUILT IN BOTH MODES, item listing and submenu alike, and that is a
+    // requirement rather than a convenience: BACK lives in this bar, and a
+    // submenu that could be entered and not left would be a dead end on the
+    // owner's daily-use device -- the same dead end getDialog's own X button
+    // already is on this route. The two labels still read the CURRENT setting
+    // ("sort: name ^") while a menu is open, so the bar is both the status
+    // and the way back out of the menu it opened.
+    //
+    // ORDER AND LABELS ARE UNCHANGED from the stacked rows this replaces --
+    // BACK, then sort, then filter, with the same strings, and the owner has
+    // learned those positions on hardware. What CHANGED is what a tap DOES:
+    // `sort:`/`filter:` used to cycle to the next value, which took up to
+    // eight taps to reach a specific one, and they now open a submenu over
+    // the item list instead (nf_build_menu_content).
+    //
+    // ROOM FOR MORE, conceptually: file operations are the next task, and a
+    // fourth item drops into this bar as another equal slot with no
+    // arithmetic to redo (NF_ITEMS_PER_PAGE counts bars, not bar items).
+    // Nothing is reserved for them here -- an empty placeholder control would
+    // be a tap target that does nothing.
+    QHBoxLayout *cmdBar   = nf_new_bar_layout();
+    nf_bar_item  cmdItems[NF_BAR_MAX_ITEMS];
+    int          nCmdItems = 0;
+
+    // BACK: the GUARANTEED exit, independent of N3Dialog's own backTapped()
+    // signal (wired once, in nf_browser_show, to this exact same
+    // nf_browser_back) -- review finding I-3, carried over from the
+    // trivial-screen milestone: getDialog wires the dialog's X
+    // (closeTapped()) to a controller-stack call pushView never populates, so
+    // the X does nothing on this route (see N3Dialog__disableCloseButton
+    // below, which removes it). If backTapped() ALSO failed to fire for any
+    // reason, this screen would have no way off it short of a power cycle, on
+    // the owner's daily-use device -- this control does not depend on
+    // N3Dialog's own signal at all, so it is the one most worth trusting if
+    // anything else here is wrong.
+    //
+    // FIRST in the bar, and still the first thing built, for that reason.
+    // Routed through nf_browser_back, the SAME function backTapped() calls --
+    // up one level, popping the dialog only at the root -- so there are not
+    // two forks of that logic to audit for drift.
+    {
+        QPushButton *shim = NULL;
+        QLabel *item = nf_new_touch_row(content, "BACK", &shim);
+        if (item) {
+            item->setText(QStringLiteral("< BACK"));
+            QObject::connect(shim, &QPushButton::clicked, [mwc, dialog] {
+                nf_browser_back(mwc, dialog);
+            });
+            nf_bar_add(cmdBar, cmdItems, &nCmdItems, item, "BACK", Qt::AlignLeft);
+        } else {
+            nh_log("browser: no BACK control this time (backTapped()/the back arrow is still wired)");
+        }
+    }
+
+    // Sort and filter. Each item shows the setting in force and OPENS THAT
+    // SETTING'S SUBMENU on a tap -- or closes it, if it is the one already
+    // open (nf_browser_open_menu, which is the single place a bar tap sets
+    // the mode). Neither one changes the listing by itself any more: nothing
+    // about the row set, the directory or the page moves until an option row
+    // in the menu is tapped, which is what makes BACK out of a menu a genuine
+    // "changed my mind" rather than an undo.
+    //
+    // The old behaviour these replace was a CYCLE -- one tap advanced to the
+    // next value -- and its cost was the whole reason for this task: five
+    // sort keys times two directions and eight filter values means up to
+    // eight taps to reach a specific one, each of them a full rebuild of the
+    // listing on the way past.
+    {
+        QPushButton *shim = NULL;
+        QLabel *item = nf_new_touch_row(content, "sort", &shim);
+        if (item) {
+            item->setText(nf_sort_row_label());
+            QObject::connect(shim, &QPushButton::clicked, [mwc, dialog, path] {
+                nf_browser_open_menu(mwc, dialog, path, NF_MENU_SORT);
+            });
+            nf_bar_add(cmdBar, cmdItems, &nCmdItems, item, "sort", Qt::AlignHCenter);
+        }
+    }
+    {
+        QPushButton *shim = NULL;
+        QLabel *item = nf_new_touch_row(content, "filter", &shim);
+        if (item) {
+            item->setText(nf_filter_row_label());
+            QObject::connect(shim, &QPushButton::clicked, [mwc, dialog, path] {
+                nf_browser_open_menu(mwc, dialog, path, NF_MENU_FILTER);
+            });
+            nf_bar_add(cmdBar, cmdItems, &nCmdItems, item, "filter", Qt::AlignRight);
+        }
+    }
+
+    // ABOVE everything below it, never interleaved -- the same principle the
+    // stacked chrome followed ("whatever gets clipped first should be the
+    // least useful row"). Added here, BEFORE the mode dispatch, so it is the
+    // first thing in the layout in both modes.
+    layout->addLayout(cmdBar);
+
+    // THE MODE DISPATCH. Everything above is shared by both halves; below,
+    // exactly one of them runs. `pageItems` is declared out here rather than
+    // inside the listing half because that bar's geometry is logged at the
+    // very END of this function, after setContent -- which is the only point
+    // where those numbers are real (see there).
+    nf_bar_item pageItems[NF_BAR_MAX_ITEMS];
+    int         nPageItems = 0;
+    if (nf_browser_menu == NF_MENU_NONE)
+        nf_build_listing_content(mwc, dialog, path, content, layout, rowWidth,
+                                 pageItems, &nPageItems);
+    else
+        nf_build_menu_content(mwc, dialog, path, content, layout, rowWidth);
+
+    // THE TITLE is the only thing on screen that says which mode this is: the
+    // command bar looks the same in all three, because it IS the same bar. A
+    // reader who taps `sort:` sees the dialog's own title change from the
+    // folder's name to "Sort by", i.e. Nickel's own chrome doing the
+    // announcing rather than a row of ours pretending to be a heading.
+    QString title;
+    if (nf_browser_menu == NF_MENU_SORT)
+        title = QStringLiteral("Sort by");
+    else if (nf_browser_menu == NF_MENU_FILTER)
+        title = QStringLiteral("Filter by");
+    else
+        title = (path == QStringLiteral(NF_ROOT))
+            ? QStringLiteral("NickelFolders")
+            : QFileInfo(path).fileName();
+    N3Dialog__setTitle(dialog, title);
 
     // Reparents `content` into the dialog's own layout and shows it;
     // deleteLater()s whatever content was there before (nfnickel.h) --
@@ -2288,7 +2541,11 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
     // identical on a screenshot and different in these two lines.
     int laidOutWidth = content->width();
     nf_log_bar_geometry("command", cmdItems,  nCmdItems,  laidOutWidth);
-    nf_log_bar_geometry("page",    pageItems, nPageItems, laidOutWidth);
+    // No page bar in a submenu, so no line for one -- nf_log_bar_geometry's
+    // own zero-item text reads "every allocation failed", which would be a
+    // false accusation here rather than a missing measurement.
+    if (nf_browser_menu == NF_MENU_NONE)
+        nf_log_bar_geometry("page", pageItems, nPageItems, laidOutWidth);
 }
 
 bool nf_browser_show(void) {
@@ -2302,6 +2559,22 @@ bool nf_browser_show(void) {
         nh_log("browser: MainWindowController::sharedInstance() returned null, refusing");
         return false;
     }
+
+    // THE TRIGGER ALWAYS MEANS "SHOW ME THE LISTING", never whichever submenu
+    // happened to be open. Reset here rather than in either branch below, so
+    // both the fresh-dialog and the re-push paths get it from one line.
+    //
+    // This is not only tidiness: nf_browser_menu is file-scope state that
+    // outlives a dialog, and the one thing that clears it in the ordinary
+    // course -- BACK, or an option tap -- cannot run if Nickel's own
+    // navigation abandons the dialog while a menu is up (tapping Home while
+    // browsing, the same case nf_browser_active_dialog's re-push exists for).
+    // Without this line the next trigger would build a sort menu at the root
+    // and the reader would have no idea why. The sort key, the direction and
+    // the filter deliberately do NOT reset with it -- they are preferences
+    // about how any listing is read (see their own comment), where the mode
+    // is a transient answer to "what is on screen right now".
+    nf_browser_menu = NF_MENU_NONE;
 
     if (nf_browser_active_dialog) {
         // Review finding L5: the guard used to refuse outright here, and
