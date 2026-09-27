@@ -9,14 +9,7 @@
 compile_commands.json
 /KoboRoot.tgz
 /libnfolders.so
-/src/nfolders.o
-/src/nfnickel.o
-/src/nfbrowser.o
-/src/nfview.o
-/src/nfops.o
-/src/nflist.o
-/src/nffmt.o
-/src/nfpath.o
+*.o
 
 # device credentials and local scratch
 /device.local
