@@ -1570,29 +1570,190 @@ static void test_view_flag_maps_each_toggle_to_its_own_field(void) {
 // menus' orders are. Unlike theirs it preserves no cycle a reader has learned
 // on hardware -- this menu has no predecessor -- so what it pins is simply
 // that the order does not drift between builds under a reader's fingers.
+//
+// SEVEN ROWS, NOT FIVE, since `sort:` and `filter:` moved off the command bar
+// and into the top of this menu. The five toggles keep their order and shift
+// down by two.
 static void test_view_menu_rows_are_the_documented_order(void) {
-    CHECK(nf_menu_row_count(NF_MENU_VIEW) == 5);
+    CHECK(nf_menu_row_count(NF_MENU_VIEW) == 7);
+    // The negative control on the count itself: it must not still be the
+    // five-toggle menu, and it must not have grown past what one screen of
+    // rows holds (nf_items_per_page is 11 with covers on).
+    CHECK(nf_menu_row_count(NF_MENU_VIEW) != 5);
+    CHECK(nf_menu_row_count(NF_MENU_VIEW) <= nf_items_per_page(true, 2));
 
     nf_view_toggle const want[] = { NF_VIEW_FILENAMES, NF_VIEW_EXTENSIONS,
                                     NF_VIEW_COVERS, NF_VIEW_HIDDEN, NF_VIEW_SIZE };
     for (int i = 0; i < 5; i++) {
         nf_view_toggle got = NF_VIEW_SIZE;
-        CHECK(nf_menu_view_toggle_at(i, &got));
+        CHECK(nf_menu_view_toggle_at(i + 2, &got));
         CHECK(got == want[i]);
     }
+}
+
+// THE TWO KINDS OF VIEW ROW, and the invariant that keeps them apart: for any
+// index, EXACTLY ONE of the two accessors answers true. A row that both opened
+// the sort menu and flipped a flag is the one defect this shape can have, and
+// a row that did neither would be a tap target that does nothing.
+static void test_view_menu_rows_are_either_a_submenu_or_a_toggle_never_both(void) {
+    for (int i = 0; i < nf_menu_row_count(NF_MENU_VIEW); i++) {
+        bool isToggle  = nf_menu_view_toggle_at(i, NULL);
+        bool isSubmenu = nf_menu_view_submenu_at(i, NULL);
+        CHECK(isToggle != isSubmenu);
+    }
+
+    // The two openers, and WHICH menu each opens.
+    nf_menu_kind m = NF_MENU_NONE;
+    CHECK(nf_menu_view_submenu_at(0, &m));
+    CHECK(m == NF_MENU_SORT);
+    CHECK(nf_menu_view_submenu_at(1, &m));
+    CHECK(m == NF_MENU_FILTER);
+
+    // THE NEGATIVE CONTROLS. Row 0 is no longer a toggle -- if it still were,
+    // tapping "sort: name (asc)" would flip `filenames` and never open
+    // anything, which is exactly the failure the split exists to rule out.
+    CHECK(!nf_menu_view_toggle_at(0, NULL));
+    CHECK(!nf_menu_view_toggle_at(1, NULL));
+    // ...and no toggle row is an opener, so tapping "covers: on" cannot
+    // navigate.
+    for (int i = 2; i < 7; i++)
+        CHECK(!nf_menu_view_submenu_at(i, NULL));
 }
 
 static void test_view_menu_index_out_of_range_refuses_and_writes_nothing(void) {
     nf_view_toggle t = NF_VIEW_COVERS;
     CHECK(!nf_menu_view_toggle_at(-1, &t));
-    CHECK(!nf_menu_view_toggle_at(5, &t));
+    CHECK(!nf_menu_view_toggle_at(7, &t));
     CHECK(t == NF_VIEW_COVERS); // untouched
-    CHECK(nf_menu_view_toggle_at(0, NULL));
+    CHECK(nf_menu_view_toggle_at(2, NULL));
     CHECK(!nf_menu_view_toggle_at(99, NULL));
+
+    // The submenu accessor refuses the same way, and writes nothing.
+    nf_menu_kind m = NF_MENU_CONFIRM_DELETE; // a value it must never produce
+    CHECK(!nf_menu_view_submenu_at(-1, &m));
+    CHECK(!nf_menu_view_submenu_at(7, &m));
+    CHECK(!nf_menu_view_submenu_at(2, &m)); // a real row, but a toggle
+    CHECK(m == NF_MENU_CONFIRM_DELETE);     // untouched by all three
+    CHECK(nf_menu_view_submenu_at(0, NULL));
+
     CHECK(nf_menu_row_label(NF_MENU_VIEW, -1, NF_SORT_NAME, false, NF_FILTER_ALL,
                             nf_view_flags_default()).isEmpty());
-    CHECK(nf_menu_row_label(NF_MENU_VIEW, 5, NF_SORT_NAME, false, NF_FILTER_ALL,
+    CHECK(nf_menu_row_label(NF_MENU_VIEW, 7, NF_SORT_NAME, false, NF_FILTER_ALL,
                             nf_view_flags_default()).isEmpty());
+}
+
+// THE TWO SUBMENU ROWS SAY WHAT THE COMMAND BAR USED TO SAY, character for
+// character. That is the whole claim that moving `sort:` and `filter:` into
+// this menu lost nothing: the state is one tap away, in the same words.
+//
+// Checked against nf_sort_bar_label/nf_filter_bar_label themselves rather than
+// against restated literals, so the two can never drift -- plus one literal
+// each, so the pair is pinned to something and not merely to each other.
+static void test_view_submenu_rows_carry_the_bars_own_labels(void) {
+    nf_view_flags def = nf_view_flags_default();
+
+    CHECK_EQ_STR(nf_menu_row_label(NF_MENU_VIEW, 0, NF_SORT_NAME, false, NF_FILTER_ALL, def),
+                 "sort: name (asc)");
+    CHECK_EQ_STR(nf_menu_row_label(NF_MENU_VIEW, 1, NF_SORT_NAME, false, NF_FILTER_ALL, def),
+                 "filter: all");
+
+    nf_sort_key const keys[] = { NF_SORT_NAME, NF_SORT_SIZE, NF_SORT_DATE,
+                                 NF_SORT_ADDED, NF_SORT_READ };
+    for (int k = 0; k < 5; k++) {
+        for (int d = 0; d < 2; d++) {
+            CHECK(nf_menu_row_label(NF_MENU_VIEW, 0, keys[k], d != 0,
+                                    NF_FILTER_ALL, def) ==
+                  nf_sort_bar_label(keys[k], d != 0));
+        }
+    }
+
+    nf_filter_kind const filters[] = { NF_FILTER_ALL, NF_FILTER_CBZ, NF_FILTER_CBR,
+                                       NF_FILTER_PDF, NF_FILTER_EPUB,
+                                       NF_FILTER_FINISHED, NF_FILTER_IN_PROGRESS,
+                                       NF_FILTER_NOT_STARTED };
+    for (int f = 0; f < 8; f++) {
+        CHECK(nf_menu_row_label(NF_MENU_VIEW, 1, NF_SORT_NAME, false,
+                                filters[f], def) ==
+              nf_filter_bar_label(filters[f]));
+    }
+
+    // THE NEGATIVE CONTROLS: both rows must MOVE with the state they report.
+    // A row built off a constant would satisfy the default case above and tell
+    // a reader "sort: name (asc)" on a screen sorted by date, descending --
+    // which is the state this row exists to carry.
+    CHECK(nf_menu_row_label(NF_MENU_VIEW, 0, NF_SORT_DATE, true, NF_FILTER_ALL, def) !=
+          nf_menu_row_label(NF_MENU_VIEW, 0, NF_SORT_NAME, false, NF_FILTER_ALL, def));
+    CHECK(nf_menu_row_label(NF_MENU_VIEW, 1, NF_SORT_NAME, false, NF_FILTER_PDF, def) !=
+          nf_menu_row_label(NF_MENU_VIEW, 1, NF_SORT_NAME, false, NF_FILTER_ALL, def));
+    // ...and each must ignore the OTHER'S axis, so the two rows cannot be one
+    // row rendered twice.
+    CHECK_EQ_STR(nf_menu_row_label(NF_MENU_VIEW, 0, NF_SORT_NAME, false, NF_FILTER_PDF, def),
+                 "sort: name (asc)");
+    CHECK_EQ_STR(nf_menu_row_label(NF_MENU_VIEW, 1, NF_SORT_DATE, true, NF_FILTER_ALL, def),
+                 "filter: all");
+    // Neither carries the toggle rows' "name: state" shape by accident, and
+    // neither carries the other two menus' "* " active mark.
+    CHECK(!nf_menu_row_label(NF_MENU_VIEW, 0, NF_SORT_NAME, false, NF_FILTER_ALL, def)
+               .startsWith(QLatin1Char('*')));
+    CHECK(!nf_menu_row_label(NF_MENU_VIEW, 1, NF_SORT_NAME, false, NF_FILTER_ALL, def)
+               .startsWith(QLatin1Char('*')));
+}
+
+// WHERE BACK GOES, at all three levels. This is the rule nfview.cc's single
+// BACK routing asks for rather than re-deriving, so it is pinned here.
+static void test_back_target_walks_one_level_of_nesting(void) {
+    // The nested case: the view menu opened these two, so BACK returns to it.
+    CHECK(nf_menu_back_target(NF_MENU_SORT, NF_MENU_VIEW)   == NF_MENU_VIEW);
+    CHECK(nf_menu_back_target(NF_MENU_FILTER, NF_MENU_VIEW) == NF_MENU_VIEW);
+
+    // The top level: the command bar opened this one, so BACK returns to the
+    // listing.
+    CHECK(nf_menu_back_target(NF_MENU_VIEW, NF_MENU_NONE) == NF_MENU_NONE);
+
+    // THE NEGATIVE CONTROL that makes the first two mean something: the SAME
+    // menus, opened from the command bar rather than from the view menu, must
+    // return to the LISTING. If this returned NF_MENU_VIEW the first two
+    // checks would pass for a function that ignored its parent entirely.
+    CHECK(nf_menu_back_target(NF_MENU_SORT, NF_MENU_NONE)   == NF_MENU_NONE);
+    CHECK(nf_menu_back_target(NF_MENU_FILTER, NF_MENU_NONE) == NF_MENU_NONE);
+
+    // No menu open: BACK is not about a menu at all, and this must not invent
+    // one to return to.
+    CHECK(nf_menu_back_target(NF_MENU_NONE, NF_MENU_NONE) == NF_MENU_NONE);
+    CHECK(nf_menu_back_target(NF_MENU_NONE, NF_MENU_VIEW) == NF_MENU_NONE);
+
+    // A confirmation ALWAYS cancels to the listing, whatever parent was
+    // recorded against it -- a parent there is a bug, and this ignores it
+    // rather than stranding the reader in a menu.
+    CHECK(nf_menu_back_target(NF_MENU_CONFIRM_DELETE, NF_MENU_VIEW) == NF_MENU_NONE);
+    CHECK(nf_menu_back_target(NF_MENU_CONFIRM_PASTE,  NF_MENU_VIEW) == NF_MENU_NONE);
+    CHECK(nf_menu_back_target(NF_MENU_CONFIRM_RESCAN, NF_MENU_VIEW) == NF_MENU_NONE);
+
+    // A menu cannot be its own parent: following that would be a BACK that
+    // never leaves.
+    CHECK(nf_menu_back_target(NF_MENU_VIEW, NF_MENU_VIEW) == NF_MENU_NONE);
+    CHECK(nf_menu_back_target(NF_MENU_SORT, NF_MENU_SORT) == NF_MENU_NONE);
+
+    // A parent that could never BE on screen is refused rather than navigated
+    // to: a confirmation has no option rows of its own to return to.
+    CHECK(nf_menu_back_target(NF_MENU_SORT, NF_MENU_CONFIRM_DELETE) == NF_MENU_NONE);
+
+    // BACK TERMINATES from every reachable state: one step lands on something
+    // whose own next step is the listing. That is what "one level deep" means,
+    // and it is checked rather than asserted.
+    nf_menu_kind const menus[] = { NF_MENU_SORT, NF_MENU_FILTER, NF_MENU_VIEW,
+                                   NF_MENU_CONFIRM_DELETE, NF_MENU_CONFIRM_PASTE,
+                                   NF_MENU_CONFIRM_RESCAN };
+    nf_menu_kind const parents[] = { NF_MENU_NONE, NF_MENU_VIEW };
+    for (int m = 0; m < 6; m++) {
+        for (int pi = 0; pi < 2; pi++) {
+            nf_menu_kind first = nf_menu_back_target(menus[m], parents[pi]);
+            // nfview.cc clears the parent when it returns to one, because one
+            // level of nesting means the menu returned to was opened from the
+            // listing -- so the second step is taken with NF_MENU_NONE.
+            CHECK(nf_menu_back_target(first, NF_MENU_NONE) == NF_MENU_NONE);
+        }
+    }
 }
 
 // EVERY VIEW ROW STATES ITS OWN STATE, IN ITS OWN TEXT, in both states. This
@@ -1601,29 +1762,32 @@ static void test_view_menu_index_out_of_range_refuses_and_writes_nothing(void) {
 // toggle whose state lived in styling would be a toggle a reader could not
 // read at all.
 static void test_view_rows_show_their_state_in_the_text(void) {
+    // Rows 2-6: the five toggles. Rows 0 and 1 are the two submenu openers and
+    // have their own test above -- the offset is the whole reason this file
+    // spells the indices out rather than looping from 0.
     nf_view_flags def = nf_view_flags_default();
-    CHECK_EQ_STR(nf_menu_row_label(NF_MENU_VIEW, 0, NF_SORT_NAME, false, NF_FILTER_ALL, def),
-                 "filenames: truncated");
-    CHECK_EQ_STR(nf_menu_row_label(NF_MENU_VIEW, 1, NF_SORT_NAME, false, NF_FILTER_ALL, def),
-                 "extensions: shown");
     CHECK_EQ_STR(nf_menu_row_label(NF_MENU_VIEW, 2, NF_SORT_NAME, false, NF_FILTER_ALL, def),
-                 "covers: on");
+                 "filenames: truncated");
     CHECK_EQ_STR(nf_menu_row_label(NF_MENU_VIEW, 3, NF_SORT_NAME, false, NF_FILTER_ALL, def),
-                 "hidden files: hidden");
+                 "extensions: shown");
     CHECK_EQ_STR(nf_menu_row_label(NF_MENU_VIEW, 4, NF_SORT_NAME, false, NF_FILTER_ALL, def),
+                 "covers: on");
+    CHECK_EQ_STR(nf_menu_row_label(NF_MENU_VIEW, 5, NF_SORT_NAME, false, NF_FILTER_ALL, def),
+                 "hidden files: hidden");
+    CHECK_EQ_STR(nf_menu_row_label(NF_MENU_VIEW, 6, NF_SORT_NAME, false, NF_FILTER_ALL, def),
                  "size: hidden");
 
     nf_view_flags on;
     on.fullNames = on.hideExtensions = on.hideCovers = on.showHidden = on.showSize = true;
-    CHECK_EQ_STR(nf_menu_row_label(NF_MENU_VIEW, 0, NF_SORT_NAME, false, NF_FILTER_ALL, on),
-                 "filenames: full");
-    CHECK_EQ_STR(nf_menu_row_label(NF_MENU_VIEW, 1, NF_SORT_NAME, false, NF_FILTER_ALL, on),
-                 "extensions: hidden");
     CHECK_EQ_STR(nf_menu_row_label(NF_MENU_VIEW, 2, NF_SORT_NAME, false, NF_FILTER_ALL, on),
-                 "covers: off");
+                 "filenames: full");
     CHECK_EQ_STR(nf_menu_row_label(NF_MENU_VIEW, 3, NF_SORT_NAME, false, NF_FILTER_ALL, on),
-                 "hidden files: shown");
+                 "extensions: hidden");
     CHECK_EQ_STR(nf_menu_row_label(NF_MENU_VIEW, 4, NF_SORT_NAME, false, NF_FILTER_ALL, on),
+                 "covers: off");
+    CHECK_EQ_STR(nf_menu_row_label(NF_MENU_VIEW, 5, NF_SORT_NAME, false, NF_FILTER_ALL, on),
+                 "hidden files: shown");
+    CHECK_EQ_STR(nf_menu_row_label(NF_MENU_VIEW, 6, NF_SORT_NAME, false, NF_FILTER_ALL, on),
                  "size: shown");
 
     // THE NEGATIVE CONTROL: every row's text must actually MOVE when its flag
@@ -1631,7 +1795,7 @@ static void test_view_rows_show_their_state_in_the_text(void) {
     // field at all -- would satisfy every equality above for one of the two
     // states and be wrong for the other, and a reader would be told "covers:
     // on" on a screen with no covers on it.
-    for (int i = 0; i < 5; i++) {
+    for (int i = 2; i < 7; i++) {
         QString a = nf_menu_row_label(NF_MENU_VIEW, i, NF_SORT_NAME, false, NF_FILTER_ALL, def);
         QString b = nf_menu_row_label(NF_MENU_VIEW, i, NF_SORT_NAME, false, NF_FILTER_ALL, on);
         CHECK(a != b);
@@ -1654,7 +1818,7 @@ static void test_view_rows_carry_no_active_mark_and_no_space_runs(void) {
         v.hideCovers     = (bits & 4)  != 0;
         v.showHidden     = (bits & 8)  != 0;
         v.showSize       = (bits & 16) != 0;
-        for (int i = 0; i < 5; i++) {
+        for (int i = 2; i < 7; i++) { // the five TOGGLE rows; 0 and 1 are openers
             QString row = nf_menu_row_label(NF_MENU_VIEW, i, NF_SORT_NAME, false,
                                             NF_FILTER_ALL, v);
             CHECK(!row.isEmpty());
@@ -1700,10 +1864,10 @@ static void test_view_bar_label_is_the_bare_word_in_every_mode(void) {
     bool *covers = nf_view_flag(&v, NF_VIEW_COVERS);
     CHECK(covers != NULL);
     if (covers) {
-        CHECK_EQ_STR(nf_menu_row_label(NF_MENU_VIEW, 2, NF_SORT_NAME, false, NF_FILTER_ALL, v),
+        CHECK_EQ_STR(nf_menu_row_label(NF_MENU_VIEW, 4, NF_SORT_NAME, false, NF_FILTER_ALL, v),
                      "covers: on");
         *covers = true;
-        CHECK_EQ_STR(nf_menu_row_label(NF_MENU_VIEW, 2, NF_SORT_NAME, false, NF_FILTER_ALL, v),
+        CHECK_EQ_STR(nf_menu_row_label(NF_MENU_VIEW, 4, NF_SORT_NAME, false, NF_FILTER_ALL, v),
                      "covers: off");
         // ...and so does the per-build log line, which is what stops a
         // screenshot being attributed to the wrong mode. It has already
@@ -1722,12 +1886,23 @@ static void test_view_flags_summary_is_the_menu_rows(void) {
     v.showSize   = true;
 
     QString summary = nf_view_flags_summary(v);
-    for (int i = 0; i < 5; i++) {
+    for (int i = 2; i < 7; i++) {
         CHECK(summary.contains(nf_menu_row_label(NF_MENU_VIEW, i, NF_SORT_NAME, false,
                                                  NF_FILTER_ALL, v)));
     }
     // All five, separated -- not one row and a truncation.
     CHECK(summary.count(QStringLiteral(" | ")) == 4);
+    // THE TWO SUBMENU ROWS ARE NOT IN IT, and that is a correctness
+    // requirement rather than brevity: this summary has no sort key and no
+    // filter to pass, so those rows would be built against placeholders and
+    // would print "sort: name (asc)" on a screen sorted by date. This line's
+    // whole job is to make a screenshot attributable to a mode, and it has
+    // already caught one real misdiagnosis in this project.
+    CHECK(!summary.contains(QStringLiteral("sort:")));
+    CHECK(!summary.contains(QStringLiteral("filter:")));
+    // ...and it does not open with the separator, which is what a skipped row
+    // and an index-keyed separator would produce together.
+    CHECK(!summary.startsWith(QStringLiteral(" | ")));
     // The negative control: the summary must describe THIS mode, not the
     // default one. "covers: on" is the default row and must be absent.
     CHECK(summary.contains(QStringLiteral("covers: off")));
@@ -2417,7 +2592,10 @@ int main(void) {
     test_zeroed_view_flags_are_the_defaults();
     test_view_flag_maps_each_toggle_to_its_own_field();
     test_view_menu_rows_are_the_documented_order();
+    test_view_menu_rows_are_either_a_submenu_or_a_toggle_never_both();
     test_view_menu_index_out_of_range_refuses_and_writes_nothing();
+    test_view_submenu_rows_carry_the_bars_own_labels();
+    test_back_target_walks_one_level_of_nesting();
     test_view_rows_show_their_state_in_the_text();
     test_view_rows_carry_no_active_mark_and_no_space_runs();
     test_view_bar_label_is_the_bare_word_in_every_mode();

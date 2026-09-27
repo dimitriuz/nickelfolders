@@ -1106,17 +1106,54 @@ static nf_filter_kind const NF_MENU_FILTER_ROWS[] = {
     NF_FILTER_FINISHED, NF_FILTER_IN_PROGRESS, NF_FILTER_NOT_STARTED,
 };
 
-// THE VIEW MENU'S ROW ORDER, same shape and same reasoning as the two above.
-// No cycle to preserve here -- this menu has no predecessor -- so the order is
-// chosen: the two that change what a LABEL says first (they interact with each
-// other, so they read best adjacent), then the one that changes the PAGE SIZE,
-// then the one that changes which rows EXIST, then the one that adds a
-// suffix. The one flag that is a genuine filter rather than a display choice
-// (`hidden files`) is deliberately not first, where a reader scanning the menu
-// would meet it before anything that explains the difference.
-static nf_view_toggle const NF_MENU_VIEW_ROWS[] = {
-    NF_VIEW_FILENAMES, NF_VIEW_EXTENSIONS, NF_VIEW_COVERS, NF_VIEW_HIDDEN,
-    NF_VIEW_SIZE,
+// THE VIEW MENU'S ROWS, and this menu is now the only one of the three with
+// two KINDS of row in it: two that OPEN another menu, then the five TOGGLES.
+//
+// WHY THE TWO OPENERS ARE HERE AT ALL: `sort:` and `filter:` used to be
+// command-bar items of their own, which put six or seven controls on a bar the
+// owner could not read -- the sort label alone measured 357 px against a
+// 1264 px panel (nf_bar_plan_layout's own comment has that measurement). Both
+// are DISPLAY concerns, which is exactly what `view` already means, so they
+// moved in here rather than being cut. The bar is four or five short items now
+// and no longer wraps (nf_items_per_page's arithmetic).
+//
+// THEY ARE FIRST, above the toggles, for two reasons: they are what the owner
+// reaches for most (they were bar items precisely because of that), and their
+// rows are the only ones that carry a state the bar used to display -- so the
+// state is still one tap away rather than lost. Their labels ARE the bar's old
+// labels, nf_sort_bar_label/nf_filter_bar_label verbatim (nf_menu_row_label
+// below), which is what makes "one tap away, not lost" literally true instead
+// of approximately true.
+//
+// THE FIVE TOGGLES' ORDER IS UNCHANGED, only shifted down by two. No cycle to
+// preserve here -- this menu has no predecessor -- so the order is chosen: the
+// two that change what a LABEL says first (they interact with each other, so
+// they read best adjacent), then the one that changes the PAGE SIZE, then the
+// one that changes which rows EXIST, then the one that adds a suffix. The one
+// flag that is a genuine filter rather than a display choice (`hidden files`)
+// is deliberately not first, where a reader scanning the menu would meet it
+// before anything that explains the difference.
+//
+// POD with constant initialisers, same as the two arrays above and for the
+// same load-bearing reason: no constructor to run, so `nm libnfolders.so |
+// grep GLOBAL__sub_I` stays empty (CLAUDE.md's file-scope rule, and the crash
+// that produced it). Every field is spelled in order in every row -- GCC 4.9's
+// C++ frontend rejects a designated initializer that SKIPS a field, so the
+// unused member of each row is written out rather than omitted.
+struct nf_view_row {
+    bool           submenu; // true: this row OPENS `menu`; false: it flips `toggle`
+    nf_menu_kind   menu;    // meaningful only when `submenu`
+    nf_view_toggle toggle;  // meaningful only when NOT `submenu`
+};
+
+static nf_view_row const NF_MENU_VIEW_ROWS[] = {
+    { true,  NF_MENU_SORT,   NF_VIEW_FILENAMES  },
+    { true,  NF_MENU_FILTER, NF_VIEW_FILENAMES  },
+    { false, NF_MENU_NONE,   NF_VIEW_FILENAMES  },
+    { false, NF_MENU_NONE,   NF_VIEW_EXTENSIONS },
+    { false, NF_MENU_NONE,   NF_VIEW_COVERS     },
+    { false, NF_MENU_NONE,   NF_VIEW_HIDDEN     },
+    { false, NF_MENU_NONE,   NF_VIEW_SIZE       },
 };
 
 #define NF_MENU_SORT_ROW_COUNT   ((int)(sizeof NF_MENU_SORT_ROWS / sizeof NF_MENU_SORT_ROWS[0]))
@@ -1149,12 +1186,80 @@ bool nf_menu_filter_at(int index, nf_filter_kind *filter) {
     return true;
 }
 
+// FALSE FOR THE TWO SUBMENU ROWS, not only for an out-of-range index, and
+// that is the whole of how a caller tells the two kinds of view row apart: it
+// asks this first, and a `false` sends it to nf_menu_view_submenu_at below.
+// A row that opened the sort menu AND flipped a flag would be the one defect
+// worth designing against here, and a refusal on each side is what rules it
+// out -- exactly one of the two answers true for any index.
 bool nf_menu_view_toggle_at(int index, nf_view_toggle *toggle) {
     if (index < 0 || index >= NF_MENU_VIEW_ROW_COUNT)
         return false;
+    if (NF_MENU_VIEW_ROWS[index].submenu)
+        return false;
     if (toggle)
-        *toggle = NF_MENU_VIEW_ROWS[index];
+        *toggle = NF_MENU_VIEW_ROWS[index].toggle;
     return true;
+}
+
+// The mirror of the above: true, and the menu to open, for exactly the rows
+// nf_menu_view_toggle_at refuses. Same refuse-rather-than-guess rule -- an
+// out-of-range index writes nothing, so a nonsense index can never become a
+// confident wrong navigation.
+bool nf_menu_view_submenu_at(int index, nf_menu_kind *submenu) {
+    if (index < 0 || index >= NF_MENU_VIEW_ROW_COUNT)
+        return false;
+    if (!NF_MENU_VIEW_ROWS[index].submenu)
+        return false;
+    if (submenu)
+        *submenu = NF_MENU_VIEW_ROWS[index].menu;
+    return true;
+}
+
+// WHERE BACK GOES from `menu`, given the menu `menu` was opened FROM.
+//
+// The whole of the nesting rule, in one pure function, because "which menu
+// does this BACK return to" is the one question the screen's single BACK
+// routing (nfview.cc's nf_browser_back) has to answer correctly at three
+// levels at once, and it is answerable with no widget, no dialog and no
+// device -- so it is tested here rather than guessed there.
+//
+// NF_MENU_NONE means THE LISTING, both as an argument and as a result. The
+// rules, in the order they are applied:
+//
+//   - no menu is open      -> NF_MENU_NONE. BACK is not about a menu at all
+//                             then, and this function must not invent one.
+//   - `menu` is a CONFIRMATION -> NF_MENU_NONE, whatever `parent` says. A
+//                             confirmation is only ever entered from the
+//                             command bar, and cancelling one must always
+//                             land on the listing the reader acted from --
+//                             so a parent recorded against one is a bug, and
+//                             this ignores it rather than following it.
+//   - `parent` == `menu`   -> NF_MENU_NONE. A menu cannot have opened itself;
+//                             following that would be a BACK that never
+//                             leaves.
+//   - `parent` is a confirmation, or has no rows (which includes
+//     NF_MENU_NONE) -> NF_MENU_NONE. Nothing that cannot BE a menu on screen
+//                             can be returned to.
+//   - otherwise            -> `parent`.
+//
+// ONE LEVEL OF NESTING is all today's menus have (the view menu opens the
+// sort and filter menus; nothing opens the view menu but the bar), which is
+// why a single parent value is enough and there is no stack. If a third level
+// is ever added, THIS is the function that stops being sufficient -- and the
+// caller that clears the parent on the way back up (nfview.cc) is the other.
+nf_menu_kind nf_menu_back_target(nf_menu_kind menu, nf_menu_kind parent) {
+    if (menu == NF_MENU_NONE)
+        return NF_MENU_NONE;
+    if (nf_menu_is_confirm(menu))
+        return NF_MENU_NONE;
+    if (parent == menu)
+        return NF_MENU_NONE;
+    if (nf_menu_is_confirm(parent))
+        return NF_MENU_NONE;
+    if (nf_menu_row_count(parent) <= 0) // NF_MENU_NONE and anything rowless
+        return NF_MENU_NONE;
+    return parent;
 }
 
 QString nf_sort_key_name(nf_sort_key key) {
@@ -1281,13 +1386,27 @@ QString nf_view_bar_label(nf_view_flags view) {
 
 QString nf_view_flags_summary(nf_view_flags view) {
     QString out;
+    // THE FIVE TOGGLE ROWS ONLY, and skipping the view menu's two SUBMENU rows
+    // is a correctness requirement rather than brevity: this function has no
+    // sort key and no filter to pass, so those two rows would be built against
+    // placeholder arguments and would print "sort: name (asc)" on a screen
+    // sorted by date. This line exists to make a screenshot ATTRIBUTABLE to a
+    // mode (nffmt.h) and has already caught one real misdiagnosis in this
+    // project -- a line that could state a setting the browser is not in would
+    // defeat exactly that. The sort key and the filter are logged in their own
+    // right where they change (nfview.cc's nf_menu_select).
+    //
+    // The separator is keyed to what has been EMITTED, not to the loop index,
+    // for the same reason: with rows skipped, `if (i)` would open the summary
+    // with a leading " | ".
     for (int i = 0; i < NF_MENU_VIEW_ROW_COUNT; i++) {
-        if (i)
+        if (!nf_menu_view_toggle_at(i, NULL))
+            continue; // the increment is in the for-HEADER -- see nfview.cc's own note on why that matters
+        if (!out.isEmpty())
             out += QStringLiteral(" | ");
         // THE MENU'S OWN ROW TEXT, not a second rendering of the same facts.
-        // The whole purpose of this line is to make a screenshot
-        // attributable to a mode (nffmt.h), and a log line that could say
-        // something the menu does not would defeat exactly that.
+        // A log line that could say something the menu does not would defeat
+        // the purpose above.
         out += nf_menu_row_label(NF_MENU_VIEW, i, NF_SORT_NAME, false,
                                  NF_FILTER_ALL, view);
     }
@@ -1332,6 +1451,27 @@ QString nf_menu_row_label(nf_menu_kind menu, int index,
     }
 
     if (menu == NF_MENU_VIEW) {
+        // THE TWO SUBMENU ROWS FIRST, and their labels are the COMMAND BAR'S
+        // OWN, verbatim -- nf_sort_bar_label and nf_filter_bar_label, the same
+        // two functions the bar called when it still carried these controls.
+        // That is what makes moving them into this menu a MOVE rather than a
+        // removal: the state the bar used to display reads identically, one
+        // tap in. Calling the bar labels rather than respelling them is the
+        // same one-place-per-word rule the rest of this file keeps -- a menu
+        // row reading "sort: date (desc)" and a log line reading something
+        // else would be two vocabularies for one setting.
+        nf_menu_kind submenu = NF_MENU_NONE;
+        if (nf_menu_view_submenu_at(index, &submenu)) {
+            if (submenu == NF_MENU_SORT)
+                return nf_sort_bar_label(activeKey, activeDesc);
+            if (submenu == NF_MENU_FILTER)
+                return nf_filter_bar_label(activeFilter);
+            // A submenu row this build has no label for. EMPTY, which is the
+            // same refusal an out-of-range index gets, rather than a plausible
+            // word for a row whose tap would go somewhere else.
+            return QString();
+        }
+
         nf_view_toggle toggle = NF_VIEW_FILENAMES;
         if (!nf_menu_view_toggle_at(index, &toggle))
             return QString();

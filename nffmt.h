@@ -177,11 +177,12 @@ struct nf_view_flags {
 // is one place the defaults are spelled.
 nf_view_flags nf_view_flags_default(void);
 
-// One toggle per row of the view submenu, in the order the menu lists them
-// (NF_MENU_VIEW_ROWS, nffmt.cc). Unlike nf_sort_key/nf_filter_kind there is
-// no "none" value and no zero-value trap to design around: a toggle is only
-// ever produced by nf_menu_view_toggle_at, which refuses an out-of-range
-// index rather than handing back a default.
+// One toggle per TOGGLE ROW of the view menu, in the order the menu lists them
+// (NF_MENU_VIEW_ROWS, nffmt.cc -- rows 2-6; rows 0 and 1 are the two submenu
+// openers and map to no toggle at all). Unlike nf_sort_key/nf_filter_kind
+// there is no "none" value and no zero-value trap to design around: a toggle
+// is only ever produced by nf_menu_view_toggle_at, which refuses both an
+// out-of-range index and a submenu row rather than handing back a default.
 enum nf_view_toggle {
     NF_VIEW_FILENAMES,   // truncated / full
     NF_VIEW_EXTENSIONS,  // shown / hidden
@@ -518,6 +519,18 @@ nf_icon_kind nf_icon_kind_for(QString const& name, bool isDir);
 // page through one folder. NF_ITEMS_PER_PAGE's own comment (nfview.cc) has
 // the same arithmetic written from the page-size side.
 //
+// TWO BARS IS THE CASE IN FORCE AGAIN, and it is worth saying why this
+// number is stable rather than merely current. The command bar wraps to a
+// second row when its items do not fit side by side, and it DID wrap: it
+// carried `< BACK | sort: name (asc) | filter: all | view | select | rescan`
+// plus `paste` -- six or seven controls, with the sort label alone measured at
+// 357 px. `sort:` and `filter:` have since moved into the view menu, leaving
+// `< BACK | view | select | rescan` (+ `paste`), four or five short items that
+// fit one row with room to spare. So chromeBarRows is 2, and the page sizes
+// are the 11 and 15 this comment and nf_items_per_page's both compute. The
+// three-bar-row arithmetic below it is now the FALLBACK -- reachable only if a
+// firmware's row font grows -- not the ordinary case it briefly was.
+//
 // 70 rather than "as large as fits": at 70 the cover is ~47x70 and legible
 // enough to pick a volume by its art, which is the whole point of the
 // feature; larger buys little and costs another item off the page.
@@ -650,10 +663,28 @@ int nf_cover_width_px(int heightPx);
 // glance at the numbers suggests -- which is most of the reason the toggle is
 // worth having at all.
 //
+// WHICH OF THESE IS IN FORCE depends on the command bar, and today it is the
+// two above: chromeBarRows is 2, because the bar is `< BACK | view | select |
+// rescan` (+ `paste` while the clipboard is full) and four or five short items
+// fit one row easily. ESTIMATED from the only two command-bar widths this
+// project has actually measured on the panel (357 px for the 16-character
+// "sort: name (asc)", 178 px for "< BACK" -- nf_bar_plan_layout's comment
+// below has both), the five-item worst case is roughly 178 + 88 + 132 + 132 +
+// 198 = 728 px of label plus 4 * 8 px of minimum gap, i.e. ~760 against the
+// ~1196 px the content widget gets. The SEVEN-item bar this replaced came to
+// roughly 1375 by the same estimate and did wrap, which is the check that the
+// estimate is not nonsense.
+//
+// IT IS AN ESTIMATE AND THE DEVICE SETTLES IT, not this comment: the per-build
+// log line prints the natural total, the gap budget, the width measured
+// against, and which of the three outcomes the plan chose ("fits on ONE row" /
+// "WRAPPED to 2 rows"). Read that line, not this paragraph.
+//
 // AND THE SAME TWO, FOR A WRAPPED COMMAND BAR (chromeBarRows = 3, i.e. 225 px
-// of chrome instead of 150). This is the arithmetic the second bar row costs,
-// and the asymmetry in it is the interesting part -- it is NOT one item off
-// each mode:
+// of chrome instead of 150). This is the FALLBACK now rather than a case the
+// bar reaches -- a firmware with a much larger row font would get here. It is
+// kept because nf_items_per_page still has to answer for it, and because the
+// asymmetry in it is the interesting part -- it is NOT one item off each mode:
 //
 //   covers ON.   N * 99 + 3 * 75 <= 1330  ->  N <= (1330 - 225) / 99 = 11.16
 //                -> 11. UNCHANGED, because the covers-on page already had
@@ -697,6 +728,16 @@ int nf_items_per_page(bool covers, int chromeBarRows);
 // that broke them. An elided command label is a control whose function cannot
 // be read, which is strictly worse than one more page turn, so:
 //
+// (THE BAR HAS SINCE SHRUNK. `sort:` and `filter:` are rows of the view menu
+// now -- the owner's verdict on the wrapped bar was "still don't like how top
+// bar looks, let's move 'sort' and 'filter' to 'view'" -- so the widths that
+// produced the two log lines above are no longer on it, and rules 2 and 3 are
+// not reached by today's four- or five-item set. The rules stay: they are what
+// makes a firmware with a larger row font degrade to a second row and then to
+// an elision, instead of overflowing. The two measurements above are also the
+// only real command-bar widths on record, which is why they stay written down
+// here rather than being deleted with the bar that produced them.)
+//
 //   1. if the items fit side by side at their natural widths, they are laid
 //      out at those widths and the leftover becomes SPACING BETWEEN them;
 //   2. if they do not, the bar WRAPS to a second row (and the page loses one
@@ -709,10 +750,14 @@ int nf_items_per_page(bool covers, int chromeBarRows);
 // row assignments and per-item budgets out -- so the rule is host-testable
 // even though the widths themselves come from QFontMetrics on the device.
 
-// The most items either bar can hold. SEVEN is the worst case the command bar
-// reaches today (BACK, sort, filter, view, select, rescan and -- only while
-// something is on the clipboard -- paste); eight leaves one spare so the next
-// control added is not also an edit to this line.
+// The most items either bar can hold. FIVE is the worst case the command bar
+// reaches today -- BACK, view, select, rescan and, only while something is on
+// the clipboard, paste (select mode's own set is the same size: done, delete,
+// cut, copy, paste). It was SEVEN until `sort:` and `filter:` moved into the
+// view menu. EIGHT is kept rather than lowered to match: the number is a
+// BOUND, the arrays it sizes are stack locals of one function, and the three
+// spare slots cost nothing while re-tightening it on every bar change is how
+// a bound ends up one item short of the mode nobody tested.
 //
 // It lives HERE rather than in nfview.cc (where it used to) because
 // nf_bar_plan below is sized by it and the plan is what the browser reads its
@@ -907,6 +952,15 @@ void nf_page_bar_labels(int page, int totalPages,
 // instead: the ITEM LIST is replaced, in place, by one row per option, using
 // the same TouchLabel rows the listing uses.
 //
+// AND NEITHER IS A COMMAND-BAR ITEM ANY MORE. Both are rows of the VIEW menu,
+// which is what opens them now; the bar is `< BACK | view | select | rescan`
+// (plus `paste` when the clipboard is full) and nothing else. The owner's
+// words after seeing the seven-item bar on the panel: "still don't like how
+// top bar looks, let's move 'sort' and 'filter' to 'view'". Sort order and
+// type filter ARE display concerns, so `view` is where they belonged; what
+// this section describes about the two menus themselves is otherwise
+// unchanged, only what opens them.
+//
 // What those rows SAY is here rather than in nfview.cc, for the reason the
 // rest of this header exists: it is a pure function of the menu, the row
 // index and the currently active setting, so it is the one part of the
@@ -927,12 +981,24 @@ enum nf_menu_kind {
     NF_MENU_NONE,
     NF_MENU_SORT,
     NF_MENU_FILTER,
-    // The five view toggles (nf_view_flags, above). A SIBLING of the two
-    // above rather than a new mechanism: same TouchLabel rows, same command
-    // bar over it, same BACK-closes-it routing, same return-to-the-page-you
-    // -were-on. What differs is only that each row is a TOGGLE rather than a
-    // selection -- so there is no single "active" row to mark, and each row
-    // states its own state instead.
+    // THE VIEW MENU, and the only two-level menu here: two rows that OPEN the
+    // two above, then the five view toggles (nf_view_flags, above).
+    //
+    // A SIBLING of the two above rather than a new mechanism: same TouchLabel
+    // rows, same command bar over it, same single BACK routing function, same
+    // return-to-the-page-you-were-on. Two things differ. Each TOGGLE row is a
+    // toggle rather than a selection -- so there is no single "active" row to
+    // mark, and each row states its own state instead. And its first two rows
+    // are SUBMENU OPENERS: `sort:` and `filter:` were command-bar items until
+    // the bar grew to six or seven controls the owner could not read (the sort
+    // label alone measured 357 px against a 1264 px panel), and both are
+    // DISPLAY concerns, which is what `view` already means.
+    //
+    // THE NESTING IS ONE LEVEL DEEP AND STAYS THAT WAY. Nothing opens the view
+    // menu but the command bar, and the sort and filter menus open nothing --
+    // which is why nfview.cc tracks a single "which menu opened this one" enum
+    // rather than a stack, and why nf_menu_back_target (below) takes one
+    // parent rather than a list. Adding a third level means changing both.
     NF_MENU_VIEW,
 
     // --- THE CONFIRMATION SCREENS ---------------------------------------
@@ -1014,14 +1080,21 @@ QString nf_filter_bar_label(nf_filter_kind filter);
 // deliberately ignored; a test pins the literal on both sides.
 QString nf_view_bar_label(nf_view_flags view);
 
-// All five view rows joined with " | ", for the one log line every content
-// build carries (nfview.cc). Built out of nf_menu_row_label itself rather
-// than out of a second set of words, so the log line and the menu can never
-// disagree about what mode the browser is in -- which is the entire point of
-// logging it: a screenshot taken under a changed flag is otherwise
-// indistinguishable from a rendering bug, and this project has already
-// discarded a working fix once because a stale screenshot was read as "it
-// does not work".
+// The five TOGGLE rows of the view menu joined with " | ", for the one log
+// line every content build carries (nfview.cc). Built out of nf_menu_row_label
+// itself rather than out of a second set of words, so the log line and the
+// menu can never disagree about what mode the browser is in -- which is the
+// entire point of logging it: a screenshot taken under a changed flag is
+// otherwise indistinguishable from a rendering bug, and this project has
+// already discarded a working fix once because a stale screenshot was read as
+// "it does not work".
+//
+// THE TWO SUBMENU ROWS ARE DELIBERATELY NOT IN IT. This function has no sort
+// key and no filter to pass, so those rows would be built against placeholder
+// arguments and would state a setting the browser is not in -- a confident
+// wrong answer in the one line that exists to prevent exactly that. Where the
+// sort key and the filter change, they are logged in their own right
+// (nfview.cc's nf_menu_select). A test pins their absence.
 QString nf_view_flags_summary(nf_view_flags view);
 
 // What row `index` of the sort / filter / view menu selects. False, with no
@@ -1030,7 +1103,35 @@ QString nf_view_flags_summary(nf_view_flags view);
 // refusal-rather-than-repair rule as nf_date_key_is_plausible's.
 bool nf_menu_sort_key_at(int index, nf_sort_key *key);
 bool nf_menu_filter_at(int index, nf_filter_kind *filter);
+
+// THE VIEW MENU HAS TWO KINDS OF ROW, so it takes two accessors, and EXACTLY
+// ONE of them answers true for any given index. A caller asks for a toggle
+// first and, on a false, asks for a submenu -- so a row can never both flip a
+// flag and navigate.
+//
+// Rows 0 and 1 are the two submenu openers (`sort:` and `filter:`, which used
+// to be command-bar items of their own); rows 2-6 are the five toggles, in
+// their original order, shifted down by two. nf_menu_view_toggle_at therefore
+// returns FALSE for indices 0 and 1 -- not merely for an out-of-range one.
 bool nf_menu_view_toggle_at(int index, nf_view_toggle *toggle);
+bool nf_menu_view_submenu_at(int index, nf_menu_kind *submenu);
+
+// WHERE BACK GOES from `menu`, given the menu it was OPENED FROM. NF_MENU_NONE
+// means the listing, as both an argument and a result.
+//
+// This is the whole of the nesting rule, kept pure so that the one question
+// the screen's single BACK routing has to answer at three levels at once --
+// listing, view menu, nested sort/filter menu -- is host-testable rather than
+// only device-observable. nfview.cc holds the parent value (one POD enum at
+// file scope; one level of nesting needs no stack) and calls this; it does not
+// re-derive the rule.
+//
+// The refusals are the interesting half and nffmt.cc has them all written out:
+// a confirmation always returns to the listing whatever parent was recorded, a
+// menu that claims itself as its own parent is refused rather than looped, and
+// a parent that could not be on screen (rowless, or a confirmation) is refused
+// rather than navigated to.
+nf_menu_kind nf_menu_back_target(nf_menu_kind menu, nf_menu_kind parent);
 
 // The text row `index` of `menu` shows, given the currently active settings.
 // EMPTY for an out-of-range index or for NF_MENU_NONE.
@@ -1063,10 +1164,20 @@ bool nf_menu_view_toggle_at(int index, nf_view_toggle *toggle);
 // direction, so tapping it again simply closes the menu, and the parenthesis
 // says what the row is rather than what a tap does.
 //
-// A VIEW ROW IS A TOGGLE, so it has no active/inactive distinction at all and
-// carries no "* " mark: every row states its own state in its own TEXT --
+// A VIEW TOGGLE ROW has no active/inactive distinction at all and carries no
+// "* " mark: every row states its own state in its own TEXT --
 // "covers: on", "size: hidden" -- because that is the only channel this panel
-// reliably has. Styling is not an option: four grey levels, on which
+// reliably has.
+//
+// THE VIEW MENU'S FIRST TWO ROWS ARE NOT TOGGLES. They open the sort and
+// filter menus, and their labels are nf_sort_bar_label/nf_filter_bar_label
+// VERBATIM -- "sort: name (asc)", "filter: all" -- i.e. exactly the strings
+// the command bar used to carry before those two controls moved in here. That
+// is deliberate and it is what makes the move lossless: the state the bar
+// displayed is still readable, one tap in, in the same words. `activeKey`,
+// `activeDesc` and `activeFilter` are what those two rows are built from, so
+// this function needs all of them for the view menu too and not only for the
+// other two -- which is why none of them is defaulted. Styling is not an option: four grey levels, on which
 // "slightly lighter" reads as "the same", which is the same finding that puts
 // "[not in library]" into a row's words (nf_row_suffix, above).
 //
