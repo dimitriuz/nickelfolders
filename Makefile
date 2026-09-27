@@ -1,7 +1,8 @@
 include NickelHook/NickelHook.mk
 
 override LIBRARY  := libnfolders.so
-override SOURCES  += nfolders.cc nfnickel.cc nfbrowser.cc nfview.cc nfops.cc nflist.cc nffmt.cc nfpath.cc
+override SOURCES  += src/nfolders.cc src/nfnickel.cc src/nfbrowser.cc src/nfview.cc \
+                     src/nfops.cc src/nflist.cc src/nffmt.cc src/nfpath.cc
 override CFLAGS   += -Wall -Wextra -Werror -Wno-missing-field-initializers -fvisibility=hidden
 override CXXFLAGS += -Wall -Wextra -Werror -Wno-missing-field-initializers -fvisibility=hidden -fvisibility-inlines-hidden
 # QWidget (nfbrowser.cc's view) lives in QtWidgets, not QtGui, on Qt5 -- added
@@ -28,21 +29,21 @@ HOST_CXX      ?= g++
 # that decides whether a delete, a move or a copy may touch a path at all, so
 # it is the single most important thing in this project to be able to run off
 # the device. nfops.cc is deliberately NOT here -- it does the syscalls.
-HOST_PURE     := nffmt.cc nflist.cc nfpath.cc
+HOST_PURE     := src/nffmt.cc src/nflist.cc src/nfpath.cc
 HOST_TESTSRC  := $(wildcard tests/test_*.cc)
 HOST_TESTBIN  := $(patsubst tests/%.cc,build/%,$(HOST_TESTSRC))
 # Header prerequisites are load-bearing, not tidiness: without them a test
 # binary is not relinked when only a header changed, so a deliberately broken
 # guard in a header runs against a stale binary and appears not to fail --
 # which would silently invalidate the one discipline this rung leans on.
-HOST_HDR      := $(wildcard *.h) $(wildcard tests/*.h)
+HOST_HDR      := $(wildcard src/*.h) $(wildcard tests/*.h)
 # `=` (recursive), not `:=`, on these two: a `:=` is expanded once, when this
 # line is read, which is on EVERY make invocation -- including a cross build
 # run inside the NickelTC container, where there is no host Qt5Core and
 # `pkg-config` prints "Package Qt5Core was not found" four times for no
 # reason. `=` defers the pkg-config calls until a host test binary is
 # actually being built, which is the only place these variables are used.
-HOST_CXXFLAGS = -std=gnu++11 -O1 -g -Wall -Wextra -Werror -I. -Itests \
+HOST_CXXFLAGS = -std=gnu++11 -O1 -g -Wall -Wextra -Werror -Isrc -Itests \
                  $(shell pkg-config --cflags Qt5Core)
 HOST_LDLIBS   = $(shell pkg-config --libs Qt5Core)
 

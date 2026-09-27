@@ -517,21 +517,21 @@ runs are easy to misread.
 ## Layout
 
 ```
-nfolders.cc          NickelHook glue and the two trigger protocols
+src/nfolders.cc          NickelHook glue and the two trigger protocols
                      (/tmp/nfolders-open, /tmp/nfolders-show) that drive
                      nfnickel.cc/nfbrowser.cc from a shell over ssh, with no
                      UI of its own. `stage` (1-4) on the open trigger stops
                      after each libnickel call so a crash localises.
-nfnickel.h/.cc        the mod's ENTIRE libnickel call surface, in one place
+src/nfnickel.h/.cc        the mod's ENTIRE libnickel call surface, in one place
                      on purpose (see "Nickel's classes stay opaque"):
                      book-opening (rung 1) and the Volume -> data-source
                      chain rung 2's screen needs, plus the inotify watch
                      machinery that replaced the original poll thread.
-nfbrowser.h/.cc       constructs the Volume data source and pushes
+src/nfbrowser.h/.cc       constructs the Volume data source and pushes
                      ArticleListLibraryController (rung 2's borrowed screen)
                      via MainWindowController::push. No fabricated vtable,
                      no fabricated RTTI, no tap hook -- see NOTES.md.
-nfview.h/.cc          THE FOLDER BROWSER: one N3Dialog, built out of
+src/nfview.h/.cc          THE FOLDER BROWSER: one N3Dialog, built out of
                      Nickel's own dialog chrome and TouchLabel rows
                      (NOTES.md's "Task 8: touch input archaeology"), whose
                      content is rebuilt in place (N3Dialog::setContent) on
@@ -548,11 +548,11 @@ nfview.h/.cc          THE FOLDER BROWSER: one N3Dialog, built out of
                      destroyed() signal) rather than building a second one
                      -- recovers if Nickel's own navigation ever leaves it
                      alive but off-screen, instead of refusing forever.
-nffmt.h/.cc           PURE display/ordering logic (natural sort, book-
+src/nffmt.h/.cc           PURE display/ordering logic (natural sort, book-
                      extension matching, common-prefix label stripping):
                      no libnickel, no NickelHook, no I/O, so it is the one
                      part of this project `make test` can actually run.
-nflist.h/.cc          PURE listing pipeline (list -> hide junk -> fetch
+src/nflist.h/.cc          PURE listing pipeline (list -> hide junk -> fetch
                      metadata via an injected callback -> group -> order ->
                      label), also host-testable for the same reason.
 tests/                the host test suite: test_nffmt.cc (63 checks),
