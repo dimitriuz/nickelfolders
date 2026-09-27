@@ -33,7 +33,8 @@
 // mod's own logic, not Nickel's: it steps up one directory, and only pops
 // the dialog off the stack once the root is reached. The screen offers TWO
 // independent exits at every level, deliberately not just one -- a
-// guaranteed "<< BACK" row wired straight to that logic, and N3Dialog's own
+// guaranteed "< BACK" control, first in the command bar, wired straight to
+// that logic, and N3Dialog's own
 // backTapped() signal wired to the exact same function -- review finding
 // I-3, because getDialog's own X button is wired to a controller-stack call
 // this route's pushView never populates, so it does nothing here (see

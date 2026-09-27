@@ -1162,6 +1162,112 @@ static void test_cover_width_keeps_the_native_aspect(void) {
     CHECK(nf_cover_width_px(NF_COVER_H_PX) < NF_COVER_H_PX);
 }
 
+// --- the page bar's three labels ---------------------------------------
+
+// The ordinary middle page: both ends live, and the counter is 1-based where
+// the argument is 0-based.
+static void test_page_bar_middle_page_has_both_ends(void) {
+    QString prev, pageText, next;
+    bool prevActive = false, nextActive = false;
+    nf_page_bar_labels(1, 4, &prev, &prevActive, &pageText, &next, &nextActive);
+    CHECK(prevActive);
+    CHECK(nextActive);
+    CHECK_EQ_STR(prev,     "< PREV");
+    CHECK_EQ_STR(pageText, "page 2/4");
+    CHECK_EQ_STR(next,     "NEXT >");
+}
+
+// THE POINT OF THE WHOLE HELPER: an unavailable end is still a label. A
+// caller that had to render "nothing" at the ends would make the bar's
+// layout jump between pages, which is precisely what the fixed three slots
+// exist to prevent.
+static void test_page_bar_ends_are_never_empty(void) {
+    QString prev, pageText, next;
+    bool prevActive = true, nextActive = true;
+    nf_page_bar_labels(0, 1, &prev, &prevActive, &pageText, &next, &nextActive);
+    CHECK(!prevActive);
+    CHECK(!nextActive);
+    CHECK(!prev.isEmpty());
+    CHECK(!next.isEmpty());
+    CHECK_EQ_STR(pageText, "page 1/1");
+}
+
+// "Inert" is carried by the CHARACTERS, not by a grey level this panel
+// cannot reliably show (nffmt.h). So the inactive forms must not merely
+// differ from the active ones -- they must drop the arrow, which is the
+// affordance itself.
+static void test_page_bar_inert_ends_drop_the_arrow(void) {
+    QString prev, next;
+    bool prevActive = true, nextActive = true;
+    nf_page_bar_labels(0, 1, &prev, &prevActive, NULL, &next, &nextActive);
+    CHECK(!prev.contains(QLatin1Char('<')));
+    CHECK(!next.contains(QLatin1Char('>')));
+    CHECK_EQ_STR(prev, "no prev");
+    CHECK_EQ_STR(next, "no next");
+
+    // ...and the ACTIVE forms must carry one, or there is nothing for the
+    // inactive form to be missing.
+    QString aPrev, aNext;
+    nf_page_bar_labels(1, 3, &aPrev, NULL, NULL, &aNext, NULL);
+    CHECK(aPrev.contains(QLatin1Char('<')));
+    CHECK(aNext.contains(QLatin1Char('>')));
+}
+
+// The two edges of a multi-page listing, which is where a fencepost error
+// would live: page 0 of 4 has no PREV but does have NEXT, and page 3 of 4 is
+// the mirror of that.
+static void test_page_bar_first_and_last_page(void) {
+    QString prev, pageText, next;
+    bool prevActive = true, nextActive = false;
+    nf_page_bar_labels(0, 4, &prev, &prevActive, &pageText, &next, &nextActive);
+    CHECK(!prevActive);
+    CHECK(nextActive);
+    CHECK_EQ_STR(pageText, "page 1/4");
+
+    prevActive = false;
+    nextActive = true;
+    nf_page_bar_labels(3, 4, &prev, &prevActive, &pageText, &next, &nextActive);
+    CHECK(prevActive);
+    CHECK(!nextActive);
+    CHECK_EQ_STR(pageText, "page 4/4");
+}
+
+// The defensive clamp. nfview.cc clamps its own page before calling this --
+// it has to, to slice the row vector -- so none of these inputs is reachable
+// from today's caller; the check is that a stale or nonsense value degrades
+// to a sensible label instead of producing "page 0/0" or "page -2/3".
+static void test_page_bar_clamps_a_nonsense_page(void) {
+    QString pageText;
+    bool prevActive = true, nextActive = true;
+
+    nf_page_bar_labels(-5, 3, NULL, &prevActive, &pageText, NULL, &nextActive);
+    CHECK_EQ_STR(pageText, "page 1/3");
+    CHECK(!prevActive);
+    CHECK(nextActive);
+
+    nf_page_bar_labels(99, 3, NULL, &prevActive, &pageText, NULL, &nextActive);
+    CHECK_EQ_STR(pageText, "page 3/3");
+    CHECK(prevActive);
+    CHECK(!nextActive);
+
+    // An EMPTY listing is showing its one and only page, not a zeroth of
+    // none -- nfview.cc floors totalPages at 1 for the same reason, and this
+    // pins the behaviour if that floor ever moves.
+    nf_page_bar_labels(0, 0, NULL, &prevActive, &pageText, NULL, &nextActive);
+    CHECK_EQ_STR(pageText, "page 1/1");
+    CHECK(!prevActive);
+    CHECK(!nextActive);
+}
+
+// Same contract as nf_row_suffix/nf_icon_badge: a caller that wants only one
+// of the outputs must not have to supply the rest.
+static void test_page_bar_accepts_null_outputs(void) {
+    nf_page_bar_labels(1, 4, NULL, NULL, NULL, NULL, NULL);
+    QString only;
+    nf_page_bar_labels(1, 4, NULL, NULL, &only, NULL, NULL);
+    CHECK_EQ_STR(only, "page 2/4");
+}
+
 int main(void) {
     test_unpadded_volume_dirs();
     test_strip_fullmetal();
@@ -1233,5 +1339,11 @@ int main(void) {
     test_cover_path_refuses_an_empty_image_id();
     test_cover_path_inserts_the_id_verbatim();
     test_cover_width_keeps_the_native_aspect();
+    test_page_bar_middle_page_has_both_ends();
+    test_page_bar_ends_are_never_empty();
+    test_page_bar_inert_ends_drop_the_arrow();
+    test_page_bar_first_and_last_page();
+    test_page_bar_clamps_a_nonsense_page();
+    test_page_bar_accepts_null_outputs();
     NF_TEST_MAIN_END
 }

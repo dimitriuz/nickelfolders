@@ -51,6 +51,7 @@
 #include <QFileInfoList>
 #include <QFont>
 #include <QFontMetrics>
+#include <QHBoxLayout>
 #include <QImage>
 #include <QLabel>
 #include <QLayout>
@@ -101,48 +102,53 @@
 // every ContentID this file builds starts with.
 #define NF_ROOT "/mnt/onboard"
 
-// Items shown per page. PROVEN, not merely conservative -- review finding
-// F3 deliberately gave up some headroom for this: NOTES.md's Task 10
-// records the one row count actually seen fitting this panel, with clear
-// blank space still below it -- BACK + a truncation notice + 15 item rows,
-// 17 rows total. That screenshot's own margin READS as room for roughly
-// 20, but 20 was never itself measured, only estimated from the same
-// image -- and this constant now has to answer for MORE fixed chrome per
-// page than that screenshot had (BACK, a position indicator, and now BOTH
-// PREV and NEXT, all four together on a middle page of a multi-page
-// listing, not just BACK and one notice). 14 kept the same 17-row total
-// (BACK + PREV + NEXT + 14 items) that is the one number this project can
-// actually cite a screenshot for, rather than betting the extra chrome on
-// the estimated, unmeasured margin above it.
+// Items shown per page, and the one constant in this file that is pure
+// arithmetic over device-measured geometry rather than a judgement call. Every
+// term below was measured on this panel (Kobo Libra 2, firmware 4.38.23684);
+// none of it is estimated, because every layout number this project ever
+// guessed turned out wrong -- NF_COVER_H_PX was 76 by eyeball and clipped its
+// own rows, and the page size was 14 and then 12 against a row count read off
+// a screenshot's margin rather than counted.
 //
-// LOWERED to 12, UNMEASURED, when the sort/filter chrome rows were added
-// below: those two rows are NOT conditional the way the position indicator/
-// PREV/NEXT are -- they show on every listing, multi-page or not -- so the
-// worst-case page's fixed-chrome count grew from 4 (BACK, indicator, PREV,
-// NEXT) to 6 (those four plus sort, filter). 12 keeps BACK + PREV + NEXT +
-// sort + filter + 12 items at 17, the same proven total the original 14 was
-// keyed to, treating the position indicator the same way the original
-// comment already did -- as an accepted, unproven 18th row, "the smallest
-// addition available" -- rather than compounding two unproven guesses (the
-// indicator AND the two new rows) on top of each other. This has NOT been
-// confirmed on hardware; see the task report's device checklist.
+//   1330 px   the content area between the first row and the bottom margin
+//             (NOTES.md; 1680 visible panel px less Nickel's own chrome)
+//     75 px   a text-or-icon row
+//     99 px   a row carrying a COVER. An inline <img> sits on the TEXT
+//             BASELINE, so such a row is max(ascent, coverHeight) + descent
+//             tall: ascent 46, descent ~29, NF_COVER_H_PX 70 -> 70 + 29.
 //
-// 27 entries -- the largest listing measured on this card (Fullmetal
-// Alchemist, same screenshot) -- is comfortably ABOVE this page size, not
-// under it: it needs three pages at 12 per page (ceil(27/12) = 3), which is
-// the multi-page case this whole feature exists to reach -- volume 26 is
-// on page 3, and multi-page is precisely what nothing before pagination
-// existed ever rendered. A single-page listing (fewer than 12 entries) is
-// still the common case elsewhere on the card and drops the indicator/
-// PREV/NEXT rows entirely; 27 is not an example of that case.
+// THE WORST CASE IS A PAGE OF NOTHING BUT COVERS, because that is the tallest
+// a page of N items can be -- an icon-only page is shorter and simply leaves
+// white space, which is the deliberate trade (a page size that varied with how
+// many covers happened to land on it would make the row count jump around as
+// you page through one folder).
 //
-// Trivially raised once a fuller worst-case page -- indicator, PREV, sort,
-// filter, 12 items, AND NEXT together -- has actually been seen on
-// hardware; see the task report's device checklist.
-// COUPLED TO NF_COVER_H_PX (nffmt.h) -- see its comment for the arithmetic.
-// 9, not 12, because a row carrying a cover is ~99 px against ~75 px for a
-// text-or-icon row, and the worst case is a page of nothing but covers.
-#define NF_ITEMS_PER_PAGE 9
+// The chrome is TWO rows now, not five: one command bar across the top
+// (BACK | sort | filter) and one page bar pinned to the bottom (PREV | page
+// N/M | NEXT), each a single row of independently tappable TouchLabels in a
+// horizontal layout rather than a full-width row apiece. Both are
+// unconditional -- see the page bar's own comment for why its ends stay
+// present-but-inert rather than disappearing -- so there is no
+// fewer-chrome-rows case to make this number conditional on.
+//
+//   N * 99 + 2 * 75 <= 1330   ->   N <= (1330 - 150) / 99 = 11.92   ->   11
+//
+// 11 * 99 + 150 = 1239, with 91 px to spare -- less than one row of either
+// height, so 11 is the real ceiling here and not a conservative pick. 12
+// would need 1338 and overflow by 8.
+//
+// THAT IS TWO ROWS BACK, NOT THREE. Dropping three full-width chrome rows
+// frees 3 * 75 = 225 px, which is three more ITEM rows only if items are text
+// rows; against the 99 px cover rows that bound this number it is 2.27, and
+// the fraction is not spendable. The brief's "about three" is right for the
+// wrong page.
+//
+// COUPLED TO NF_COVER_H_PX (nffmt.h) -- change either one and you must redo
+// the arithmetic above; its comment carries the same numbers from the cover
+// side. A first device screenshot must COUNT the item rows on a full page: if
+// it shows fewer than 11, the 1330/75/99 terms are what to re-measure, not
+// this quotient.
+#define NF_ITEMS_PER_PAGE 11
 
 // PAGINATION, not scrolling -- a deliberate choice, not a shortcut, and
 // the reasoning is load-bearing enough to spell out here so nobody
@@ -235,10 +241,10 @@ static char nf_browser_cwd[PATH_MAX];
 // every descend, every BACK/ascend step, and the initial root call all
 // pass true, because all three move nf_browser_cwd to a DIFFERENT
 // directory, whose page 0 has no relationship to whatever page the
-// previous directory happened to be showing. The PREV/NEXT PAGE rows are
+// previous directory happened to be showing. The page bar's PREV/NEXT are
 // the one caller that passes false: they change the page WITHIN the same
 // directory nf_browser_cwd already names, so resetting here would make
-// NEXT PAGE always land back on page 0.
+// NEXT always land back on page 0.
 static int nf_browser_page = 0;
 
 // Sort key/direction and type filter -- the state the two new chrome rows
@@ -420,7 +426,7 @@ static void nf_browser_cycle_filter(void) {
 
 // Plain ASCII, e-ink-safe, matching the "^"/"v"-style affordance the task
 // brief itself suggests ("sort: name ^") and the same convention as this
-// file's other ASCII chrome ("<< BACK", "< PREV PAGE"). "^" reads as
+// file's other ASCII chrome ("< BACK", "< PREV"). "^" reads as
 // ascending (smallest/oldest/A first, pointing at the top of the list) and
 // "v" as descending, without needing a real glyph this panel may not have.
 // "date" is the FILE's own mtime and "added"/"read" are the LIBRARY's two
@@ -1400,6 +1406,186 @@ static QString nf_row_leading_markup(nf_icon_kind kind, QString const& coverPath
     return nf_icon_markup(kind);
 }
 
+// --- the two chrome bars -----------------------------------------------
+//
+// The chrome used to be FIVE full-width rows stacked above the items --
+// "<< BACK", "page N/M", "NEXT PAGE >", "sort: name ^", "filter: all" -- one
+// TouchLabel each, one per line of the panel. It is now two horizontal bars:
+// a command bar across the top (BACK | sort | filter) and a page bar pinned
+// to the bottom (PREV | page N/M | NEXT). Three rows of panel come back,
+// which is what paid for NF_ITEMS_PER_PAGE going 9 -> 11 (see its own
+// arithmetic above; against 99 px cover rows those 225 px buy two items, not
+// three).
+//
+// EACH BAR ITEM IS ITS OWN TouchLabel, never one label with tappable regions,
+// and that is not a style preference: Nickel does not deliver touch as Qt
+// mouse events at all, so there is no coordinate to test a region against.
+// It reads the panel itself and dispatches its own gestures, and a widget
+// needs all three of grabGesture(), an event() override routing QEvent
+// 194-196/209/198, and GestureDelegate-named RTTI to be in that path.
+// TouchLabel self-registers for exactly that in its own constructor, which
+// is why every tappable thing in this file is one and why "one label, three
+// hot zones" is not an option here (this file's header comment, and
+// NOTES.md's "Task 8: touch input archaeology").
+//
+// A HORIZONTAL LAYOUT IS THE ONE GENUINELY NEW MECHANISM on this screen --
+// every widget this project has put on the panel so far has been a
+// full-width row in a QVBoxLayout -- so nf_log_bar_geometry (below) logs
+// each item's x/width/height once per listing build. Its failure modes are
+// all silent ones: items stacked at x=0, items at zero width, a bar
+// collapsed to nothing. On a screenshot those are indistinguishable from
+// "the bar did not render"; in the log they are three different lines.
+
+// Allocates, constructs and wires ONE tappable TouchLabel, returning it as
+// the QLabel* every caller here needs anyway (setText/setAlignment are
+// QLabel's OWN, ABI-stable, already-linked functions -- see this file's
+// header comment on casting an opaque Nickel pointer to a real Qt base).
+//
+// One copy of the allocation size, the NULL check and the old-style signal
+// connect, rather than the five the two bars would otherwise need. The item
+// row loop in nf_browser_go deliberately keeps its own copy of this shape:
+// both of its failure logs name the row by index AND filename, which a
+// shared `char const *what` cannot carry, and those two lines are how a
+// device run says WHICH row went missing.
+//
+// `what` is always a string literal from the call site. Returns NULL, having
+// logged, if the allocation failed -- every caller treats that as "this one
+// control is missing", never as fatal (CLAUDE.md: NickelHook's failsafe is
+// SHARED infrastructure, and a mod that fails hard can make the owner's
+// other mods uninstall themselves). *outShim receives the hidden QPushButton
+// whose clicked() the caller connects its own lambda to.
+static QLabel *nf_new_touch_row(QWidget *parent, char const *what, QPushButton **outShim) {
+    // 132 bytes measured at TouchLabel's own construction call sites
+    // (NOTES.md); 256 is this project's usual over-allocation margin for a
+    // Nickel object whose own size we cannot ask -- and NickelHardcover's
+    // shipped calloc(1, 128) for this same class is a live 4-byte overflow,
+    // which is why the number here is measured rather than borrowed.
+    // calloc, not ::operator new: Qt eventually deletes this widget itself
+    // through its own real vtable, and glibc's calloc/malloc and libstdc++'s
+    // default operator new/delete share the same underlying allocator -- the
+    // same assumption every TouchLabel allocation in this project ships on.
+    void *row = calloc(1, 256);
+    if (!row) {
+        nh_log("browser: calloc(1,256) failed for the %s control, skipping it", what);
+        return NULL;
+    }
+    TouchLabel__ctor(row, parent, 0);
+
+    // The signal-adaptor trick (NickelMenu, src/nickelmenu.cc): a hidden
+    // QPushButton relays TouchLabel's own, real, old-style tapped(bool)
+    // signal to a plain capturing lambda, so this project needs no moc step.
+    // Old-style string connects are not compile-checked, so a failure is
+    // logged loudly rather than silently doing nothing.
+    QPushButton *shim = new QPushButton(parent);
+    shim->setVisible(false);
+    if (!QObject::connect(reinterpret_cast<QObject*>(row), SIGNAL(tapped(bool)), shim, SLOT(click())))
+        nh_log("browser: connecting the %s control's tapped(bool) failed -- it will silently do nothing", what);
+
+    *outShim = shim;
+    return reinterpret_cast<QLabel*>(row);
+}
+
+// One bar item's identity for the geometry log. POD, and only ever a LOCAL of
+// nf_browser_go -- nothing at file scope, per this file's no-dynamic-
+// initialiser rule.
+struct nf_bar_item {
+    QWidget    *w;
+    char const *name;
+};
+
+// Four is what the command bar will want once file operations land (BACK,
+// sort, filter, plus whatever they add); six leaves both bars room to grow
+// without this becoming the thing that has to be edited. Overflow is dropped
+// from the LOG only, never from the bar -- see nf_bar_record.
+#define NF_BAR_MAX_ITEMS 6
+
+static void nf_bar_record(nf_bar_item *items, int *n, QWidget *w, char const *name) {
+    if (*n >= NF_BAR_MAX_ITEMS)
+        return; // logging is best-effort; the widget is already in the layout
+    items[*n].w    = w;
+    items[*n].name = name;
+    (*n)++;
+}
+
+// One line per bar per listing build: every item's x, width and height, as
+// the layout actually resolved them.
+//
+// WHICH LAYOUT PASS these numbers came from is the whole reason the line
+// carries a marker, and the precedent is exact: N3Dialog::width() returns 600
+// before the dialog is laid out and 1264 after, and 600 is "a plausible-
+// looking number that announces nothing" (CLAUDE.md). The same trap is here,
+// one level down -- a bar read before layout hands back Qt's defaults, which
+// look like measurements. So the content widget's own width decides the
+// marker, on the same NF_WIDTH_PLAUSIBLE_MIN_PX floor nf_row_width_px uses.
+//
+// The FIRST listing of a session is always PRE-LAYOUT: nf_browser_show calls
+// nf_browser_go before pushView, so nothing has been sized to the panel yet.
+// Every later navigation is MEASURED. A run whose lines are all PRE-LAYOUT
+// means setContent is not laying the content out, which is itself the finding.
+static void nf_log_bar_geometry(char const *bar, nf_bar_item const *items, int n, int contentW) {
+    // 160, not 256: nh_log truncates at 256 bytes SILENTLY (CLAUDE.md), and
+    // the prefix below spends some of that. Three items cost ~75 characters.
+    char line[160];
+    line[0] = '\0';
+    int off = 0;
+    for (int i = 0; i < n; i++) {
+        int room = (int)sizeof line - off;
+        if (room <= 1)
+            break;
+        int wrote = snprintf(line + off, (size_t)room, "%s%s x=%d w=%d h=%d",
+                             i ? " | " : "", items[i].name,
+                             items[i].w->x(), items[i].w->width(), items[i].w->height());
+        // snprintf returns what it WOULD have written, which can exceed the
+        // room it had -- advancing by that would run `off` past the buffer.
+        if (wrote < 0 || wrote >= room)
+            break;
+        off += wrote;
+    }
+    nh_log("browser: %s bar -- %s (content widget %d px): %s", bar,
+           contentW >= NF_WIDTH_PLAUSIBLE_MIN_PX ? "MEASURED" : "PRE-LAYOUT",
+           contentW, n ? line : "(no items -- every allocation failed)");
+}
+
+// A bar's own QHBoxLayout, with the two settings that decide whether it is
+// ONE row tall.
+//
+// ZERO CONTENTS MARGINS, deliberately and not for tidiness: this firmware's
+// default layout margins are 34 px a side (queried, and printed in the row-
+// width log line below -- 1264 -> 1196), and a NESTED layout gets its own
+// copy of them. Left at the default, each bar would be inset by another 34
+// px top and bottom, i.e. ~68 px taller than the row it contains -- which
+// would quietly break NF_ITEMS_PER_PAGE's arithmetic, since that counts each
+// bar as one 75 px row. The bars sit inside the outer QVBoxLayout, which
+// already pays the horizontal margins for them.
+//
+// ZERO SPACING for a different reason: the separation between items comes
+// from the equal-width slots each item is given (addWidget(w, 1)) and from
+// each item's own text alignment, so a spacing here would be an invented
+// layout constant doing nothing the slots do not already do -- and every
+// invented layout constant in this project has so far been wrong.
+static QHBoxLayout *nf_new_bar_layout(void) {
+    QHBoxLayout *bar = new QHBoxLayout();
+    bar->setContentsMargins(0, 0, 0, 0);
+    bar->setSpacing(0);
+    return bar;
+}
+
+// Puts one finished item into a bar: an equal-width slot (stretch 1, so the
+// slots do not move when a label's text changes -- "< PREV" becoming "no
+// prev" must not shift the page counter beside it), with the item filling its
+// slot so the TAP TARGET is the whole third rather than just the glyphs, and
+// the text aligned within it to give the bar its left/centre/right reading.
+//
+// Alignment is set on the LABEL, not passed to addWidget: passing it to
+// addWidget shrinks the widget to its sizeHint inside the slot, which would
+// make every bar control a small target on a panel operated with a finger.
+static void nf_bar_add(QHBoxLayout *bar, nf_bar_item *items, int *n,
+                       QLabel *item, char const *name, Qt::Alignment align) {
+    item->setAlignment(align | Qt::AlignVCenter);
+    bar->addWidget(item, 1);
+    nf_bar_record(items, n, item, name);
+}
+
 // Builds a fresh content widget (rows for `path`'s own directory listing)
 // and swaps it into the ALREADY-EXISTING `dialog` via N3Dialog::setContent
 // -- this is the whole navigation model (nfview.h): one N3Dialog for the
@@ -1416,9 +1602,9 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
 
     // See nf_browser_page's own comment: every real navigation (descend,
     // ascend, the initial root call) passes resetPage=true here; only the
-    // PREV/NEXT PAGE rows below pass false, because they call back into
-    // this SAME function for the SAME path just to render a different
-    // slice of the same listing.
+    // page bar's PREV/NEXT pass false, because they call back into this
+    // SAME function for the SAME path just to render a different slice of
+    // the same listing.
     if (resetPage)
         nf_browser_page = 0;
 
@@ -1509,8 +1695,10 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
         nf_browser_page = 0;
     int startIdx = nf_browser_page * NF_ITEMS_PER_PAGE;
     int endIdx   = qMin(startIdx + NF_ITEMS_PER_PAGE, rows.size());
-    bool hasPrev = nf_browser_page > 0;
-    bool hasNext = nf_browser_page < totalPages - 1;
+    // hasPrev/hasNext are NOT computed here any more: the page bar asks
+    // nf_page_bar_labels (nffmt.h) for both the labels and the two active
+    // flags in one call, so "is this end live" has one answer, made in the
+    // one place a host test can reach it.
 
     QWidget *content = new QWidget();
     QVBoxLayout *layout = new QVBoxLayout(content);
@@ -1536,233 +1724,112 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
            layoutMargins.left(), layoutMargins.right(),
            NF_PANEL_VISIBLE_WIDTH_PX);
 
-    // Row 0: a GUARANTEED exit, independent of N3Dialog's own backTapped()
+    // --- THE COMMAND BAR, one row across the top ------------------------
+    //
+    //     < BACK        sort: name ^        filter: all
+    //
+    // Three independently tappable TouchLabels in one horizontal layout,
+    // where there used to be three full-width rows (plus the page indicator
+    // and NEXT PAGE, now in the bottom bar). See the "two chrome bars"
+    // comment above nf_new_touch_row for why each item must be its own
+    // TouchLabel rather than one label with hot zones.
+    //
+    // The `|` separators in the brief's sketch are NOT drawn: a literal "|"
+    // would either be its own TouchLabel (a tap target that does nothing) or
+    // live inside a neighbour's text (widening that control's label for no
+    // reason). The separation is the three equal-width slots and the
+    // left/centre/right text alignment instead.
+    //
+    // ORDER AND LABELS ARE UNCHANGED from the stacked rows this replaces --
+    // BACK, then sort, then filter, with the same strings and the same cycle
+    // on each tap. The owner has learned those tap sequences on hardware;
+    // this task moves where the controls sit, not what they do.
+    //
+    // ROOM FOR MORE, conceptually: file operations are the next task, and a
+    // fourth item drops into this bar as another equal slot with no
+    // arithmetic to redo (NF_ITEMS_PER_PAGE counts bars, not bar items).
+    // Nothing is reserved for them here -- an empty placeholder control would
+    // be a tap target that does nothing.
+    QHBoxLayout *cmdBar   = nf_new_bar_layout();
+    nf_bar_item  cmdItems[NF_BAR_MAX_ITEMS];
+    int          nCmdItems = 0;
+
+    // BACK: the GUARANTEED exit, independent of N3Dialog's own backTapped()
     // signal (wired once, in nf_browser_show, to this exact same
     // nf_browser_back) -- review finding I-3, carried over from the
-    // trivial-screen milestone this replaces: getDialog wires the dialog's
-    // X (closeTapped()) to a controller-stack call pushView never
-    // populates, so the X does nothing on this route (see
-    // N3Dialog__disableCloseButton below, which removes it). If
-    // backTapped() ALSO failed to fire for any reason, this screen would
-    // have no way off it short of a power cycle, on the owner's daily-use
-    // device -- this row does not depend on N3Dialog's own signal at all,
-    // so it is the one most worth trusting if anything else here is wrong.
-    // Labelled unmistakably, placed first, rebuilt fresh on every call
-    // (calloc'd here, not hoisted -- it is a child of `content`, which gets
-    // deleteLater()'d wholesale on the next navigation, same as every real
-    // listing row below).
+    // trivial-screen milestone: getDialog wires the dialog's X
+    // (closeTapped()) to a controller-stack call pushView never populates, so
+    // the X does nothing on this route (see N3Dialog__disableCloseButton
+    // below, which removes it). If backTapped() ALSO failed to fire for any
+    // reason, this screen would have no way off it short of a power cycle, on
+    // the owner's daily-use device -- this control does not depend on
+    // N3Dialog's own signal at all, so it is the one most worth trusting if
+    // anything else here is wrong.
+    //
+    // FIRST in the bar, and still the first thing built, for that reason.
+    // Routed through nf_browser_back, the SAME function backTapped() calls --
+    // up one level, popping the dialog only at the root -- so there are not
+    // two forks of that logic to audit for drift.
     {
-        // 132 bytes measured at TouchLabel's own construction call sites
-        // (NOTES.md); 256 is this project's usual over-allocation margin
-        // for a Nickel object whose own size we cannot ask. calloc, not
-        // ::operator new: Qt eventually deletes this widget itself through
-        // its own real vtable, and glibc's calloc/malloc and libstdc++'s
-        // default operator new/delete share the same underlying allocator
-        // -- the same assumption every TouchLabel allocation in this
-        // project already ships on. Checked for NULL before use (CLAUDE.md
-        // task brief, Part 2) -- calloc failing here is not fatal to the
-        // rest of the screen, just to this one guaranteed-exit row, which
-        // is exactly why it is worth logging loudly rather than silently
-        // skipping.
-        void *row = calloc(1, 256);
-        if (row) {
-            TouchLabel__ctor(row, content, 0);
-            reinterpret_cast<QLabel*>(row)->setText(QStringLiteral("<< BACK"));
-
-            // The signal-adaptor trick (NickelMenu, src/nickelmenu.cc): a
-            // hidden QPushButton relays TouchLabel's own, real, old-style
-            // tapped(bool) signal to a plain capturing lambda -- see this
-            // file's header comment for the full derivation. Old-style
-            // string connects are not compile-checked, so a failure here
-            // is logged loudly rather than silently doing nothing.
-            QPushButton *shim = new QPushButton(content);
-            shim->setVisible(false);
-            if (!QObject::connect(reinterpret_cast<QObject*>(row), SIGNAL(tapped(bool)), shim, SLOT(click())))
-                nh_log("browser: connecting the BACK row's tapped(bool) failed -- this row will silently do nothing (backTapped()/the back arrow is this screen's other, independent exit)");
+        QPushButton *shim = NULL;
+        QLabel *item = nf_new_touch_row(content, "BACK", &shim);
+        if (item) {
+            item->setText(QStringLiteral("< BACK"));
             QObject::connect(shim, &QPushButton::clicked, [mwc, dialog] {
                 nf_browser_back(mwc, dialog);
             });
-
-            layout->addWidget(reinterpret_cast<QWidget*>(row));
+            nf_bar_add(cmdBar, cmdItems, &nCmdItems, item, "BACK", Qt::AlignLeft);
         } else {
-            nh_log("browser: calloc(1,256) failed for the BACK row -- this screen has no BACK row this time (backTapped()/the back arrow is still wired)");
+            nh_log("browser: no BACK control this time (backTapped()/the back arrow is still wired)");
         }
     }
 
-    // Position indicator -- "page 2/2" -- a plain QLabel, not a TouchLabel:
-    // informational only, not a tap target, so it needs none of
-    // TouchLabel's gesture machinery. Shown only when there is more than
-    // one page: on a single-page listing -- fewer than NF_ITEMS_PER_PAGE
-    // entries, still the common case elsewhere on this card even though
-    // 27 (Fullmetal Alchemist, the largest listing measured) is NOT an
-    // example of it -- "page 1/1" says nothing a reader does not already
-    // know from PREV/NEXT both being absent.
-    //
-    // Placed HERE -- immediately after the BACK row, ABOVE the listing rows
-    // -- for the same reason review finding L1 placed the old truncation
-    // notice here rather than after the rows, and the same reason PREV/NEXT
-    // (below) were moved here too (review finding F3): this panel's real
-    // capacity for this many rows at once is still not device-measured
-    // beyond the 17-row screenshot NF_ITEMS_PER_PAGE's own comment cites, so
-    // whatever gets clipped first should be the least useful row -- and
-    // "where I already am" (this label) is the least useful of the three
-    // pieces of page-navigation chrome, which is why it sits above PREV/NEXT
-    // rather than below them.
-    if (totalPages > 1) {
-        QLabel *pageInfo = new QLabel(content);
-        pageInfo->setText(QStringLiteral("page %1/%2").arg(nf_browser_page + 1).arg(totalPages));
-        layout->addWidget(pageInfo);
-    }
-
-    // PREV PAGE and NEXT PAGE rows -- TouchLabels, same construction/shim
-    // pattern as every other tappable row in this function (see the BACK
-    // row's own comment for the allocation-size and signal-adaptor
-    // derivation, not repeated per row). Each is built only when that
-    // direction actually exists -- an always-present, sometimes-disabled
-    // row was rejected because this panel gives no reliable "disabled"
-    // visual state (CLAUDE.md's task brief on the four grey levels applies
-    // here too), so absence is the only unambiguous way to say "no such
-    // page" on this hardware.
-    //
-    // BOTH placed HERE, directly under the position indicator and ABOVE
-    // every item row -- review finding F3, reversing this file's own
-    // earlier placement of NEXT PAGE after the items. That placement had
-    // NEXT PAGE clipped FIRST if this page's row count ever exceeds the
-    // panel's real height, and NEXT PAGE is the only route to any page
-    // past the first -- concretely, the only route to Fullmetal Alchemist
-    // volume 26, which is the entire reason pagination exists. A user
-    // could see "page 1/2" (the indicator, above) with genuinely no way to
-    // reach page 2 -- worse than the truncation notice ever being clipped,
-    // because L1's old finding was about a MISSING clue, not a VISIBLE
-    // clue to a control that isn't there. This file's own
-    // NF_ITEMS_PER_PAGE comment already states the principle ("whatever
-    // gets clipped first should be the least useful row"); this placement
-    // is what makes the code match it -- PREV/NEXT are both more useful
-    // than any single item row below them, not less.
-    //
-    // `path` (this directory) is captured by value in both, and
-    // nf_browser_go is called with resetPage=FALSE in both -- this is a
-    // page change WITHIN the current directory, not a navigation to a
-    // different one, so nf_browser_page must survive the rebuild this
-    // triggers.
-    if (hasPrev) {
-        void *row = calloc(1, 256); // 132 measured, 256 over-allocated -- see the BACK row's comment
-        if (row) {
-            TouchLabel__ctor(row, content, 0);
-            reinterpret_cast<QLabel*>(row)->setText(QStringLiteral("< PREV PAGE"));
-
-            QPushButton *shim = new QPushButton(content);
-            shim->setVisible(false);
-            if (!QObject::connect(reinterpret_cast<QObject*>(row), SIGNAL(tapped(bool)), shim, SLOT(click())))
-                nh_log("browser: connecting the PREV PAGE row's tapped(bool) failed -- this row will silently do nothing");
-            QObject::connect(shim, &QPushButton::clicked, [mwc, dialog, path] {
-                nf_browser_page--;
-                nh_log("browser: page -- prev, now %d in '%s'", nf_browser_page, qPrintable(path));
-                nf_browser_go(mwc, dialog, path, false);
-            });
-
-            layout->addWidget(reinterpret_cast<QWidget*>(row));
-        } else {
-            nh_log("browser: calloc(1,256) failed for the PREV PAGE row, skipping it");
-        }
-    }
-
-    if (hasNext) {
-        void *row = calloc(1, 256); // 132 measured, 256 over-allocated -- see the BACK row's comment
-        if (row) {
-            TouchLabel__ctor(row, content, 0);
-            reinterpret_cast<QLabel*>(row)->setText(QStringLiteral("NEXT PAGE >"));
-
-            QPushButton *shim = new QPushButton(content);
-            shim->setVisible(false);
-            if (!QObject::connect(reinterpret_cast<QObject*>(row), SIGNAL(tapped(bool)), shim, SLOT(click())))
-                nh_log("browser: connecting the NEXT PAGE row's tapped(bool) failed -- this row will silently do nothing");
-            QObject::connect(shim, &QPushButton::clicked, [mwc, dialog, path] {
-                nf_browser_page++;
-                nh_log("browser: page -- next, now %d in '%s'", nf_browser_page, qPrintable(path));
-                nf_browser_go(mwc, dialog, path, false);
-            });
-
-            layout->addWidget(reinterpret_cast<QWidget*>(row));
-        } else {
-            nh_log("browser: calloc(1,256) failed for the NEXT PAGE row, skipping it");
-        }
-    }
-
-    // Sort and filter chrome -- ALWAYS shown (unlike the indicator/PREV/NEXT
-    // above, which are conditional on more than one page), same TouchLabel/
-    // shim construction as every other tappable row in this function.
-    // Deliberately placed BELOW PREV/NEXT rather than above them: PREV/NEXT
-    // are the ONLY route to a page past the first (this file's own NEXT
-    // PAGE placement comment, above, already established that principle for
-    // moving them ahead of the item rows), so if this panel's real capacity
-    // is ever tight enough that something here gets clipped, it must be
-    // these two rather than PREV/NEXT -- losing them costs a reader the
-    // CONVENIENCE of changing sort/filter in this one directory (the default
-    // state, or whatever was carried in from wherever they navigated from,
-    // still works), where losing NEXT PAGE would cost outright reachability
-    // of whatever is on page 2 and beyond. Still placed ABOVE every item
-    // row, per the task brief: these are chrome, not content.
-    //
-    // Tapping either one changes what THIS directory shows, which is a
-    // bigger change to the row set than a mere page turn -- unlike PREV/
-    // NEXT (resetPage=false, same directory, different slice), both of
-    // these pass resetPage=TRUE: the total row/page count can shrink or
-    // grow arbitrarily (a filter can turn a 3-page listing into a 1-page
-    // one), and landing on whatever page NUMBER happened to be current
-    // would be an arbitrary slice of a now-different listing, not a
-    // meaningful "same place" the way it is for BACK/descend's own
-    // resetPage=true callers.
+    // Sort and filter. Tapping either changes what THIS directory shows,
+    // which is a bigger change to the row set than a page turn -- so unlike
+    // PREV/NEXT (resetPage=false, same directory, different slice), both of
+    // these pass resetPage=TRUE: a filter can turn a 3-page listing into a
+    // 1-page one, and landing on whatever page NUMBER happened to be current
+    // would be an arbitrary slice of a now-different listing rather than the
+    // meaningful "same place" it is for BACK/descend.
     {
-        void *row = calloc(1, 256); // 132 measured, 256 over-allocated -- see the BACK row's comment
-        if (row) {
-            TouchLabel__ctor(row, content, 0);
-            reinterpret_cast<QLabel*>(row)->setText(nf_sort_row_label());
-
-            QPushButton *shim = new QPushButton(content);
-            shim->setVisible(false);
-            if (!QObject::connect(reinterpret_cast<QObject*>(row), SIGNAL(tapped(bool)), shim, SLOT(click())))
-                nh_log("browser: connecting the sort row's tapped(bool) failed -- this row will silently do nothing");
+        QPushButton *shim = NULL;
+        QLabel *item = nf_new_touch_row(content, "sort", &shim);
+        if (item) {
+            item->setText(nf_sort_row_label());
             QObject::connect(shim, &QPushButton::clicked, [mwc, dialog, path] {
                 nf_browser_cycle_sort();
                 nh_log("browser: sort -- now %s", qPrintable(nf_sort_row_label()));
                 nf_browser_go(mwc, dialog, path, true); // resetPage -- see this block's own comment
             });
-
-            layout->addWidget(reinterpret_cast<QWidget*>(row));
-        } else {
-            nh_log("browser: calloc(1,256) failed for the sort row, skipping it");
+            nf_bar_add(cmdBar, cmdItems, &nCmdItems, item, "sort", Qt::AlignHCenter);
         }
     }
     {
-        void *row = calloc(1, 256); // 132 measured, 256 over-allocated -- see the BACK row's comment
-        if (row) {
-            TouchLabel__ctor(row, content, 0);
-            reinterpret_cast<QLabel*>(row)->setText(nf_filter_row_label());
-
-            QPushButton *shim = new QPushButton(content);
-            shim->setVisible(false);
-            if (!QObject::connect(reinterpret_cast<QObject*>(row), SIGNAL(tapped(bool)), shim, SLOT(click())))
-                nh_log("browser: connecting the filter row's tapped(bool) failed -- this row will silently do nothing");
+        QPushButton *shim = NULL;
+        QLabel *item = nf_new_touch_row(content, "filter", &shim);
+        if (item) {
+            item->setText(nf_filter_row_label());
             QObject::connect(shim, &QPushButton::clicked, [mwc, dialog, path] {
                 nf_browser_cycle_filter();
                 nh_log("browser: filter -- now %s", qPrintable(nf_filter_row_label()));
                 nf_browser_go(mwc, dialog, path, true); // resetPage -- see this block's own comment
             });
-
-            layout->addWidget(reinterpret_cast<QWidget*>(row));
-        } else {
-            nh_log("browser: calloc(1,256) failed for the filter row, skipping it");
+            nf_bar_add(cmdBar, cmdItems, &nCmdItems, item, "filter", Qt::AlignRight);
         }
     }
+
+    // ABOVE every item row, never interleaved with them -- the same principle
+    // the stacked chrome followed ("whatever gets clipped first should be the
+    // least useful row"), now with only two things that could ever be clipped.
+    layout->addLayout(cmdBar);
 
     // Spec sections 3.6/6.3: an empty ROW SET reads one of two ways, and
     // conflating them tells a reader who filtered to PDF and got nothing
     // that their books are gone rather than that their filter matched
-    // nothing. A plain QLabel, like the page indicator above -- informational
-    // only, not a tap target. Says WHICH filter is active so the fix (tap
-    // "filter: ..." until it reads "all") is discoverable from this message
-    // alone, without hunting for the filter row above it.
+    // nothing. A plain QLabel, like the page counter in the bar below --
+    // informational only, not a tap target. Says WHICH filter is active so
+    // the fix (tap "filter: ..." in the command bar until it reads "all") is
+    // discoverable from this message alone.
     //
     // Spec section 3.6's OTHER distinction -- "empty" versus "cannot be listed at all"
     // (a read failure) -- is NOT built here: nf_browser_scan_dir (above)
@@ -2047,6 +2114,130 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
         layout->addWidget(reinterpret_cast<QWidget*>(row));
     }
 
+    // A STRETCH, and it is what PINS the page bar to the bottom of the
+    // content area rather than letting it float under the last item row. A
+    // folder with three items must still show the bar at the bottom, so the
+    // reader's eye finds it in the same place in every folder -- the slack
+    // goes here, between the items and the bar, instead of being shared out
+    // among the rows.
+    //
+    // It also fixes the item rows at their natural height: a QVBoxLayout with
+    // nothing expanding in it hands the spare vertical space to the widgets
+    // themselves (QLabel's vertical size policy can grow), so before this the
+    // rows on a short page were stretched taller than a full page's rows. Now
+    // every page's rows are the same height whatever the page holds, which is
+    // also what makes NF_ITEMS_PER_PAGE's 75/99 px terms mean one thing
+    // rather than two.
+    layout->addStretch(1);
+
+    // --- THE PAGE BAR, one row pinned to the bottom ---------------------
+    //
+    //     < PREV        page 2/4        NEXT >
+    //
+    // The three labels come from nf_page_bar_labels (nffmt.h) -- pure and
+    // host-tested, because the one real DECISION here (what the ends say when
+    // there is no such page) is the part that can be tested off-device, and
+    // the layout is the part that cannot.
+    //
+    // BOTH ENDS ARE ALWAYS PRESENT. A control that disappears on the first
+    // and last page makes the bar's own layout jump as a reader pages through
+    // a folder, and it leaves the page counter sliding around under their
+    // thumb. So an unavailable end is rendered INERT rather than omitted:
+    //   - the label loses its arrow and reads "no prev"/"no next", which is
+    //     how inert is conveyed -- in the CHARACTERS, because this panel has
+    //     four grey levels and "slightly lighter" does not read as
+    //     "different" on it (the same finding that puts "[not in library]" in
+    //     a row's text rather than leaving it to colour);
+    //   - and it is built as a PLAIN QLabel, not as an unconnected
+    //     TouchLabel, so it is not a tap target at all rather than one that
+    //     silently does nothing. That also skips a 256-byte allocation and a
+    //     gesture registration for a control that cannot act.
+    //
+    // The whole bar is unconditional, including on a single-page listing
+    // (where it reads "no prev | page 1/1 | no next"). The stacked chrome
+    // used to hide its page indicator in that case, on the grounds that
+    // "page 1/1" says nothing -- but a bar that is sometimes absent makes the
+    // height of the item area depend on the folder, and NF_ITEMS_PER_PAGE's
+    // arithmetic counts exactly two chrome rows on every page.
+    //
+    // `path` is captured by value in both handlers, and nf_browser_go is
+    // called with resetPage=FALSE: this is a page change WITHIN the current
+    // directory, not a navigation to a different one, so nf_browser_page must
+    // survive the rebuild it triggers.
+    QString prevLabel, pageLabel, nextLabel;
+    bool    prevActive = false, nextActive = false;
+    nf_page_bar_labels(nf_browser_page, totalPages,
+                       &prevLabel, &prevActive, &pageLabel, &nextLabel, &nextActive);
+
+    QHBoxLayout *pageBar   = nf_new_bar_layout();
+    nf_bar_item  pageItems[NF_BAR_MAX_ITEMS];
+    int          nPageItems = 0;
+
+    {
+        QLabel *item = NULL;
+        bool    live = false;
+        if (prevActive) {
+            QPushButton *shim = NULL;
+            item = nf_new_touch_row(content, "PREV", &shim);
+            if (item) {
+                live = true;
+                QObject::connect(shim, &QPushButton::clicked, [mwc, dialog, path] {
+                    nf_browser_page--;
+                    nh_log("browser: page -- prev, now %d in '%s'", nf_browser_page, qPrintable(path));
+                    nf_browser_go(mwc, dialog, path, false);
+                });
+            }
+        }
+        // Two ways to get here without a live control: there IS no previous
+        // page (the ordinary case -- the inert label, see this bar's own
+        // comment), or the TouchLabel allocation failed (already logged by
+        // nf_new_touch_row). A plain QLabel covers both, and the SLOT is held
+        // open either way so a missing control never slides the counter out
+        // from under the reader's eye. The failed-allocation slot is left
+        // BLANK rather than labelled "< PREV": a label that looks like a
+        // control and cannot receive a tap is worse than a gap.
+        if (!item)
+            item = new QLabel(content);
+        item->setText((prevActive && !live) ? QString() : prevLabel);
+        nf_bar_add(pageBar, pageItems, &nPageItems, item,
+                   live ? "PREV" : (prevActive ? "prev(alloc failed)" : "prev(inert)"),
+                   Qt::AlignLeft);
+    }
+
+    // The counter: informational only, never a tap target, so a plain QLabel
+    // needs none of TouchLabel's gesture machinery -- same as the stacked
+    // chrome's own page indicator.
+    {
+        QLabel *item = new QLabel(content);
+        item->setText(pageLabel);
+        nf_bar_add(pageBar, pageItems, &nPageItems, item, "page", Qt::AlignHCenter);
+    }
+
+    {
+        QLabel *item = NULL;
+        bool    live = false;
+        if (nextActive) {
+            QPushButton *shim = NULL;
+            item = nf_new_touch_row(content, "NEXT", &shim);
+            if (item) {
+                live = true;
+                QObject::connect(shim, &QPushButton::clicked, [mwc, dialog, path] {
+                    nf_browser_page++;
+                    nh_log("browser: page -- next, now %d in '%s'", nf_browser_page, qPrintable(path));
+                    nf_browser_go(mwc, dialog, path, false);
+                });
+            }
+        }
+        if (!item) // inert, or a blank held-open slot -- see PREV's own comment
+            item = new QLabel(content);
+        item->setText((nextActive && !live) ? QString() : nextLabel);
+        nf_bar_add(pageBar, pageItems, &nPageItems, item,
+                   live ? "NEXT" : (nextActive ? "next(alloc failed)" : "next(inert)"),
+                   Qt::AlignRight);
+    }
+
+    layout->addLayout(pageBar);
+
     QString title = (path == QStringLiteral(NF_ROOT))
         ? QStringLiteral("NickelFolders")
         : QFileInfo(path).fileName();
@@ -2058,9 +2249,11 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
     // Reparents `content` into the dialog's own layout and shows it;
     // deleteLater()s whatever content was there before (nfnickel.h) --
     // which is what actually tears down the PREVIOUS screen's rows and
-    // shim buttons. Must be the last thing this function does with
-    // `content`/`layout`/the rows just built: nothing here may be touched
-    // again afterward.
+    // shim buttons. Must be the last thing this function MODIFIES about
+    // `content`/`layout`/the rows just built: nothing here may be added to,
+    // reparented or re-set afterward. What follows is read-only -- a pointer
+    // remembered, a destroyed() connect, and the two bar-geometry lines,
+    // which only READ x()/width()/height() off widgets the dialog now owns.
     N3Dialog__setContent(dialog, content);
 
     // Recorded AFTER setContent, so this only ever names a widget the dialog
@@ -2079,6 +2272,23 @@ static void nf_browser_go(void *mwc, N3Dialog *dialog, QString const &path, bool
         if (nf_browser_active_content == tracked)
             nf_browser_active_content = NULL;
     });
+
+    // THE BARS' GEOMETRY, logged here and only here, because this is the
+    // first point in the build where the numbers are real: QWidget::
+    // setVisible(true) activates a widget's own layout before showing its
+    // children, so the content widget the dialog has just taken and shown has
+    // been laid out by the time these run. Read before setContent they would
+    // be Qt's pre-layout defaults dressed up as measurements -- the same trap
+    // N3Dialog::width()'s 600-versus-1264 sets one level up, which is why the
+    // line carries a marker saying which it got (nf_log_bar_geometry).
+    //
+    // This is the cheap check whose ABSENCE is the problem: a horizontal
+    // layout is new on this screen, and all three of its plausible failures
+    // (items stacked at x=0, zero-width items, a collapsed bar) look
+    // identical on a screenshot and different in these two lines.
+    int laidOutWidth = content->width();
+    nf_log_bar_geometry("command", cmdItems,  nCmdItems,  laidOutWidth);
+    nf_log_bar_geometry("page",    pageItems, nPageItems, laidOutWidth);
 }
 
 bool nf_browser_show(void) {

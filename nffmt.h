@@ -404,13 +404,14 @@ nf_icon_kind nf_icon_kind_for(QString const& name, bool isDir);
 // The height the <img> is forced to, and therefore the row's own height
 // budget. THIS IS THE OWNER'S NUMBER, not a measurement this project made:
 // the brief states the current row height is ~76 px and chose to keep it
-// rather than grow rows, because NF_ITEMS_PER_PAGE (12, nfview.cc) is keyed
+// rather than grow rows, because NF_ITEMS_PER_PAGE (nfview.cc) is keyed
 // to a measured 17-row panel and every px of row height risks an item off
 // the page. The only row measurement on record here is weaker than that --
 // 17 rows fitting the 1680 px visible panel with margin reading as room for
 // roughly 20 (NOTES.md, Task 10) -- so a first device screenshot must COUNT
-// the item rows on a full page. If it shows fewer than 12, lower this one
-// constant; nothing else needs to change, because the width follows from it
+// the item rows on a full page. If it shows fewer than NF_ITEMS_PER_PAGE,
+// lower this one constant; nothing else needs to change, because the width
+// follows from it
 // (nf_cover_width_px) and the elision reserve is charged from the same
 // number that is emitted (nfview.cc).
 // COUPLED TO NF_ITEMS_PER_PAGE (nfview.cc) -- change one and you must
@@ -423,11 +424,15 @@ nf_icon_kind nf_icon_kind_for(QString const& name, bool isDir);
 // 2026-09-27: ascent 46, descent ~29, so a 70 px cover makes a ~99 px row
 // against ~75 px for a text-or-icon row.
 //
-// Worst case is a page of nothing but covers: 9 * 99 + 5 chrome rows * 75
-// = 1266, inside the 1330 available with room to spare. A page of icon rows
-// is shorter and simply leaves white space, which is the deliberate trade --
-// a page size that varied with how many covers happened to be on it would
-// make the row count jump around as you page through one folder.
+// Worst case is a page of nothing but covers, against the TWO horizontal
+// chrome bars the browser now has (a command bar on top, a page bar pinned to
+// the bottom -- it was five stacked full-width rows when this comment was
+// first written): 11 * 99 + 2 * 75 = 1239, inside the 1330 available with 91
+// px to spare. A page of icon rows is shorter and simply leaves white space,
+// which is the deliberate trade -- a page size that varied with how many
+// covers happened to be on it would make the row count jump around as you
+// page through one folder. NF_ITEMS_PER_PAGE's own comment (nfview.cc) has
+// the same arithmetic written from the page-size side.
 //
 // 70 rather than "as large as fits": at 70 the cover is ~47x70 and legible
 // enough to pick a volume by its art, which is the whole point of the
@@ -537,5 +542,46 @@ void nf_row_suffix(nf_row const& row, QString *markup, QString *plain);
 // plus its suffix", never to "no name at all".
 #define NF_NAME_MIN_PX 60
 int nf_name_budget_px(int rowWidth, int iconWidth, int suffixWidth);
+
+// --- the page bar's three labels ----------------------------------------
+//
+// The bottom bar reads "< PREV        page 2/4        NEXT >", and the only
+// real DECISION in it is what the two ends say when there is no such page.
+// That decision is pure, so it lives here where a host test can run it --
+// the bar's LAYOUT is not host-testable at all (it needs Nickel's own
+// TouchLabel and a panel to lay out on), which is exactly why the part that
+// can be tested is separated from the part that cannot.
+//
+// BOTH ENDS ARE ALWAYS PRESENT, never omitted: a control that disappears on
+// the first and last page makes the bar's own layout jump as a reader pages
+// through a folder, and the three slots are fixed-width precisely so it does
+// not. So an unavailable end returns a label AND `false` for its active
+// flag; nfview.cc renders the inactive form as a plain QLabel rather than a
+// TouchLabel, so it is not merely un-wired but not a tap target at all.
+//
+// HOW "INERT" IS CONVEYED, and why it is not styling: this panel has four
+// grey levels and "slightly lighter" does not read as "different" on it --
+// the same finding that puts "[not in library]" in a row's TEXT rather than
+// leaving it to colour (nf_row_suffix, above). So the inactive form differs
+// in the CHARACTERS: the arrow -- the whole affordance -- is gone, the case
+// drops to lowercase, and the word "no" says which direction is unavailable.
+// Three independent differences, none of which depends on a grey level.
+//
+// "no prev"/"no next" rather than "first page"/"last page", deliberately:
+// a label reading "first page" beside a page counter is exactly what a
+// jump-to-the-start control would say, so it would invite the tap it is
+// there to refuse. "no prev" cannot be read as a control at all.
+//
+// `page` is 0-based (nf_browser_page's own convention) and `pageText` is
+// 1-based ("page 1/4" for page == 0), because a counter a reader sees is
+// 1-based everywhere else in the world. Both arguments are clamped here as
+// well as by the caller: nfview.cc must clamp anyway to slice the row
+// vector, and a second clamp costs two comparisons and means this function
+// has no input that produces a nonsense label. Any output pointer may be
+// NULL.
+void nf_page_bar_labels(int page, int totalPages,
+                        QString *prev, bool *prevActive,
+                        QString *pageText,
+                        QString *next, bool *nextActive);
 
 #endif

@@ -780,3 +780,35 @@ int nf_cover_width_px(int heightPx) {
         w = 1;
     return w;
 }
+
+void nf_page_bar_labels(int page, int totalPages,
+                        QString *prev, bool *prevActive,
+                        QString *pageText,
+                        QString *next, bool *nextActive) {
+    // The defensive clamp described in nffmt.h. totalPages floors at 1 so an
+    // EMPTY listing still reads "page 1/1" rather than "page 1/0" -- an empty
+    // folder is showing its one and only page, not a zeroth of none.
+    if (totalPages < 1)
+        totalPages = 1;
+    if (page < 0)
+        page = 0;
+    if (page > totalPages - 1)
+        page = totalPages - 1;
+
+    bool hasPrev = page > 0;
+    bool hasNext = page < totalPages - 1;
+
+    // ASCII only, same as every other piece of chrome this mod draws
+    // ("<< BACK", "sort: name ^"): the arrow is "<" and ">", not a glyph this
+    // panel's font may not carry.
+    if (prev)
+        *prev = hasPrev ? QStringLiteral("< PREV") : QStringLiteral("no prev");
+    if (prevActive)
+        *prevActive = hasPrev;
+    if (pageText)
+        *pageText = QStringLiteral("page %1/%2").arg(page + 1).arg(totalPages);
+    if (next)
+        *next = hasNext ? QStringLiteral("NEXT >") : QStringLiteral("no next");
+    if (nextActive)
+        *nextActive = hasNext;
+}
